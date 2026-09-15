@@ -29,7 +29,7 @@ enum Command {
         /// Path to scan (defaults to the current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
-        /// Minimum number of tokens for a clone group (default 50)
+        /// Minimum number of tokens for a clone group (default 40)
         #[arg(long)]
         min_tokens: Option<usize>,
         /// Minimum number of occurrences per group (default 2)

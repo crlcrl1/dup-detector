@@ -77,13 +77,85 @@ fn collect(node: Node<'_>, tokens: &mut Vec<Token>) {
             line: start.row as u32 + 1,
             end_line: end.row as u32 + 1,
             column: start.column as u32 + 1,
+            unit_start: false,
+            unit_end: false,
+            unit_end_of_start: 0,
+            unit_start_of_end: u32::MAX,
+            container_start: false,
+            container_end_of_start: 0,
         });
         return;
     }
+    let first = tokens.len();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect(child, tokens);
     }
+    if tokens.len() > first && is_unit_kind(node.kind()) {
+        let last = tokens.len() - 1;
+        if is_container_kind(node.kind()) {
+            tokens[first].container_start = true;
+            tokens[first].container_end_of_start = tokens[first]
+                .container_end_of_start
+                .max(tokens.len() as u32);
+        } else {
+            tokens[first].unit_start = true;
+            tokens[first].unit_end_of_start =
+                tokens[first].unit_end_of_start.max(tokens.len() as u32);
+        }
+        tokens[last].unit_end = true;
+        tokens[last].unit_start_of_end = tokens[last].unit_start_of_end.min(first as u32);
+    }
+}
+
+const CONTAINER_KINDS: &[&str] = &[
+    "block",
+    "statement_block",
+    "compound_statement",
+    "program",
+    "module",
+    "source_file",
+    "translation_unit",
+    "declaration_list",
+    "class_body",
+    "interface_body",
+    "enum_body",
+    "field_declaration_list",
+    "switch_body",
+    "match_block",
+];
+
+const UNIT_KINDS: &[&str] = &[
+    "declaration",
+    "preproc_include",
+    "preproc_def",
+    "preproc_ifdef",
+    "preproc_if",
+    "preproc_call",
+    "linkage_specification",
+    "class_specifier",
+    "enum_specifier",
+    "if_expression",
+    "for_expression",
+    "while_expression",
+    "loop_expression",
+    "match_expression",
+];
+
+fn is_container_kind(kind: &str) -> bool {
+    CONTAINER_KINDS.contains(&kind)
+}
+
+fn is_unit_kind(kind: &str) -> bool {
+    if kind == "parameter_declaration" {
+        return false;
+    }
+    is_container_kind(kind)
+        || UNIT_KINDS.contains(&kind)
+        || kind.ends_with("_statement")
+        || kind.ends_with("_item")
+        || kind.ends_with("_declaration")
+        || kind.ends_with("_definition")
 }
 
 fn classify(kind: &str) -> TokenKind {

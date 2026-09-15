@@ -74,7 +74,7 @@ File discovery (ignore) -> tree-sitter parse -> token stream -> parameterized en
    - Run a **bijection check** on candidate pairs (identifiers must map one-to-one; any conflict fails), then extend maximally left/right to obtain the maximal matching span.
 4. **Fixed tokens** (keywords/operators/punctuation) must match exactly; identifiers use bijection; literals match exactly by default (`parameterize_literals` can be enabled).
 5. **Type-3 (opt-in)**: when `type3` is enabled, the maximal extension tolerates small gaps (up to `type3_max_gap` tokens per side) by looking for a resumption run of at least `type3_min_run` compatible tokens, and overlapping/adjacent matches are chained. Each candidate span is scored with an LCS over parameterized token keys (`similarity = LCS / max(len)`); spans below `type3_min_similarity` are rejected. Type-3 requires opt-in (`type3 = true` / MCP `type3: true` / CLI `--type3`).
-6. **Post-processing**: merge overlapping/adjacent matches within the same file pair; filter boilerplate (imports, getters); sort by token count; limit the number of returned groups.
+6. **Post-processing**: merge overlapping/adjacent matches within the same file pair only when their file-offset alignment stays constant (prevents span drift); report occurrences only at single-semantic-unit granularity — a span must be exactly one statement, item, or block (per-token unit ranges are recorded during tokenization), and Type-1/2 multi-unit matches are split into one clone group per unit; drop groups that cannot be aligned; drop group occurrences that do not match the group representative (exact parameterized keys for Type-1/2, `type3_min_similarity` otherwise) so Type-3 is never reported when disabled; filter boilerplate (imports, pure declarations); sort by token count; limit the number of returned groups.
 7. **Same-file overlapping regions** must be handled explicitly to avoid meaningless self-overlap results.
 
 ## 5. MCP Tool Interface
@@ -88,7 +88,7 @@ The server is long-running, maintains an in-memory index keyed by workspace root
 | `find_clones_for_region` | **Most used by agents**: is the code I'm writing duplicated? | `file`, `start_line`, `end_line`, `scope?`, `min_tokens?`, `max_groups?`, `type3?` |
 | `reindex` | Manually rebuild the index | `path?` |
 
-Defaults: `min_tokens = 50`, `min_occurrences = 2`, `max_groups = 50`, `max_bucket = 32`, seed window 8. `types` accepts `"type-1"` / `"type-2"` / `"type-3"`. `find_clones_for_region` defaults `min_tokens` to the size of the queried region and parses the file on the fly if it is not indexed yet.
+Defaults: `min_tokens = 40`, `min_occurrences = 2`, `max_groups = 50`, `max_bucket = 32`, seed window 8. `types` accepts `"type-1"` / `"type-2"` / `"type-3"`. `find_clones_for_region` defaults `min_tokens` to the size of the queried region and parses the file on the fly if it is not indexed yet.
 
 Responses stay **token-efficient**: `{files_scanned, groups: [{token_count, similarity, clone_type, occurrences: [{path, start_line, end_line}]}]}`, limited in number and sorted by size; no source excerpts.
 
@@ -99,7 +99,7 @@ cargo build                       # daily build
 cargo build --release             # performance-sensitive (always use release for large projects)
 cargo run -- mcp                  # start MCP server over stdio
 cargo run -- scan <path>          # scan from the command line and print results
-cargo run -- scan <path> --json --min-tokens 50 --min-occurrences 2 --max-groups 50 --parameterize-literals --lang rust
+cargo run -- scan <path> --json --min-tokens 40 --min-occurrences 2 --max-groups 50 --parameterize-literals --lang rust
 cargo run -- scan <path> --type3    # include Type-3 near-miss clones
 cargo test                        # unit/integration tests
 cargo fmt                         # formatting (required before commit)
@@ -119,7 +119,7 @@ Note: the `rmcp` server must not write to stdout; all logs go to stderr (set `tr
 
 ## 8. Roadmap
 
-- **Phase 0** Done: language scope is rust / python / javascript / typescript / tsx / cpp; defaults `min_tokens = 50`, seed window 8, `max_bucket = 32`.
+- **Phase 0** Done: language scope is rust / python / javascript / typescript / tsx / cpp; defaults `min_tokens = 40`, seed window 8, `max_bucket = 32`.
 - **Phase 1** Done: MCP server over stdio + working `scan` CLI.
 - **Phase 2** Done: tree-sitter token extraction and parameterized encoding, with unit tests.
 - **Phase 3** Done: seed-and-extend detection + bijection check + maximal matching + clone clustering; `find_clones` usable.

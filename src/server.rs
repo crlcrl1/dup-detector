@@ -69,7 +69,7 @@ impl CloneServer {
 pub struct FindClonesParams {
     /// Subdirectory to scan; defaults to the current working directory.
     pub scope: Option<String>,
-    /// Minimum number of tokens for a clone group (default 50).
+    /// Minimum number of tokens for a clone group (default 40).
     pub min_tokens: Option<usize>,
     /// Minimum number of occurrences per group (default 2).
     pub min_occurrences: Option<usize>,
@@ -89,7 +89,7 @@ pub struct FindClonesInFileParams {
     pub file: String,
     /// Subdirectory to scan; defaults to the current working directory.
     pub scope: Option<String>,
-    /// Minimum number of tokens for a clone group (default 50).
+    /// Minimum number of tokens for a clone group (default 40).
     pub min_tokens: Option<usize>,
     /// Minimum number of occurrences per group (default 2).
     pub min_occurrences: Option<usize>,

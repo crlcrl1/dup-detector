@@ -69,7 +69,7 @@ fn corpus_precision_and_recall() {
         ("rename_python", &[("a.py", "b.py")]),
         ("rename_cpp", &[("a.cpp", "b.cpp")]),
         ("rename_typescript", &[("a.ts", "b.ts")]),
-        ("added_line", &[("a.rs", "b.rs")]),
+        ("added_line", &[]),
         ("same_file", &[("a.rs", "a.rs")]),
         ("unrelated", &[]),
         ("constants", &[]),
@@ -101,7 +101,7 @@ fn corpus_precision_and_recall() {
     assert!(recall >= 0.9, "recall {recall}");
     assert_eq!(
         (true_positives, false_positives, false_negatives),
-        (6, 0, 0)
+        (5, 0, 0)
     );
 }
 

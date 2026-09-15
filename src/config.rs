@@ -19,7 +19,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            min_tokens: 50,
+            min_tokens: 40,
             min_occurrences: 2,
             max_bucket: 32,
             seed_window: 8,

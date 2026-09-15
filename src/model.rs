@@ -22,6 +22,12 @@ pub struct Token {
     pub line: u32,
     pub end_line: u32,
     pub column: u32,
+    pub unit_start: bool,
+    pub unit_end: bool,
+    pub unit_end_of_start: u32,
+    pub unit_start_of_end: u32,
+    pub container_start: bool,
+    pub container_end_of_start: u32,
 }
 
 pub struct SourceFile {
