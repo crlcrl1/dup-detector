@@ -59,6 +59,9 @@ src/
 editors/
   vscode/        VS Code extension (vscode-languageclient, packages to .vsix)
   zed/           Zed extension (wasm, registers the language server name)
+docs/
+  *.md           user documentation (configuration, mcp, lsp, architecture)
+  zh-CN/*.md     Chinese translations
 ```
 
 Data flow:
