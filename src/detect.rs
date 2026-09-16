@@ -431,27 +431,29 @@ fn cluster(
         roots.entry(dsu.find(id)).or_default().push(id);
     }
 
-    let mut refined_groups: Vec<Vec<Occurrence>> = Vec::new();
-    let mut scratch = ClusterScratch::default();
-    for ids in roots.values() {
-        let mut occs: Vec<Occurrence> = ids.iter().map(|&id| occurrences[id]).collect();
-        occs.sort();
-        let occs = drop_contained(occs);
-        if occs.len() < config.min_occurrences {
-            continue;
-        }
-        let (representative_index, merged) =
-            representative_class(files, &occs, config, &mut scratch);
-        let representative = occs[representative_index];
-        if merged.len() < config.min_occurrences {
-            continue;
-        }
-        if let Some(refined) =
-            refine_groups(files, &metas, &merged, representative, config, &mut scratch)
-        {
-            refined_groups.extend(refined);
-        }
-    }
+    let components: Vec<&Vec<usize>> = roots.values().collect();
+    let refined_groups: Vec<Vec<Occurrence>> = components
+        .par_iter()
+        .map_init(ClusterScratch::default, |scratch, ids| {
+            let mut occs: Vec<Occurrence> = ids.iter().map(|&id| occurrences[id]).collect();
+            occs.sort();
+            let occs = drop_contained(occs);
+            if occs.len() < config.min_occurrences {
+                return Vec::new();
+            }
+            let (representative_index, merged) =
+                representative_class(files, &occs, config, scratch);
+            let representative = occs[representative_index];
+            if merged.len() < config.min_occurrences {
+                return Vec::new();
+            }
+            refine_groups(files, &metas, &merged, representative, config, scratch)
+                .unwrap_or_default()
+        })
+        .collect::<Vec<Vec<Vec<Occurrence>>>>()
+        .into_iter()
+        .flatten()
+        .collect();
     let mut dsu = Dsu::new(refined_groups.len());
     let mut seen_occurrence: HashMap<Occurrence, usize> = HashMap::new();
     for (index, group) in refined_groups.iter().enumerate() {
