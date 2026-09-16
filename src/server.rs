@@ -18,15 +18,15 @@ pub struct CloneServer {
 }
 
 struct ServerState {
-    config: Config,
+    default_config: Config,
     indexes: Mutex<HashMap<PathBuf, SourceIndex>>,
 }
 
 impl CloneServer {
-    pub fn new(config: Config) -> Self {
+    pub fn new(default_config: Config) -> Self {
         Self {
             state: Arc::new(ServerState {
-                config,
+                default_config,
                 indexes: Mutex::new(HashMap::new()),
             }),
         }
@@ -51,14 +51,18 @@ impl CloneServer {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let key = entry.key().clone();
+                    let config = Config::load(&key)
+                        .map_err(|e| e.to_string())?
+                        .unwrap_or_else(|| state.default_config.clone());
                     entry.insert(
-                        SourceIndex::build(&key, &state.config)
+                        SourceIndex::build(&key, &config)
                             .map_err(|e| format!("failed to index: {e}"))?,
                     )
                 }
             };
             index.refresh();
-            Ok(f(index, &state.config))
+            let config = index.config().clone();
+            Ok(f(index, &config))
         })
         .await
         .map_err(|e| format!("scan task panicked: {e}"))?

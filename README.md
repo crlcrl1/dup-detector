@@ -85,6 +85,23 @@ Scan options:
 | `--lang <LANG>`           | all     | Restrict to a language (repeatable)          |
 | `--json`                  | off     | Print results as JSON                        |
 
+## Configuration
+
+Configuration is per project: put a `dup-detector.toml` at the project root. It is read at startup by searching upwards from the scanned path for `scan`, and from the server's working directory and each `scope` root for the MCP server, so scanning a subdirectory still finds the project config. Command-line flags and MCP tool parameters override the file. Every key is optional and falls back to the default.
+
+```toml
+# dup-detector.toml
+min_lines = 5
+min_occurrences = 2
+max_bucket = 32          # seed buckets larger than this are dropped as generic
+seed_window = 8          # seed window length in tokens
+max_groups = 100         # omit / comment out for no limit
+parameterize_literals = false
+languages = ["rust", "python", "javascript", "typescript", "tsx", "cpp"]
+```
+
+Unknown keys and unknown language names are reported as errors. A missing `dup-detector.toml` is fine and simply uses the defaults.
+
 ## Using it as an MCP server
 
 Register the release binary with your MCP client. Example configuration:
@@ -100,7 +117,7 @@ Register the release binary with your MCP client. Example configuration:
 }
 ```
 
-The server keeps an in-memory index per workspace root and refreshes it incrementally by file mtime/size. Parsed token streams are also cached in the `.dup-detector/` directory at the scanned root, one entry per source file named by a hash of its root-relative path (validated by mtime, size and a text hash), so new processes only reparse changed files and only changed entries are rewritten; use `reindex` to clear the directory. Add `.dup-detector/` to `.gitignore` if you don't want it tracked. All logs go to stderr so the stdio protocol stays clean.
+The server keeps an in-memory index per workspace root and refreshes it incrementally by file mtime/size. Each root's `dup-detector.toml` supplies its configuration, falling back to the server's startup directory. Parsed token streams are also cached in the `.dup-detector/` directory at the scanned root, one entry per source file named by a hash of its root-relative path (validated by mtime, size and a text hash), so new processes only reparse changed files and only changed entries are rewritten; use `reindex` to clear the directory. Add `.dup-detector/` to `.gitignore` if you don't want it tracked. All logs go to stderr so the stdio protocol stays clean.
 
 ### Tools
 
@@ -139,7 +156,7 @@ The server keeps an in-memory index per workspace root and refreshes it incremen
 src/
   main.rs       CLI entry: `mcp` / `scan`
   lib.rs        library root
-  config.rs     Config (thresholds, language toggles)
+  config.rs     Config + dup-detector.toml loading
   language.rs   extension -> LanguageId -> tree-sitter grammar
   model.rs      Token / SourceFile / Occurrence / CloneGroup / CloneType
   tokenize.rs   source -> CST -> leaf token stream

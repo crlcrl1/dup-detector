@@ -85,6 +85,23 @@ dup-detector scan <path> --parameterize-literals
 | `--lang <LANG>`           | 全部   | 限定语言（可重复）           |
 | `--json`                  | 关闭   | 以 JSON 输出结果             |
 
+## 配置文件
+
+配置以项目为单位：在项目根目录放置 `dup-detector.toml`。启动时从被扫描路径向上查找该文件（`scan`），MCP 服务器则从其工作目录以及每个 `scope` 根目录向上查找，因此扫描子目录时也能找到项目配置。命令行参数与 MCP 工具参数会覆盖配置文件。所有键均可选，缺省时使用默认值。
+
+```toml
+# dup-detector.toml
+min_lines = 5
+min_occurrences = 2
+max_bucket = 32          # 大于该值的种子桶视为通用模式并丢弃
+seed_window = 8          # 种子窗口的 token 长度
+max_groups = 100         # 省略或注释掉表示不限制
+parameterize_literals = false
+languages = ["rust", "python", "javascript", "typescript", "tsx", "cpp"]
+```
+
+未知的键和未知的语言名会报错。缺少 `dup-detector.toml` 时直接使用默认值。
+
 ## 作为 MCP 服务器使用
 
 在 MCP 客户端中注册 release 产物。配置示例：
@@ -100,7 +117,7 @@ dup-detector scan <path> --parameterize-literals
 }
 ```
 
-服务器按工作区根目录维护内存索引，并依据文件 mtime/大小进行增量刷新。解析后的 token 流还会缓存到扫描根目录下的 `.dup-detector/` 目录中，每个源文件一个条目、条目名为其相对根目录路径的哈希（通过 mtime、大小和文本哈希校验），因此新进程只需重新解析发生变化的文件，且只重写变化的条目；可用 `reindex` 清空该目录。如不希望它被纳入版本控制，请将 `.dup-detector/` 加入 `.gitignore`。所有日志都写入 stderr，以保持 stdio 协议干净。
+服务器按工作区根目录维护内存索引，并依据文件 mtime/大小进行增量刷新。每个根目录的 `dup-detector.toml` 提供其配置，缺失时回退到服务器启动目录的配置。解析后的 token 流还会缓存到扫描根目录下的 `.dup-detector/` 目录中，每个源文件一个条目、条目名为其相对根目录路径的哈希（通过 mtime、大小和文本哈希校验），因此新进程只需重新解析发生变化的文件，且只重写变化的条目；可用 `reindex` 清空该目录。如不希望它被纳入版本控制，请将 `.dup-detector/` 加入 `.gitignore`。所有日志都写入 stderr，以保持 stdio 协议干净。
 
 ### 工具
 
@@ -139,7 +156,7 @@ dup-detector scan <path> --parameterize-literals
 src/
   main.rs       CLI 入口：`mcp` / `scan`
   lib.rs        库根
-  config.rs     Config（阈值、语言开关）
+  config.rs     Config + dup-detector.toml 读取
   language.rs   扩展名 -> LanguageId -> tree-sitter 语法
   model.rs      Token / SourceFile / Occurrence / CloneGroup / CloneType
   tokenize.rs   源码 -> CST -> 叶子 token 流

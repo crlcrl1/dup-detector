@@ -81,7 +81,10 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_mcp() -> anyhow::Result<()> {
-    let server = CloneServer::new(Config::default());
+    let root = std::env::current_dir().context("cannot resolve the current directory")?;
+    let config = Config::load_or_default(&root)
+        .with_context(|| format!("failed to load config from {}", root.display()))?;
+    let server = CloneServer::new(config);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -102,7 +105,9 @@ fn run_scan(
     languages: &[String],
     json: bool,
 ) -> anyhow::Result<()> {
-    let mut config = Config::default().with_limits(min_lines, min_occurrences, max_groups);
+    let mut config = Config::load_or_default(path)
+        .with_context(|| format!("failed to load config for {}", path.display()))?
+        .with_limits(min_lines, min_occurrences, max_groups);
     if parameterize_literals {
         config.parameterize_literals = true;
     }

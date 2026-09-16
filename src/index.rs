@@ -169,6 +169,10 @@ impl SourceIndex {
         &self.root
     }
 
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
     pub fn files(&self) -> &[SourceFile] {
         &self.files
     }

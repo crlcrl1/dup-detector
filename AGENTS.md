@@ -28,10 +28,10 @@ The core goal is not text-level matching but **semantic (rename-invariant) detec
 Already written into `Cargo.toml`; no need to pick versions again:
 
 - Rust **edition 2024**, toolchain 1.98+
-- MCP SDK: `rmcp` 3.3 (feat. `transport-io`, stdio transport)
+- MCP SDK: `rmcp` 3.4 (feat. `transport-io`, stdio transport)
 - Parsing: `tree-sitter` 0.27 + grammars: rust / python / javascript / typescript / cpp
 - Traversal: `ignore` (respects .gitignore), `rayon` (parallel parsing)
-- Serialization: `serde` / `serde_json` / `schemars` (MCP tool schemas)
+- Serialization: `serde` / `serde_json` / `schemars` (MCP tool schemas), `toml` (config file)
 - Errors: `anyhow` (application layer) / `thiserror` (library layer)
 - CLI: `clap` (derive)
 - Logging: `tracing` / `tracing-subscriber` (env-filter)
@@ -45,7 +45,7 @@ Module layout (all modules implemented; the core algorithm lives in `tokenize` /
 src/
   main.rs        CLI entry: mcp / scan subcommands
   lib.rs         Library root, exports public API
-  config.rs      Config (min_lines, thresholds, language toggles, etc.)
+  config.rs      Config (min_lines, thresholds, language toggles, etc.) + `dup-detector.toml` loading
   language.rs    Extension -> LanguageId -> tree-sitter Language
   model.rs       Token / SourceFile / Occurrence / CloneGroup / CloneType
   tokenize.rs    Source file -> CST -> leaf token stream
@@ -63,6 +63,10 @@ File discovery (ignore) -> tree-sitter parse -> token stream -> parameterized en
   -> seed hash bucketing -> bijection check -> maximal match extension
   -> dedupe/merge/cluster -> sort -> MCP response
 ```
+
+### Configuration file
+
+Per project, one `dup-detector.toml` at the project root (constant `config::CONFIG_FILE_NAME`). It is read at startup by searching upwards from the starting path to the filesystem root: `scan` starts at the scanned path, `mcp` starts at the server's working directory, and the server also reads each scope/index root and falls back to the startup config when a root has none. All keys are optional; a missing file yields `Config::default()`. Unknown keys and unknown language names are errors (`ConfigError`). CLI flags and MCP tool params override the file via `with_limits`/direct field assignment. Schema: `min_lines`, `min_occurrences`, `max_bucket`, `seed_window`, `max_groups`, `parameterize_literals`, `languages` (array of language names accepted by `LanguageId::from_name`).
 
 ## 4. Core Algorithms (make-or-break, must follow)
 
