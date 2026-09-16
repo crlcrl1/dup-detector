@@ -14,7 +14,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            min_lines: 4,
+            min_lines: 5,
             min_occurrences: 2,
             max_bucket: 32,
             seed_window: 8,

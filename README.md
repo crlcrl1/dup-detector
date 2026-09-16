@@ -65,7 +65,7 @@ dup-detector mcp
 dup-detector scan <path>
 
 # restrict languages and tune thresholds
-dup-detector scan <path> --lang rust --lang python --min-lines 4 --min-occurrences 2 --max-groups 50
+dup-detector scan <path> --lang rust --lang python --min-lines 5 --min-occurrences 2 --max-groups 50
 
 # JSON output (for tooling)
 dup-detector scan <path> --json
@@ -78,7 +78,7 @@ Scan options:
 
 | Flag                      | Default | Description                                  |
 | ------------------------- | ------- | -------------------------------------------- |
-| `--min-lines <N>`         | `4`     | Minimum line count for a clone group         |
+| `--min-lines <N>`         | `5`     | Minimum line count for a clone group         |
 | `--min-occurrences <N>`   | `2`     | Minimum occurrences per group                |
 | `--max-groups <N>`        | none    | Maximum number of groups to report           |
 | `--parameterize-literals` | off     | Treat consistently renamed literals as equal |
