@@ -314,8 +314,8 @@ fn merge_matches(matches: Vec<(Occurrence, Occurrence)>) -> Vec<(Occurrence, Occ
         let mut chain: Vec<(Occurrence, Occurrence)> = Vec::new();
         for (a, b) in group {
             if let Some((la, lb)) = chain.last_mut()
-                && a.start <= la.end
-                && b.start <= lb.end
+                && a.start == la.end
+                && b.start == lb.end
                 && aligned(la, lb, &a, &b)
             {
                 *la = Occurrence {
@@ -1175,6 +1175,19 @@ fn compute_total(items: Vec<i32>) -> i32 {
         let group = &groups[0];
         assert_eq!(group.occurrences.len(), 2);
         assert!(group.occurrences[0].end <= group.occurrences[1].start);
+    }
+
+    #[test]
+    fn adjacent_clone_after_identifier_tail_is_reported() {
+        let source = "fn pre() -> i32 {\n    let signatures = 1;\n    signatures\n}\n\nfn parameterized(previous: u32, start: usize, index: usize, tag: u64) -> u64 {\n    let distance = if previous != u32::MAX && previous as usize >= start {\n        (index - previous as usize) as u64\n    } else {\n        0\n    };\n    (distance & !TAG_MASK) | tag\n}\n\nfn parameterized111(previous: u32, start: usize, index: usize, tag: u64) -> u64 {\n    let distance = if previous != u32::MAX && previous as usize >= start {\n        (index - previous as usize) as u64\n    } else {\n        0\n    };\n    (distance & !TAG_MASK) | tag\n}\n";
+        let f = file("a.rs", source);
+        let groups = detect(&[&f], &config());
+        assert!(
+            groups
+                .iter()
+                .any(|group| group.token_count >= 60 && group.occurrences.len() == 2),
+            "expected the two adjacent functions to be reported as a clone, got {groups:?}"
+        );
     }
 
     #[test]
