@@ -68,7 +68,7 @@ dup-detector lsp
 dup-detector scan <path>
 
 # 限定语言并调整阈值
-dup-detector scan <path> --lang rust --lang python --min-lines 5 --min-occurrences 2 --max-groups 50
+dup-detector scan <path> --lang rust --lang python --min-lines 7 --min-occurrences 2 --max-groups 50
 
 # JSON 输出（便于工具集成）
 dup-detector scan <path> --json
@@ -81,7 +81,7 @@ dup-detector scan <path> --parameterize-literals
 
 | 参数                      | 默认值 | 说明                         |
 | ------------------------- | ------ | ---------------------------- |
-| `--min-lines <N>`         | `5`    | 克隆组的最小行数             |
+| `--min-lines <N>`         | `7`    | 克隆组的最小行数             |
 | `--min-occurrences <N>`   | `2`    | 每个克隆组的最小出现次数     |
 | `--max-groups <N>`        | 无限制 | 最多返回的克隆组数量         |
 | `--parameterize-literals` | 关闭   | 将一致重命名的字面量视为相同 |
@@ -94,7 +94,7 @@ dup-detector scan <path> --parameterize-literals
 
 ```toml
 # dup-detector.toml
-min_lines = 5
+min_lines = 7
 min_occurrences = 2
 max_bucket = 32          # 大于该值的种子桶视为通用模式并丢弃
 seed_window = 8          # 种子窗口的 token 长度

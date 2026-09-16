@@ -1330,11 +1330,11 @@ fn compute_total(items: Vec<i32>) -> i32 {
     fn default_threshold_reports_medium_statements() {
         let a = file(
             "a.rs",
-            "fn alpha(index: &Index, params: &Params) -> Result<i32, Error> {\n    let total = compute_first(index.root())\n        .and_then(|value| compute_second(value))\n        .and_then(|value| compute_third(value))\n        .and_then(|value| compute_fourth(value))\n        .unwrap_or_default();\n    Ok(total + 1)\n}",
+            "fn alpha(index: &Index, params: &Params) -> Result<i32, Error> {\n    let total = compute_first(index.root())\n        .and_then(|value| compute_second(value))\n        .and_then(|value| compute_third(value))\n        .and_then(|value| compute_fourth(value))\n        .and_then(|value| compute_fifth(value))\n        .and_then(|value| compute_sixth(value))\n        .unwrap_or_default();\n    Ok(total + 1)\n}",
         );
         let b = file(
             "b.rs",
-            "fn beta(index: &Index, params: &Params) -> Result<i32, Error> {\n    let total = compute_first(index.root())\n        .and_then(|value| compute_second(value))\n        .and_then(|value| compute_third(value))\n        .and_then(|value| compute_fourth(value))\n        .unwrap_or_default();\n    Ok(total + 2)\n}",
+            "fn beta(index: &Index, params: &Params) -> Result<i32, Error> {\n    let total = compute_first(index.root())\n        .and_then(|value| compute_second(value))\n        .and_then(|value| compute_third(value))\n        .and_then(|value| compute_fourth(value))\n        .and_then(|value| compute_fifth(value))\n        .and_then(|value| compute_sixth(value))\n        .unwrap_or_default();\n    Ok(total + 2)\n}",
         );
         let groups = detect(&[&a, &b], &Config::default());
         assert_eq!(groups.len(), 1);
@@ -1350,7 +1350,7 @@ fn compute_total(items: Vec<i32>) -> i32 {
                 )
             })
             .collect();
-        assert_eq!(lines, vec![(2, 6), (2, 6)]);
+        assert_eq!(lines, vec![(2, 8), (2, 8)]);
     }
 
     #[test]

@@ -31,7 +31,7 @@ enum Command {
         /// Path to scan (defaults to the current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
-        /// Minimum number of lines for a clone group (default 5)
+        /// Minimum number of lines for a clone group (default 7)
         #[arg(long)]
         min_lines: Option<usize>,
         /// Minimum number of occurrences per group (default 2)
