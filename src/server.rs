@@ -338,19 +338,22 @@ impl CloneServer {
                     let cfg = config
                         .clone()
                         .with_limits(Some(min_tokens), None, params.max_groups);
-                    let groups: Vec<CloneGroup> = crate::detect::detect(&files, &cfg)
-                        .into_iter()
-                        .filter(|g| {
-                            g.occurrences.iter().any(|o| {
-                                o.file as usize == file_idx
-                                    && o.start < span_end as u32
-                                    && o.end > span_start as u32
-                            }) && params
-                                .types
-                                .as_ref()
-                                .is_none_or(|types| types.contains(&g.clone_type))
-                        })
-                        .collect();
+                    let allowed =
+                        crate::detect::span_window_signatures(file, span_start, span_end, &cfg);
+                    let groups: Vec<CloneGroup> =
+                        crate::detect::detect_filtered(&files, &cfg, Some(&allowed))
+                            .into_iter()
+                            .filter(|g| {
+                                g.occurrences.iter().any(|o| {
+                                    o.file as usize == file_idx
+                                        && o.start < span_end as u32
+                                        && o.end > span_start as u32
+                                }) && params
+                                    .types
+                                    .as_ref()
+                                    .is_none_or(|types| types.contains(&g.clone_type))
+                            })
+                            .collect();
                     Ok(ScanResponse {
                         files_scanned: files.len(),
                         groups: groups.iter().map(|g| to_dto(&files, g)).collect(),
