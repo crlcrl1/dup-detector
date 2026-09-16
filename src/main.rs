@@ -29,13 +29,13 @@ enum Command {
         /// Path to scan (defaults to the current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
-        /// Minimum number of tokens for a clone group (default 40)
+        /// Minimum number of lines for a clone group (default 4)
         #[arg(long)]
-        min_tokens: Option<usize>,
+        min_lines: Option<usize>,
         /// Minimum number of occurrences per group (default 2)
         #[arg(long)]
         min_occurrences: Option<usize>,
-        /// Maximum number of groups to report (default 50)
+        /// Maximum number of groups to report (default: no limit)
         #[arg(long)]
         max_groups: Option<usize>,
         /// Allow consistent literal renames to match as clones
@@ -62,7 +62,7 @@ fn main() -> anyhow::Result<()> {
         Command::Mcp => run_mcp(),
         Command::Scan {
             path,
-            min_tokens,
+            min_lines,
             min_occurrences,
             max_groups,
             parameterize_literals,
@@ -70,7 +70,7 @@ fn main() -> anyhow::Result<()> {
             json,
         } => run_scan(
             &path,
-            min_tokens,
+            min_lines,
             min_occurrences,
             max_groups,
             parameterize_literals,
@@ -95,14 +95,14 @@ fn run_mcp() -> anyhow::Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn run_scan(
     path: &PathBuf,
-    min_tokens: Option<usize>,
+    min_lines: Option<usize>,
     min_occurrences: Option<usize>,
     max_groups: Option<usize>,
     parameterize_literals: bool,
     languages: &[String],
     json: bool,
 ) -> anyhow::Result<()> {
-    let mut config = Config::default().with_limits(min_tokens, min_occurrences, max_groups);
+    let mut config = Config::default().with_limits(min_lines, min_occurrences, max_groups);
     if parameterize_literals {
         config.parameterize_literals = true;
     }

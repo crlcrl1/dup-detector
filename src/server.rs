@@ -69,11 +69,11 @@ impl CloneServer {
 pub struct FindClonesParams {
     /// Subdirectory to scan; defaults to the current working directory.
     pub scope: Option<String>,
-    /// Minimum number of tokens for a clone group (default 40).
-    pub min_tokens: Option<usize>,
+    /// Minimum number of lines for a clone group (default 4).
+    pub min_lines: Option<usize>,
     /// Minimum number of occurrences per group (default 2).
     pub min_occurrences: Option<usize>,
-    /// Maximum number of groups to return (default 50).
+    /// Maximum number of groups to return (default: no limit).
     pub max_groups: Option<usize>,
     /// Restrict results to these clone types: "type-1", "type-2".
     pub types: Option<Vec<CloneType>>,
@@ -87,11 +87,11 @@ pub struct FindClonesInFileParams {
     pub file: String,
     /// Subdirectory to scan; defaults to the current working directory.
     pub scope: Option<String>,
-    /// Minimum number of tokens for a clone group (default 40).
-    pub min_tokens: Option<usize>,
+    /// Minimum number of lines for a clone group (default 4).
+    pub min_lines: Option<usize>,
     /// Minimum number of occurrences per group (default 2).
     pub min_occurrences: Option<usize>,
-    /// Maximum number of groups to return (default 50).
+    /// Maximum number of groups to return (default: no limit).
     pub max_groups: Option<usize>,
     /// Restrict results to these clone types: "type-1", "type-2".
     pub types: Option<Vec<CloneType>>,
@@ -107,9 +107,9 @@ pub struct FindClonesForRegionParams {
     pub end_line: u32,
     /// Subdirectory to scan; defaults to the current working directory.
     pub scope: Option<String>,
-    /// Minimum number of tokens for a clone group; defaults to the size of the region.
-    pub min_tokens: Option<usize>,
-    /// Maximum number of groups to return (default 50).
+    /// Minimum number of lines for a clone group; defaults to the line span of the region.
+    pub min_lines: Option<usize>,
+    /// Maximum number of groups to return (default: no limit).
     pub max_groups: Option<usize>,
     /// Restrict results to these clone types: "type-1", "type-2".
     pub types: Option<Vec<CloneType>>,
@@ -200,6 +200,12 @@ fn token_span_for_lines(
     (start < end).then_some((start, end))
 }
 
+fn line_span(file: &SourceFile, start: usize, end: usize) -> usize {
+    let first = file.tokens[start].line as usize;
+    let last = file.tokens[end - 1].end_line as usize;
+    last.saturating_sub(first) + 1
+}
+
 #[tool_router(server_handler)]
 impl CloneServer {
     #[tool(
@@ -215,7 +221,7 @@ impl CloneServer {
                 scope.as_deref(),
                 move |index, config| -> Result<ScanResponse, String> {
                     let mut cfg = config.clone().with_limits(
-                        params.min_tokens,
+                        params.min_lines,
                         params.min_occurrences,
                         params.max_groups,
                     );
@@ -265,7 +271,7 @@ impl CloneServer {
                         )
                     })?;
                     let cfg = config.clone().with_limits(
-                        params.min_tokens,
+                        params.min_lines,
                         params.min_occurrences,
                         params.max_groups,
                     );
@@ -332,12 +338,13 @@ impl CloneServer {
                             groups: Vec::new(),
                         });
                     };
-                    let min_tokens = params
-                        .min_tokens
-                        .unwrap_or(config.min_tokens.min(span_end - span_start));
+                    let region_lines = line_span(file, span_start, span_end);
+                    let min_lines = params
+                        .min_lines
+                        .unwrap_or(config.min_lines.min(region_lines));
                     let cfg = config
                         .clone()
-                        .with_limits(Some(min_tokens), None, params.max_groups);
+                        .with_limits(Some(min_lines), None, params.max_groups);
                     let allowed =
                         crate::detect::span_window_signatures(file, span_start, span_end, &cfg);
                     let groups: Vec<CloneGroup> =

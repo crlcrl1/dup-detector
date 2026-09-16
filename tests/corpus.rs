@@ -5,7 +5,7 @@ use dup_detector::config::Config;
 use dup_detector::index::SourceIndex;
 use dup_detector::model::{CloneGroup, CloneType};
 
-const MIN_TOKENS: usize = 25;
+const MIN_LINES: usize = 4;
 
 fn corpus_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus")
@@ -13,7 +13,7 @@ fn corpus_root() -> PathBuf {
 
 fn base_config() -> Config {
     Config {
-        min_tokens: MIN_TOKENS,
+        min_lines: MIN_LINES,
         ..Config::default()
     }
 }
@@ -107,6 +107,20 @@ fn corpus_precision_and_recall() {
     );
 }
 
+fn group_lines(index: &SourceIndex, group: &CloneGroup) -> usize {
+    group
+        .occurrences
+        .iter()
+        .map(|o| {
+            let file = &index.files()[o.file as usize];
+            let first = file.tokens[o.start as usize].line as usize;
+            let last = file.tokens[o.end as usize - 1].end_line as usize;
+            last - first + 1
+        })
+        .min()
+        .unwrap_or(0)
+}
+
 #[test]
 fn renamed_clones_are_type2() {
     let config = base_config();
@@ -118,10 +132,10 @@ fn renamed_clones_are_type2() {
         "rename_javascript",
         "rename_tsx",
     ] {
-        let (_index, groups) = scan(case, &config);
+        let (index, groups) = scan(case, &config);
         assert_eq!(groups.len(), 1, "{case}: expected a single group");
         assert_eq!(groups[0].clone_type, CloneType::Type2, "{case}");
-        assert!(groups[0].token_count >= MIN_TOKENS, "{case}");
+        assert!(group_lines(&index, &groups[0]) >= MIN_LINES, "{case}");
     }
 }
 

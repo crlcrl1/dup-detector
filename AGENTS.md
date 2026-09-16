@@ -45,7 +45,7 @@ Module layout (all modules implemented; the core algorithm lives in `tokenize` /
 src/
   main.rs        CLI entry: mcp / scan subcommands
   lib.rs         Library root, exports public API
-  config.rs      Config (min_tokens, thresholds, language toggles, etc.)
+  config.rs      Config (min_lines, thresholds, language toggles, etc.)
   language.rs    Extension -> LanguageId -> tree-sitter Language
   model.rs       Token / SourceFile / Occurrence / CloneGroup / CloneType
   tokenize.rs    Source file -> CST -> leaf token stream
@@ -82,12 +82,12 @@ The server is long-running, maintains an in-memory index keyed by workspace root
 
 | Tool | Purpose | Key params |
 | --- | --- | --- |
-| `find_clones` | Project-wide duplicated code | `scope?`, `min_tokens?`, `min_occurrences?`, `max_groups?`, `types?`, `parameterize_literals?` |
-| `find_clones_in_file` | Clones involving a given file | `file`, `scope?`, `min_tokens?`, `min_occurrences?`, `max_groups?`, `types?` |
-| `find_clones_for_region` | **Most used by agents**: is the code I'm writing duplicated? | `file`, `start_line`, `end_line`, `scope?`, `min_tokens?`, `max_groups?`, `types?` |
+| `find_clones` | Project-wide duplicated code | `scope?`, `min_lines?`, `min_occurrences?`, `max_groups?`, `types?`, `parameterize_literals?` |
+| `find_clones_in_file` | Clones involving a given file | `file`, `scope?`, `min_lines?`, `min_occurrences?`, `max_groups?`, `types?` |
+| `find_clones_for_region` | **Most used by agents**: is the code I'm writing duplicated? | `file`, `start_line`, `end_line`, `scope?`, `min_lines?`, `max_groups?`, `types?` |
 | `reindex` | Manually rebuild the index and clear its on-disk cache | `path?` |
 
-Defaults: `min_tokens = 40`, `min_occurrences = 2`, `max_groups = 50`, `max_bucket = 32`, seed window 8. `types` accepts `"type-1"` / `"type-2"`. `find_clones_for_region` defaults `min_tokens` to the size of the queried region and parses the file on the fly if it is not indexed yet.
+Defaults: `min_lines = 4`, `min_occurrences = 2`, `max_groups = unlimited`, `max_bucket = 32`, seed window 8. `types` accepts `"type-1"` / `"type-2"`. `find_clones_for_region` defaults `min_lines` to the line span of the queried region and parses the file on the fly if it is not indexed yet.
 
 Responses stay **token-efficient**: `{files_scanned, groups: [{token_count, clone_type, occurrences: [{path, start_line, end_line}]}]}`, limited in number and sorted by size; no source excerpts.
 
@@ -98,7 +98,7 @@ cargo build                       # daily build
 cargo build --release             # performance-sensitive (always use release for large projects)
 cargo run -- mcp                  # start MCP server over stdio
 cargo run -- scan <path>          # scan from the command line and print results
-cargo run -- scan <path> --json --min-tokens 40 --min-occurrences 2 --max-groups 50 --parameterize-literals --lang rust
+cargo run -- scan <path> --json --min-lines 4 --min-occurrences 2 --parameterize-literals --lang rust
 cargo test                        # unit/integration tests
 cargo fmt                         # formatting (required before commit)
 cargo clippy --all-targets -- -D warnings   # lint (required before commit)
@@ -117,7 +117,7 @@ Note: the `rmcp` server must not write to stdout; all logs go to stderr (set `tr
 
 ## 8. Roadmap
 
-- **Phase 0** Done: language scope is rust / python / javascript / typescript / tsx / cpp; defaults `min_tokens = 40`, seed window 8, `max_bucket = 32`.
+- **Phase 0** Done: language scope is rust / python / javascript / typescript / tsx / cpp; defaults `min_lines = 4`, seed window 8, `max_bucket = 32`.
 - **Phase 1** Done: MCP server over stdio + working `scan` CLI.
 - **Phase 2** Done: tree-sitter token extraction and parameterized encoding, with unit tests.
 - **Phase 3** Done: seed-and-extend detection + bijection check + maximal matching + clone clustering; `find_clones` usable.

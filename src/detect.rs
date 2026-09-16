@@ -108,7 +108,7 @@ pub fn detect_filtered(
     let extend_ms = started.elapsed().as_millis();
 
     let matches = merge_matches(matches);
-    let matches = filter_matches(matches, config);
+    let matches = filter_matches(files, matches, config);
     let groups = cluster(files, &hashes, matches, config);
     tracing::debug!(
         seed_ms,
@@ -357,17 +357,24 @@ fn aligned(la: &Occurrence, lb: &Occurrence, a: &Occurrence, b: &Occurrence) -> 
 }
 
 fn filter_matches(
+    files: &[&SourceFile],
     matches: Vec<(Occurrence, Occurrence)>,
     config: &Config,
 ) -> Vec<(Occurrence, Occurrence)> {
     matches
         .into_iter()
         .filter(|(a, b)| {
-            let len_a = (a.end - a.start) as usize;
-            let len_b = (b.end - b.start) as usize;
-            len_a.min(len_b) >= config.min_tokens
+            let lines_a = line_span(files[a.file as usize].tokens.as_slice(), a);
+            let lines_b = line_span(files[b.file as usize].tokens.as_slice(), b);
+            lines_a.min(lines_b) >= config.min_lines
         })
         .collect()
+}
+
+fn line_span(tokens: &[Token], occurrence: &Occurrence) -> usize {
+    let start = tokens[occurrence.start as usize].line as usize;
+    let end = tokens[occurrence.end as usize - 1].end_line as usize;
+    end.saturating_sub(start) + 1
 }
 
 struct Dsu {
@@ -494,7 +501,12 @@ fn cluster(
             .map(|o| (o.end - o.start) as usize)
             .min()
             .unwrap_or(0);
-        if token_count < config.min_tokens {
+        let line_count = merged
+            .iter()
+            .map(|o| line_span(files[o.file as usize].tokens.as_slice(), o))
+            .min()
+            .unwrap_or(0);
+        if line_count < config.min_lines {
             continue;
         }
         if is_boilerplate(files, &merged) {
@@ -514,7 +526,9 @@ fn cluster(
             k1.cmp(&k2)
         })
     });
-    groups.truncate(config.max_groups);
+    if let Some(limit) = config.max_groups {
+        groups.truncate(limit);
+    }
     groups
 }
 
@@ -1033,8 +1047,15 @@ fn compute_total(items: Vec<i32>) -> i32 {
 
     fn config() -> Config {
         Config {
-            min_tokens: 10,
+            min_lines: 5,
             ..Config::default()
+        }
+    }
+
+    fn fine_config() -> Config {
+        Config {
+            min_lines: 1,
+            ..config()
         }
     }
 
@@ -1078,30 +1099,22 @@ fn compute_total(items: Vec<i32>) -> i32 {
     }
 
     #[test]
-    fn min_tokens_filters_small_clones() {
+    fn min_lines_filters_small_clones() {
         let a = file("a.rs", "fn one() -> i32 { 100 + 200 }");
         let b = file("b.rs", "fn one() -> i32 { 100 + 200 }");
         let strict = Config {
-            min_tokens: 12,
+            min_lines: 2,
             ..config()
         };
         assert!(detect(&[&a, &b], &strict).is_empty());
-        let relaxed = Config {
-            min_tokens: 5,
-            ..config()
-        };
-        assert_eq!(detect(&[&a, &b], &relaxed).len(), 1);
+        assert_eq!(detect(&[&a, &b], &fine_config()).len(), 1);
     }
 
     #[test]
     fn literal_mismatch_is_not_a_clone_by_default() {
         let a = file("a.rs", "fn one() -> i32 { 100 + 200 }");
         let b = file("b.rs", "fn two() -> i32 { 300 + 100 }");
-        let relaxed = Config {
-            min_tokens: 5,
-            ..config()
-        };
-        assert!(detect(&[&a, &b], &relaxed).is_empty());
+        assert!(detect(&[&a, &b], &fine_config()).is_empty());
     }
 
     #[test]
@@ -1109,9 +1122,8 @@ fn compute_total(items: Vec<i32>) -> i32 {
         let a = file("a.rs", "fn one() -> i32 { 100 + 200 }");
         let b = file("b.rs", "fn one() -> i32 { 100 + 300 }");
         let cfg = Config {
-            min_tokens: 5,
             parameterize_literals: true,
-            ..config()
+            ..fine_config()
         };
         assert_eq!(detect(&[&a, &b], &cfg).len(), 1);
     }
@@ -1120,16 +1132,7 @@ fn compute_total(items: Vec<i32>) -> i32 {
     fn inconsistent_rename_is_not_a_clone() {
         let a = file("a.rs", "fn f(x: i32, y: i32) -> i32 { x + y + x }");
         let b = file("b.rs", "fn f(a: i32, b: i32) -> i32 { a + b + c }");
-        let cfg = Config {
-            min_tokens: 19,
-            ..config()
-        };
-        assert!(detect(&[&a, &b], &cfg).is_empty());
-        let lenient = Config {
-            min_tokens: 5,
-            ..config()
-        };
-        assert!(detect(&[&a, &b], &lenient).is_empty());
+        assert!(detect(&[&a, &b], &fine_config()).is_empty());
     }
 
     fn occ(file: u32, start: u32, end: u32) -> Occurrence {
@@ -1159,7 +1162,7 @@ fn compute_total(items: Vec<i32>) -> i32 {
         let f = file("a.rs", "let a = b; let a = b; let c = d; let e = f;");
         let files: Vec<&SourceFile> = vec![&f];
         let cfg = Config {
-            min_tokens: 1,
+            min_lines: 1,
             min_occurrences: 2,
             ..Config::default()
         };
@@ -1184,7 +1187,7 @@ fn compute_total(items: Vec<i32>) -> i32 {
             "b.rs",
             "fn beta(items: Vec<i32>) -> i32 {\n    let total = first(items) + second(items) * fourth(items);\n    total\n}",
         );
-        assert!(detect(&[&a, &b], &config()).is_empty());
+        assert!(detect(&[&a, &b], &fine_config()).is_empty());
     }
 
     #[test]
@@ -1197,7 +1200,7 @@ fn compute_total(items: Vec<i32>) -> i32 {
             "b.rs",
             "fn beta(items: Vec<i32>) -> i32 {\n    let total = first(items) + second(items) + third(items);\n    total + 2\n}",
         );
-        let groups = detect(&[&a, &b], &config());
+        let groups = detect(&[&a, &b], &fine_config());
         assert_eq!(groups.len(), 1);
         let lines: Vec<(u32, u32)> = groups[0]
             .occurrences
@@ -1217,11 +1220,11 @@ fn compute_total(items: Vec<i32>) -> i32 {
     fn default_threshold_reports_medium_statements() {
         let a = file(
             "a.rs",
-            "fn alpha(index: &Index, params: &Params) -> Result<PathBuf, Error> {\n    let resolved = resolve_file(index.root(), &params.file).ok_or_else(|| {\n        format!(\"cannot resolve file `{}` under `{}`\", params.file, index.root().display())\n    })?;\n    let value = 1;\n    Ok(resolved)\n}",
+            "fn alpha(index: &Index, params: &Params) -> Result<i32, Error> {\n    let total = compute_first(index.root())\n        .and_then(|value| compute_second(value))\n        .and_then(|value| compute_third(value))\n        .and_then(|value| compute_fourth(value))\n        .unwrap_or_default();\n    Ok(total + 1)\n}",
         );
         let b = file(
             "b.rs",
-            "fn beta(index: &Index, params: &Params) -> Result<PathBuf, Error> {\n    let resolved = resolve_file(index.root(), &params.file).ok_or_else(|| {\n        format!(\"cannot resolve file `{}` under `{}`\", params.file, index.root().display())\n    })?;\n    let value = 2;\n    Ok(resolved)\n}",
+            "fn beta(index: &Index, params: &Params) -> Result<i32, Error> {\n    let total = compute_first(index.root())\n        .and_then(|value| compute_second(value))\n        .and_then(|value| compute_third(value))\n        .and_then(|value| compute_fourth(value))\n        .unwrap_or_default();\n    Ok(total + 2)\n}",
         );
         let groups = detect(&[&a, &b], &Config::default());
         assert_eq!(groups.len(), 1);
@@ -1237,7 +1240,7 @@ fn compute_total(items: Vec<i32>) -> i32 {
                 )
             })
             .collect();
-        assert_eq!(lines, vec![(2, 4), (2, 4)]);
+        assert_eq!(lines, vec![(2, 6), (2, 6)]);
     }
 
     #[test]
@@ -1250,7 +1253,7 @@ fn compute_total(items: Vec<i32>) -> i32 {
             "b.rs",
             "fn beta() {\n    let first = compute_one(alpha_input, beta_input, gamma_input);\n    let second = compute_two(alpha_input, beta_input) + extra_value;\n    let marker = 2;\n}",
         );
-        let groups = detect(&[&a, &b], &config());
+        let groups = detect(&[&a, &b], &fine_config());
         assert_eq!(groups.len(), 2);
         let mut lines: Vec<(u32, u32)> = groups
             .iter()
@@ -1285,7 +1288,7 @@ fn compute_total(items: Vec<i32>) -> i32 {
             "c.rs",
             "fn unrelated(input: &[i32], scale: i32) -> usize {\n    let adjusted = input.iter().map(|value| value * scale).collect::<Vec<i32>>();\n    adjusted.len()\n}\n",
         );
-        let groups = detect(&[&a, &b, &c], &config());
+        let groups = detect(&[&a, &b, &c], &fine_config());
         assert_eq!(groups.len(), 2);
         let outer = groups
             .iter()

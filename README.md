@@ -65,7 +65,7 @@ dup-detector mcp
 dup-detector scan <path>
 
 # restrict languages and tune thresholds
-dup-detector scan <path> --lang rust --lang python --min-tokens 50 --min-occurrences 2 --max-groups 50
+dup-detector scan <path> --lang rust --lang python --min-lines 4 --min-occurrences 2 --max-groups 50
 
 # JSON output (for tooling)
 dup-detector scan <path> --json
@@ -78,9 +78,9 @@ Scan options:
 
 | Flag                      | Default | Description                                  |
 | ------------------------- | ------- | -------------------------------------------- |
-| `--min-tokens <N>`        | `40`    | Minimum token count for a clone group        |
+| `--min-lines <N>`         | `4`     | Minimum line count for a clone group         |
 | `--min-occurrences <N>`   | `2`     | Minimum occurrences per group                |
-| `--max-groups <N>`        | `50`    | Maximum number of groups to report           |
+| `--max-groups <N>`        | none    | Maximum number of groups to report           |
 | `--parameterize-literals` | off     | Treat consistently renamed literals as equal |
 | `--lang <LANG>`           | all     | Restrict to a language (repeatable)          |
 | `--json`                  | off     | Print results as JSON                        |
@@ -106,14 +106,14 @@ The server keeps an in-memory index per workspace root and refreshes it incremen
 
 | Tool                     | Purpose                               | Parameters                                                                                               |
 | ------------------------ | ------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `find_clones`            | Project-wide duplicated code          | `scope?`, `min_tokens?`, `min_occurrences?`, `max_groups?`, `types?`, `parameterize_literals?` |
-| `find_clones_in_file`    | Clones involving a given file         | `file`, `scope?`, `min_tokens?`, `min_occurrences?`, `max_groups?`, `types?`                             |
-| `find_clones_for_region` | "Is the code I'm writing duplicated?" | `file`, `start_line`, `end_line`, `scope?`, `min_tokens?`, `max_groups?`, `types?`                       |
+| `find_clones`            | Project-wide duplicated code          | `scope?`, `min_lines?`, `min_occurrences?`, `max_groups?`, `types?`, `parameterize_literals?` |
+| `find_clones_in_file`    | Clones involving a given file         | `file`, `scope?`, `min_lines?`, `min_occurrences?`, `max_groups?`, `types?`                             |
+| `find_clones_for_region` | "Is the code I'm writing duplicated?" | `file`, `start_line`, `end_line`, `scope?`, `min_lines?`, `max_groups?`, `types?`                       |
 | `reindex`                | Rebuild the in-memory index           | `path?`                                                                                                  |
 
 - `scope` defaults to the current working directory.
 - `types` accepts `"type-1"`, `"type-2"`.
-- `find_clones_for_region` defaults `min_tokens` to the size of the queried region and parses the file on the fly if it is not indexed yet.
+- `find_clones_for_region` defaults `min_lines` to the line span of the queried region and parses the file on the fly if it is not indexed yet.
 
 ### Response shape
 
