@@ -2,16 +2,16 @@
 
 [English](README.md) | 简体中文
 
-一个 [MCP](https://modelcontextprotocol.io) 服务器（同时提供 CLI），用于在代码库中查找**重复代码**，目标是与 JetBrains IDE 的 _Duplicated Code_ 检查对齐。
+一个用于在代码库中查找**重复代码**的工具，提供 LSP、MCP 和 CLI，目标是与 JetBrains IDE 的 _Duplicated Code_ 检查对齐。
 
 与基于文本/正则的方案不同，`dup-detector` 基于 **tree-sitter 生成的 token 流**，并使用**参数化（重命名不变）编码**，因此即使变量或字面量被重命名，只要结构相同也能识别出来。
 
 ## 克隆类型
 
-| 类型   | 含义                                     | 支持情况           |
-| ------ | ---------------------------------------- | ------------------ |
-| Type-1 | 除空白/注释/格式外完全相同               | 支持               |
-| Type-2 | 标识符（以及可选的字面量）被一致地重命名 | 支持（核心目标）   |
+| 类型   | 含义                                     | 支持情况         |
+| ------ | ---------------------------------------- | ---------------- |
+| Type-1 | 除空白/注释/格式外完全相同               | 支持             |
+| Type-2 | 标识符（以及可选的字面量）被一致地重命名 | 支持（核心目标） |
 
 ## 主要特性
 
@@ -20,7 +20,7 @@
 - **多语言** —— Rust、Python、JavaScript、TypeScript/TSX、C++。
 - **高性能** —— 并行解析（`rayon`）、遵循 `.gitignore` 的文件发现（`ignore`）、哈希种子分桶、基于 mtime 增量刷新的内存索引，以及跨进程复用的磁盘 token 缓存。
 - **响应精简** —— 仅返回文件路径 + 行号范围 + 令牌数 + 克隆类型，不返回源码片段。
-- **两种使用方式** —— 面向编码代理的常驻 MCP 服务器，以及 `scan` 命令行。
+- **三种使用方式** —— 面向编码代理的常驻 MCP 服务器、面向编辑器的 LSP 服务器，以及 `scan` 命令行。
 
 ## 工作原理
 
@@ -60,6 +60,9 @@ cargo build --release
 ```bash
 # 通过 stdio 启动 MCP 服务器
 dup-detector mcp
+
+# 通过 stdio 启动语言服务器
+dup-detector lsp
 
 # 扫描某个路径（默认当前目录）
 dup-detector scan <path>
@@ -121,12 +124,12 @@ languages = ["rust", "python", "javascript", "typescript", "tsx", "cpp"]
 
 ### 工具
 
-| 工具                     | 用途                           | 参数                                                                                                     |
-| ------------------------ | ------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| 工具                     | 用途                           | 参数                                                                                          |
+| ------------------------ | ------------------------------ | --------------------------------------------------------------------------------------------- |
 | `find_clones`            | 全项目范围的重复代码           | `scope?`、`min_lines?`、`min_occurrences?`、`max_groups?`、`types?`、`parameterize_literals?` |
-| `find_clones_in_file`    | 涉及指定文件的克隆             | `file`、`scope?`、`min_lines?`、`min_occurrences?`、`max_groups?`、`types?`                             |
-| `find_clones_for_region` | “我正在写的这段代码是否重复？” | `file`、`start_line`、`end_line`、`scope?`、`min_lines?`、`max_groups?`、`types?`                       |
-| `reindex`                | 重建内存索引                   | `path?`                                                                                                  |
+| `find_clones_in_file`    | 涉及指定文件的克隆             | `file`、`scope?`、`min_lines?`、`min_occurrences?`、`max_groups?`、`types?`                   |
+| `find_clones_for_region` | “我正在写的这段代码是否重复？” | `file`、`start_line`、`end_line`、`scope?`、`min_lines?`、`max_groups?`、`types?`             |
+| `reindex`                | 重建内存索引                   | `path?`                                                                                       |
 
 - `scope` 默认为当前工作目录。
 - `types` 接受 `"type-1"`、`"type-2"`。
@@ -150,11 +153,42 @@ languages = ["rust", "python", "javascript", "typescript", "tsx", "cpp"]
 }
 ```
 
+## 编辑器集成（LSP）
+
+以 `dup-detector lsp` 启动语言服务器，即可在编辑器中直接看到重复代码：
+
+- **警告** —— 打开文件中每个克隆出现位置都会报告为 `Warning` 诊断，范围覆盖重复片段，消息中列出其他出现位置（可通过 related information 跳转）。
+- **跳转到重复片段** —— 在克隆的任意位置执行 go to definition 会跳转到其他出现位置；find references 会列出全部位置。
+- **悬停** —— 显示克隆大小、类型以及所有出现位置。
+
+编辑器配置示例（Neovim）：
+
+```lua
+vim.lsp.start({
+  name = "dup-detector",
+  cmd = { "/absolute/path/to/dup-detector", "lsp" },
+  root_dir = vim.fs.root(0, { "dup-detector.toml", ".git" }),
+})
+```
+
+项目配置（`dup-detector.toml`）从工作区根目录读取（若不存在则回退到服务器启动目录）。
+
+### LSP 的效率设计
+
+检测是项目级的，若每次按键都重新检测将非常浪费。服务器因此：
+
+- 使用**增量文本同步**，只重新解析发生变化的文档；
+- 对编辑进行**防抖**（350 ms）并合并连续变更，通过 generation 计数取消过期分析；
+- 将 CPU 密集的分析放在**阻塞线程池**上执行，保持请求处理响应迅速；
+- **每次编辑增量检测**：只重新检测被修改的 token 窗口，加上上一次报告过的克隆的窗口签名，因此未受影响的克隆会被精确复现，候选规模与改动量成正比而非仓库大小；
+- 复用内存索引的 **mtime/大小增量刷新** 与每文件种子签名缓存；
+- 每个文件最多发布 `100` 条诊断，避免刷屏。
+
 ## 项目结构
 
 ```
 src/
-  main.rs       CLI 入口：`mcp` / `scan`
+  main.rs       CLI 入口：`mcp` / `lsp` / `scan`
   lib.rs        库根
   config.rs     Config + dup-detector.toml 读取
   language.rs   扩展名 -> LanguageId -> tree-sitter 语法
@@ -165,6 +199,7 @@ src/
   index.rs      文件发现、并行解析、增量刷新
   cache.rs      磁盘 token 缓存（mtime/大小/文本哈希校验）
   server.rs     rmcp 服务器 + MCP 工具定义
+  lsp.rs        LSP 服务器（诊断、跳转定义、引用、悬停）
 tests/
   corpus.rs     语料回归（重命名 / 常量 / 增行 / ……）
   corpus/       手写样例，含 precision/recall 断言
@@ -184,6 +219,7 @@ cargo clippy --all-targets -- -D warnings
 ## 路线图
 
 - Phase 0–6 已完成：token 提取、编码、检测、Type-1/2、基于 mtime 刷新的内存索引 + 磁盘 token 缓存、语料回归。
+- Phase 7 已完成：LSP 服务器，提供防抖增量诊断与跳转到重复片段。
 
 ## 许可证
 

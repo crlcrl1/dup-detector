@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-An [MCP](https://modelcontextprotocol.io) server (and CLI) that finds **duplicated code** in a codebase, aiming for parity with JetBrains IDE's _Duplicated Code_ inspection.
+A tool that finds **duplicated code** in a codebase, providing LSP, MCP and CLI, aiming for parity with JetBrains IDE's _Duplicated Code_ inspection.
 
 Unlike text/regex based tools, `dup-detector` works on the **token stream produced by tree-sitter** and uses a **parameterized (rename-invariant) encoding**, so it recognizes code that is structurally identical even when variables or literals have been renamed.
 
@@ -20,7 +20,7 @@ Unlike text/regex based tools, `dup-detector` works on the **token stream produc
 - **Multi-language** — Rust, Python, JavaScript, TypeScript/TSX, C++.
 - **Fast** — parallel parsing (`rayon`), `.gitignore`-aware discovery (`ignore`), hashed seed buckets, in-memory index with mtime-based incremental refresh, and an on-disk token cache that survives restarts.
 - **Token-efficient responses** — file paths + line ranges + size + clone type, no source excerpts.
-- **Two ways to use it** — a long-running MCP server for coding agents, and a `scan` CLI.
+- **Three ways to use it** — a long-running MCP server for coding agents, an LSP server for editors, and a `scan` CLI.
 
 ## How it works
 
@@ -60,6 +60,9 @@ cargo build --release
 ```bash
 # start the MCP server over stdio
 dup-detector mcp
+
+# start the language server over stdio
+dup-detector lsp
 
 # scan a path (defaults to the current directory)
 dup-detector scan <path>
@@ -121,12 +124,12 @@ The server keeps an in-memory index per workspace root and refreshes it incremen
 
 ### Tools
 
-| Tool                     | Purpose                               | Parameters                                                                                               |
-| ------------------------ | ------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| Tool                     | Purpose                               | Parameters                                                                                    |
+| ------------------------ | ------------------------------------- | --------------------------------------------------------------------------------------------- |
 | `find_clones`            | Project-wide duplicated code          | `scope?`, `min_lines?`, `min_occurrences?`, `max_groups?`, `types?`, `parameterize_literals?` |
-| `find_clones_in_file`    | Clones involving a given file         | `file`, `scope?`, `min_lines?`, `min_occurrences?`, `max_groups?`, `types?`                             |
-| `find_clones_for_region` | "Is the code I'm writing duplicated?" | `file`, `start_line`, `end_line`, `scope?`, `min_lines?`, `max_groups?`, `types?`                       |
-| `reindex`                | Rebuild the in-memory index           | `path?`                                                                                                  |
+| `find_clones_in_file`    | Clones involving a given file         | `file`, `scope?`, `min_lines?`, `min_occurrences?`, `max_groups?`, `types?`                   |
+| `find_clones_for_region` | "Is the code I'm writing duplicated?" | `file`, `start_line`, `end_line`, `scope?`, `min_lines?`, `max_groups?`, `types?`             |
+| `reindex`                | Rebuild the in-memory index           | `path?`                                                                                       |
 
 - `scope` defaults to the current working directory.
 - `types` accepts `"type-1"`, `"type-2"`.
@@ -150,11 +153,42 @@ The server keeps an in-memory index per workspace root and refreshes it incremen
 }
 ```
 
+## Editor integration (LSP)
+
+Run `dup-detector lsp` as a language server to surface duplicates directly in the editor:
+
+- **Warnings** — every clone occurrence in an open file is reported as a `Warning` diagnostic whose range covers the duplicated span and whose message lists the other occurrences (click-through via related information).
+- **Jump to duplicates** — go to definition on any line of a clone jumps to the other occurrences; find references lists all of them.
+- **Hover** — shows the clone size, type and every occurrence location.
+
+Example editor configuration (Neovim):
+
+```lua
+vim.lsp.start({
+  name = "dup-detector",
+  cmd = { "/absolute/path/to/dup-detector", "lsp" },
+  root_dir = vim.fs.root(0, { "dup-detector.toml", ".git" }),
+})
+```
+
+The project config (`dup-detector.toml`) is loaded from the workspace root (the server also falls back to its startup directory).
+
+### How the LSP stays fast
+
+Detection is project-wide, so re-running it on every keystroke would be wasteful. The server:
+
+- uses **incremental text sync** and only re-tokenizes the document that changed;
+- **debounces** edits (350 ms) and coalesces bursts, cancelling stale runs via a generation counter;
+- runs the CPU-heavy analysis on a **blocking thread pool**, so request handling stays responsive;
+- is **incremental per edit**: it re-detects only the token windows touched by the edit plus the window signatures of the clones reported last time, so unchanged clones are reproduced exactly and the candidate set stays proportional to the changes rather than the project size;
+- reuses the in-memory index with **mtime/size incremental refresh** and the per-file seed-signature cache;
+- caps published diagnostics per file (`100`) to avoid flooding.
+
 ## Project layout
 
 ```
 src/
-  main.rs       CLI entry: `mcp` / `scan`
+  main.rs       CLI entry: `mcp` / `lsp` / `scan`
   lib.rs        library root
   config.rs     Config + dup-detector.toml loading
   language.rs   extension -> LanguageId -> tree-sitter grammar
@@ -165,6 +199,7 @@ src/
   index.rs      file discovery, parallel parsing, incremental refresh
   cache.rs      on-disk token cache (mtime/size/text-hash validated)
   server.rs     rmcp server + MCP tool definitions
+  lsp.rs        LSP server (diagnostics, go-to-definition, references, hover)
 tests/
   corpus.rs     corpus regression (rename / constants / added line / ...)
   corpus/       hand-crafted fixtures with precision/recall assertions
@@ -184,6 +219,7 @@ cargo clippy --all-targets -- -D warnings
 ## Roadmap
 
 - Phases 0–6 done: tokens, encoding, detection, Type-1/2, in-memory index with mtime-based refresh plus an on-disk token cache, corpus regression.
+- Phase 7 done: LSP server with debounced, incremental diagnostics and jump-to-duplicate navigation.
 
 ## License
 

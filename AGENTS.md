@@ -29,6 +29,7 @@ Already written into `Cargo.toml`; no need to pick versions again:
 
 - Rust **edition 2024**, toolchain 1.98+
 - MCP SDK: `rmcp` 3.4 (feat. `transport-io`, stdio transport)
+- LSP SDK: `tower-lsp` 0.20 (stdio transport, tokio runtime)
 - Parsing: `tree-sitter` 0.27 + grammars: rust / python / javascript / typescript / cpp
 - Traversal: `ignore` (respects .gitignore), `rayon` (parallel parsing)
 - Serialization: `serde` / `serde_json` / `schemars` (MCP tool schemas), `toml` (config file)
@@ -54,6 +55,7 @@ src/
   index.rs       Project-level index (file discovery, parallel parsing, incremental invalidation)
   cache.rs       On-disk token cache (`.dup-detector/`, one entry per source file named by a hash of its root-relative path, mtime/size/text-hash validated)
   server.rs      rmcp ServerHandler + #[tool] tool definitions
+  lsp.rs         tower-lsp LanguageServer (diagnostics, definition, references, hover)
 ```
 
 Data flow:
@@ -67,6 +69,12 @@ File discovery (ignore) -> tree-sitter parse -> token stream -> parameterized en
 ### Configuration file
 
 Per project, one `dup-detector.toml` at the project root (constant `config::CONFIG_FILE_NAME`). It is read at startup by searching upwards from the starting path to the filesystem root: `scan` starts at the scanned path, `mcp` starts at the server's working directory, and the server also reads each scope/index root and falls back to the startup config when a root has none. All keys are optional; a missing file yields `Config::default()`. Unknown keys and unknown language names are errors (`ConfigError`). CLI flags and MCP tool params override the file via `with_limits`/direct field assignment. Schema: `min_lines`, `min_occurrences`, `max_bucket`, `seed_window`, `max_groups`, `parameterize_literals`, `languages` (array of language names accepted by `LanguageId::from_name`).
+
+### LSP server
+
+`lsp.rs` implements `tower_lsp::LanguageServer` over stdio (`dup-detector lsp`). It publishes clone occurrences in open documents as `Warning` diagnostics and answers `textDocument/definition`, `textDocument/references` and `textDocument/hover` from the last analysis snapshot. Editor buffers (including unsaved edits) are overlaid on the disk index by tokenizing the changed document in memory. Efficiency rules, keep them intact: incremental text sync (only the changed document is re-tokenized), a 350 ms debounce with coalescing and generation-based cancellation of stale runs, analysis on `spawn_blocking`, and incremental re-detection where `allowed` seeds are the changed regions plus the window signatures of the clones reported in the previous snapshot (so unchanged clones are reproduced and the candidate set scales with edits, not project size). A `PendingChanges` set tracks touched byte ranges; externally changed non-open files are treated as whole-file changes. The index does mtime/size incremental refresh and diagnostics are capped per file.
+
+Correctness invariant: for every clone whose occurrences include an open file, the incremental result must equal a full `detect_filtered` restricted to the open files. This is validated by a differential test that compares LSP diagnostics against `scan` after each random edit (synthetic and real-file corpora); keep it passing when touching the seed logic.
 
 ## 4. Core Algorithms (make-or-break, must follow)
 
@@ -101,6 +109,7 @@ Responses stay **token-efficient**: `{files_scanned, groups: [{token_count, clon
 cargo build                       # daily build
 cargo build --release             # performance-sensitive (always use release for large projects)
 cargo run -- mcp                  # start MCP server over stdio
+cargo run -- lsp                  # start language server over stdio
 cargo run -- scan <path>          # scan from the command line and print results
 cargo run -- scan <path> --json --min-lines 5 --min-occurrences 2 --parameterize-literals --lang rust
 cargo test                        # unit/integration tests
@@ -108,7 +117,7 @@ cargo fmt                         # formatting (required before commit)
 cargo clippy --all-targets -- -D warnings   # lint (required before commit)
 ```
 
-Note: the `rmcp` server must not write to stdout; all logs go to stderr (set `tracing_subscriber`'s writer to stderr), otherwise the stdio protocol breaks.
+Note: the `rmcp` and LSP servers must not write to stdout; all logs go to stderr (set `tracing_subscriber`'s writer to stderr), otherwise the stdio protocol breaks.
 
 ## 7. Coding Standards
 
@@ -128,6 +137,7 @@ Note: the `rmcp` server must not write to stdout; all logs go to stderr (set `tr
 - **Phase 4** Done: filtering/sorting/clustering for Type-1/Type-2 clones.
 - **Phase 5** Done: project index with mtime/size incremental refresh and a best-effort on-disk token cache (`.dup-detector/` in the scanned root; one entry per source file, named by a hash of its root-relative path and validated by mtime/size/text hash; corrupt/missing entries fall back to parsing; refresh only rewrites changed entries and drops entries for removed files; `reindex` clears the whole directory).
 - **Phase 6** Done: corpus regression under `tests/corpus/` (rename / change constant / add line / same file / unrelated) with precision/recall assertions in `tests/corpus.rs`.
+- **Phase 7** Done: `lsp.rs` LSP server over stdio publishing clone warnings for open documents plus go-to-definition / references / hover navigation, with incremental sync, debouncing, generation-based cancellation and open-document seed filtering.
 
 ## 9. Working Agreements for Agents
 

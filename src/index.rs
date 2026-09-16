@@ -114,12 +114,12 @@ impl SourceIndex {
         }
     }
 
-    pub fn refresh(&mut self) {
+    pub fn refresh(&mut self) -> Vec<PathBuf> {
         let paths = match discover(&self.root, &self.config) {
             Ok(paths) => paths,
             Err(e) => {
                 tracing::warn!(error = %e, "refresh: file discovery failed");
-                return;
+                return Vec::new();
             }
         };
         let mut old: HashMap<PathBuf, SourceFile> = std::mem::take(&mut self.files)
@@ -127,6 +127,7 @@ impl SourceIndex {
             .map(|f| (f.path.clone(), f))
             .collect();
         let mut files = Vec::with_capacity(paths.len());
+        let mut changed = Vec::new();
         let mut parsed = 0usize;
         for (path, language) in paths {
             if let Some(f) = old.remove(&path)
@@ -145,6 +146,7 @@ impl SourceIndex {
                 }
                 files.push(f);
             }
+            changed.push(path);
             parsed += 1;
         }
         if let Some(dir) = &self.cache_dir {
@@ -152,6 +154,7 @@ impl SourceIndex {
                 cache::remove_entry(dir, &self.root, &removed.path);
             }
         }
+        changed.extend(old.into_keys());
         self.files = files;
         self.by_path = self
             .files
@@ -163,6 +166,7 @@ impl SourceIndex {
             cache_hits: 0,
             parsed_files: parsed,
         };
+        changed
     }
 
     pub fn root(&self) -> &Path {

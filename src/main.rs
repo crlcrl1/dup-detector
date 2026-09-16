@@ -24,6 +24,8 @@ struct Cli {
 enum Command {
     /// Run as a long-running MCP server over stdio
     Mcp,
+    /// Run as a language server over stdio (diagnostics + jump to duplicates)
+    Lsp,
     /// Scan a path and print duplicated code groups
     Scan {
         /// Path to scan (defaults to the current directory)
@@ -60,6 +62,7 @@ fn main() -> anyhow::Result<()> {
 
     match Cli::parse().command {
         Command::Mcp => run_mcp(),
+        Command::Lsp => run_lsp(),
         Command::Scan {
             path,
             min_lines,
@@ -93,6 +96,13 @@ fn run_mcp() -> anyhow::Result<()> {
         running.waiting().await?;
         Ok(())
     })
+}
+
+fn run_lsp() -> anyhow::Result<()> {
+    let root = std::env::current_dir().context("cannot resolve the current directory")?;
+    let config = Config::load_or_default(&root)
+        .with_context(|| format!("failed to load config from {}", root.display()))?;
+    dup_detector::lsp::run(config, root)
 }
 
 #[allow(clippy::too_many_arguments)]
