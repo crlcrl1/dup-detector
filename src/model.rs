@@ -52,14 +52,11 @@ pub enum CloneType {
     Type1,
     #[serde(rename = "type-2")]
     Type2,
-    #[serde(rename = "type-3")]
-    Type3,
 }
 
 #[derive(Debug, Clone)]
 pub struct CloneGroup {
     pub occurrences: Vec<Occurrence>,
     pub token_count: usize,
-    pub similarity: f64,
     pub clone_type: CloneType,
 }

@@ -58,11 +58,8 @@ pub fn detect(files: &[&SourceFile], config: &Config) -> Vec<CloneGroup> {
                 }) {
                     continue;
                 }
-                let extended = if config.type3 {
-                    extend_match_gapped(files, a.file, a.start, b.file, b.start, window, config)
-                } else {
-                    extend_match(files, a.file, a.start, b.file, b.start, window, config)
-                };
+                let extended =
+                    extend_match(files, a.file, a.start, b.file, b.start, window, config);
                 let Some((occ_a, occ_b)) = extended else {
                     continue;
                 };
@@ -72,7 +69,7 @@ pub fn detect(files: &[&SourceFile], config: &Config) -> Vec<CloneGroup> {
         }
     }
 
-    let matches = merge_matches(files, matches, config);
+    let matches = merge_matches(matches);
     let matches = filter_matches(matches, config);
     cluster(files, matches, config)
 }
@@ -145,229 +142,6 @@ fn extend_match(
     ))
 }
 
-fn extend_match_gapped(
-    files: &[&SourceFile],
-    file_a: u32,
-    start_a: u32,
-    file_b: u32,
-    start_b: u32,
-    window: usize,
-    config: &Config,
-) -> Option<(Occurrence, Occurrence)> {
-    let mut aligner = Aligner::new(files, file_a, file_b, config);
-    let tokens_a = aligner.tokens_a;
-    let tokens_b = aligner.tokens_b;
-    let mut a_start = start_a as usize;
-    let mut b_start = start_b as usize;
-    let mut a_end = start_a as usize + window;
-    let mut b_end = start_b as usize + window;
-    for i in 0..window {
-        if !aligner.hard(start_a as usize + i, start_b as usize + i) {
-            return None;
-        }
-    }
-    aligner.extend_right(&mut a_end, &mut b_end);
-    aligner.extend_left(&mut a_start, &mut b_start);
-    if a_end > tokens_a.len() || b_end > tokens_b.len() {
-        return None;
-    }
-    Some((
-        Occurrence {
-            file: file_a,
-            start: a_start as u32,
-            end: a_end as u32,
-        },
-        Occurrence {
-            file: file_b,
-            start: b_start as u32,
-            end: b_end as u32,
-        },
-    ))
-}
-
-struct Aligner<'a> {
-    source_a: &'a SourceFile,
-    source_b: &'a SourceFile,
-    tokens_a: &'a [Token],
-    tokens_b: &'a [Token],
-    config: &'a Config,
-    bijection: Bijection<'a>,
-}
-
-impl<'a> Aligner<'a> {
-    fn new(files: &[&'a SourceFile], file_a: u32, file_b: u32, config: &'a Config) -> Self {
-        let source_a = files[file_a as usize];
-        let source_b = files[file_b as usize];
-        Self {
-            source_a,
-            source_b,
-            tokens_a: &source_a.tokens,
-            tokens_b: &source_b.tokens,
-            config,
-            bijection: Bijection::new(),
-        }
-    }
-
-    fn soft(&self, index_a: usize, index_b: usize) -> bool {
-        compatible_soft(
-            self.source_a,
-            &self.tokens_a[index_a],
-            self.source_b,
-            &self.tokens_b[index_b],
-            &self.bijection,
-            self.config,
-        )
-    }
-
-    fn hard(&mut self, index_a: usize, index_b: usize) -> bool {
-        compatible(
-            self.source_a,
-            &self.tokens_a[index_a],
-            self.source_b,
-            &self.tokens_b[index_b],
-            &mut self.bijection,
-            self.config,
-        )
-    }
-
-    fn extend_right(&mut self, a_end: &mut usize, b_end: &mut usize) {
-        loop {
-            let mut run = 0;
-            while *a_end + run < self.tokens_a.len()
-                && *b_end + run < self.tokens_b.len()
-                && self.soft(*a_end + run, *b_end + run)
-            {
-                run += 1;
-            }
-            for k in 0..run {
-                self.hard(*a_end + k, *b_end + k);
-            }
-            *a_end += run;
-            *b_end += run;
-            if *a_end >= self.tokens_a.len() || *b_end >= self.tokens_b.len() {
-                return;
-            }
-            match self.resume_forward(*a_end, *b_end) {
-                Some((gap_a, gap_b)) => {
-                    *a_end += gap_a;
-                    *b_end += gap_b;
-                }
-                None => return,
-            }
-        }
-    }
-
-    fn extend_left(&mut self, a_start: &mut usize, b_start: &mut usize) {
-        loop {
-            let mut run = 0;
-            while *a_start > run
-                && *b_start > run
-                && self.soft(*a_start - run - 1, *b_start - run - 1)
-            {
-                run += 1;
-            }
-            for k in 0..run {
-                self.hard(*a_start - k - 1, *b_start - k - 1);
-            }
-            *a_start -= run;
-            *b_start -= run;
-            if *a_start == 0 || *b_start == 0 {
-                return;
-            }
-            match self.resume_backward(*a_start, *b_start) {
-                Some((gap_a, gap_b)) => {
-                    *a_start -= gap_a;
-                    *b_start -= gap_b;
-                }
-                None => return,
-            }
-        }
-    }
-
-    fn resume_forward(&self, a_end: usize, b_end: usize) -> Option<(usize, usize)> {
-        let max_gap = self.config.type3_max_gap;
-        let min_run = self.config.type3_min_run.max(2);
-        for total in 1..=max_gap * 2 {
-            for gap_a in 0..=total.min(max_gap) {
-                let gap_b = total - gap_a;
-                if gap_b > max_gap {
-                    continue;
-                }
-                if a_end + gap_a + min_run > self.tokens_a.len()
-                    || b_end + gap_b + min_run > self.tokens_b.len()
-                {
-                    continue;
-                }
-                if (0..min_run).all(|k| self.soft(a_end + gap_a + k, b_end + gap_b + k)) {
-                    return Some((gap_a, gap_b));
-                }
-            }
-        }
-        None
-    }
-
-    fn resume_backward(&self, a_start: usize, b_start: usize) -> Option<(usize, usize)> {
-        let max_gap = self.config.type3_max_gap;
-        let min_run = self.config.type3_min_run.max(2);
-        for total in 1..=max_gap * 2 {
-            for gap_a in 0..=total.min(max_gap) {
-                let gap_b = total - gap_a;
-                if gap_b > max_gap {
-                    continue;
-                }
-                if gap_a + min_run > a_start || gap_b + min_run > b_start {
-                    continue;
-                }
-                if (0..min_run).all(|k| self.soft(a_start - gap_a - k - 1, b_start - gap_b - k - 1))
-                {
-                    return Some((gap_a, gap_b));
-                }
-            }
-        }
-        None
-    }
-}
-
-fn compatible_soft<'a>(
-    file_a: &'a SourceFile,
-    token_a: &Token,
-    file_b: &'a SourceFile,
-    token_b: &Token,
-    bijection: &Bijection<'a>,
-    config: &Config,
-) -> bool {
-    match (token_a.kind, token_b.kind) {
-        (TokenKind::Fixed, TokenKind::Fixed) => {
-            file_a.text[token_a.start as usize..token_a.end as usize]
-                == file_b.text[token_b.start as usize..token_b.end as usize]
-        }
-        (TokenKind::Identifier, TokenKind::Identifier) => {
-            let name_a = &file_a.text[token_a.start as usize..token_a.end as usize];
-            let name_b = &file_b.text[token_b.start as usize..token_b.end as usize];
-            match (bijection.forward.get(name_a), bijection.reverse.get(name_b)) {
-                (Some(mapped), _) => *mapped == name_b,
-                (None, Some(mapped)) => *mapped == name_a,
-                (None, None) => true,
-            }
-        }
-        (TokenKind::Literal, TokenKind::Literal) => {
-            if config.parameterize_literals {
-                let lit_a = &file_a.text[token_a.start as usize..token_a.end as usize];
-                let lit_b = &file_b.text[token_b.start as usize..token_b.end as usize];
-                match (bijection.forward.get(lit_a), bijection.reverse.get(lit_b)) {
-                    (Some(mapped), _) => *mapped == lit_b,
-                    (None, Some(mapped)) => *mapped == lit_a,
-                    (None, None) => true,
-                }
-            } else {
-                file_a.text[token_a.start as usize..token_a.end as usize]
-                    == file_b.text[token_b.start as usize..token_b.end as usize]
-            }
-        }
-        _ => false,
-    }
-}
-
 fn compatible<'a>(
     file_a: &'a SourceFile,
     token_a: &Token,
@@ -426,50 +200,32 @@ impl<'a> Bijection<'a> {
     }
 }
 
-fn merge_matches(
-    files: &[&SourceFile],
-    matches: Vec<(Occurrence, Occurrence)>,
-    config: &Config,
-) -> Vec<(Occurrence, Occurrence)> {
+fn merge_matches(matches: Vec<(Occurrence, Occurrence)>) -> Vec<(Occurrence, Occurrence)> {
     let mut by_pair: HashMap<(u32, u32), Vec<(Occurrence, Occurrence)>> = HashMap::new();
     for (a, b) in matches {
         by_pair.entry((a.file, b.file)).or_default().push((a, b));
     }
-    let tolerance = if config.type3 {
-        config.type3_max_gap as u32
-    } else {
-        0
-    };
     let mut merged: Vec<(Occurrence, Occurrence)> = Vec::new();
     for mut group in by_pair.into_values() {
         group.sort_by_key(|(a, b)| (a.start, b.start));
         let mut chain: Vec<(Occurrence, Occurrence)> = Vec::new();
         for (a, b) in group {
             if let Some((la, lb)) = chain.last_mut()
-                && a.start <= la.end.saturating_add(tolerance)
-                && b.start <= lb.end.saturating_add(tolerance)
-                && aligned(la, lb, &a, &b, tolerance)
+                && a.start <= la.end
+                && b.start <= lb.end
+                && aligned(la, lb, &a, &b)
             {
-                let candidate = (
-                    Occurrence {
-                        file: la.file,
-                        start: la.start,
-                        end: la.end.max(a.end),
-                    },
-                    Occurrence {
-                        file: lb.file,
-                        start: lb.start,
-                        end: lb.end.max(b.end),
-                    },
-                );
-                if !config.type3
-                    || pair_similarity(files, candidate.0, candidate.1, config)
-                        >= config.type3_min_similarity
-                {
-                    *la = candidate.0;
-                    *lb = candidate.1;
-                    continue;
-                }
+                *la = Occurrence {
+                    file: la.file,
+                    start: la.start,
+                    end: la.end.max(a.end),
+                };
+                *lb = Occurrence {
+                    file: lb.file,
+                    start: lb.start,
+                    end: lb.end.max(b.end),
+                };
+                continue;
             }
             chain.push((a, b));
         }
@@ -478,16 +234,8 @@ fn merge_matches(
     merged
 }
 
-fn aligned(
-    la: &Occurrence,
-    lb: &Occurrence,
-    a: &Occurrence,
-    b: &Occurrence,
-    tolerance: u32,
-) -> bool {
-    let chained = la.start as i64 - lb.start as i64;
-    let candidate = a.start as i64 - b.start as i64;
-    (chained - candidate).unsigned_abs() <= u64::from(tolerance)
+fn aligned(la: &Occurrence, lb: &Occurrence, a: &Occurrence, b: &Occurrence) -> bool {
+    (la.start as i64 - lb.start as i64) == (a.start as i64 - b.start as i64)
 }
 
 fn filter_matches(
@@ -502,51 +250,6 @@ fn filter_matches(
             len_a.min(len_b) >= config.min_tokens
         })
         .collect()
-}
-
-fn pair_similarity(files: &[&SourceFile], a: Occurrence, b: Occurrence, config: &Config) -> f64 {
-    let len_a = (a.end - a.start) as usize;
-    let len_b = (b.end - b.start) as usize;
-    let longest = len_a.max(len_b);
-    if longest == 0 {
-        return 1.0;
-    }
-    if longest > config.type3_max_lcs_span {
-        return 0.0;
-    }
-    let keys_a = encode::span_keys(
-        files[a.file as usize],
-        a.start as usize,
-        len_a,
-        config.parameterize_literals,
-    );
-    let keys_b = encode::span_keys(
-        files[b.file as usize],
-        b.start as usize,
-        len_b,
-        config.parameterize_literals,
-    );
-    lcs_len(&keys_a, &keys_b) as f64 / longest as f64
-}
-
-fn lcs_len(a: &[u64], b: &[u64]) -> usize {
-    if a.is_empty() || b.is_empty() {
-        return 0;
-    }
-    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
-    let mut previous = vec![0u32; short.len() + 1];
-    let mut current = vec![0u32; short.len() + 1];
-    for &x in long {
-        for (j, &y) in short.iter().enumerate() {
-            current[j + 1] = if x == y {
-                previous[j] + 1
-            } else {
-                previous[j + 1].max(current[j])
-            };
-        }
-        std::mem::swap(&mut previous, &mut current);
-    }
-    previous[short.len()] as usize
 }
 
 struct Dsu {
@@ -673,19 +376,9 @@ fn cluster(
             continue;
         }
         let clone_type = classify_type(files, &merged);
-        if clone_type == CloneType::Type3 && !config.type3 {
-            continue;
-        }
-        let similarity = group_similarity(
-            files,
-            merged[best_representative(files, &merged, config)],
-            &merged,
-            config,
-        );
         groups.push(CloneGroup {
             occurrences: merged,
             token_count,
-            similarity,
             clone_type,
         });
     }
@@ -722,35 +415,6 @@ fn refine_groups(
     representative: Occurrence,
     config: &Config,
 ) -> Option<Vec<Vec<Occurrence>>> {
-    if config.type3 {
-        let refined: Vec<Occurrence> = occurrences
-            .iter()
-            .filter_map(|occ| {
-                let file = files[occ.file as usize];
-                snap_out(
-                    file,
-                    &pairs[occ.file as usize],
-                    occ.start as usize,
-                    occ.end as usize,
-                )
-                .map(|(start, end)| Occurrence {
-                    file: occ.file,
-                    start: start as u32,
-                    end: end as u32,
-                })
-            })
-            .collect();
-        if refined.len() < config.min_occurrences {
-            return None;
-        }
-        let representative = refined[best_representative(files, &refined, config)];
-        let kept: Vec<Occurrence> = refined
-            .into_iter()
-            .filter(|occ| occurrences_match(files, representative, *occ, config))
-            .collect();
-        return (kept.len() >= config.min_occurrences).then_some(vec![kept]);
-    }
-
     let representative_index = occurrences.iter().position(|occ| *occ == representative)?;
     let expanded: Option<Vec<Occurrence>> = occurrences
         .iter()
@@ -1119,9 +783,6 @@ fn is_boilerplate(files: &[&SourceFile], occurrences: &[Occurrence]) -> bool {
 fn occurrences_match(files: &[&SourceFile], a: Occurrence, b: Occurrence, config: &Config) -> bool {
     let len_a = (a.end - a.start) as usize;
     let len_b = (b.end - b.start) as usize;
-    if config.type3 && len_a.max(len_b) <= config.type3_max_lcs_span {
-        return pair_similarity(files, a, b, config) >= config.type3_min_similarity;
-    }
     len_a == len_b
         && encode::span_keys(
             files[a.file as usize],
@@ -1145,11 +806,7 @@ fn classify_type(files: &[&SourceFile], occurrences: &[Occurrence]) -> CloneType
         let file_b = files[occ.file as usize];
         let tokens_b = &file_b.tokens[occ.start as usize..occ.end as usize];
         let text_b = &file_b.text;
-        if tokens_a.len() != tokens_b.len() {
-            return CloneType::Type3;
-        }
-        let n = tokens_a.len().min(tokens_b.len());
-        for i in 0..n {
+        for i in 0..tokens_a.len() {
             if text_a[tokens_a[i].start as usize..tokens_a[i].end as usize]
                 != text_b[tokens_b[i].start as usize..tokens_b[i].end as usize]
             {
@@ -1158,23 +815,6 @@ fn classify_type(files: &[&SourceFile], occurrences: &[Occurrence]) -> CloneType
         }
     }
     CloneType::Type1
-}
-
-fn group_similarity(
-    files: &[&SourceFile],
-    representative: Occurrence,
-    occurrences: &[Occurrence],
-    config: &Config,
-) -> f64 {
-    if !config.type3 {
-        // Non-Type-3 occurrences passed exact parameterized-key equality against the representative.
-        return 1.0;
-    }
-    occurrences
-        .iter()
-        .filter(|occ| **occ != representative)
-        .map(|occ| pair_similarity(files, representative, *occ, config))
-        .fold(1.0f64, f64::min)
 }
 
 #[cfg(test)]
@@ -1314,108 +954,30 @@ fn compute_total(items: Vec<i32>) -> i32 {
         assert!(detect(&[&a, &b], &lenient).is_empty());
     }
 
-    const LOOP: &str = r#"
-fn compute_total(items: Vec<i32>) -> i32 {
-    let mut sum = 0;
-    for item in items {
-        sum = sum + item * item;
-    }
-    return sum;
-}
-"#;
-
-    #[test]
-    fn type3_disabled_does_not_report_type3() {
-        let a = file("a.rs", LOOP);
-        let b = file(
-            "b.rs",
-            &LOOP.replace("    return sum;", "    sum = sum + 1;\n    return sum;"),
-        );
-        let cfg = Config {
-            min_tokens: 12,
-            ..config()
-        };
-        let groups = detect(&[&a, &b], &cfg);
-        assert!(!groups.is_empty());
-        assert!(groups.iter().all(|g| g.clone_type != CloneType::Type3));
-    }
-
-    #[test]
-    fn type3_detects_added_statement() {
-        let a = file("a.rs", LOOP);
-        let b = file(
-            "b.rs",
-            &LOOP.replace(
-                "        sum = sum + item * item;",
-                "        sum = sum + item * item;\n        if sum > 100 {\n            sum = sum - 50;\n        }",
-            ),
-        );
-        let cfg = Config {
-            min_tokens: 15,
-            type3: true,
-            ..config()
-        };
-        let groups = detect(&[&a, &b], &cfg);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].clone_type, CloneType::Type3);
-        assert!(groups[0].similarity < 1.0);
-        assert!(groups[0].similarity >= 0.7);
-    }
-
-    #[test]
-    fn type3_respects_max_gap() {
-        let alpha = "fn alpha(x: i32) -> i32 { let mut t = x; t = t + 1; t = t * 2; t - 3 }";
-        let beta = "fn beta(s: &str) -> usize { let n = s.len(); n * 2 + 1 }";
-        let filler =
-            "struct Widget { colour: u32, weight: f64, label: String, count: usize, fresh: bool }";
-        let a = file("a.rs", &format!("{alpha}\n{beta}\n"));
-        let b = file("b.rs", &format!("{alpha}\n{filler}\n{beta}\n"));
-        let cfg = Config {
-            min_tokens: 12,
-            type3: true,
-            ..config()
-        };
-        let groups = detect(&[&a, &b], &cfg);
-        assert!(!groups.is_empty());
-        assert!(groups.iter().all(|g| g.clone_type != CloneType::Type3));
-    }
-
     fn occ(file: u32, start: u32, end: u32) -> Occurrence {
         Occurrence { file, start, end }
     }
 
     #[test]
     fn aligned_matches_merge() {
-        let f = file("a.rs", "x");
-        let files: Vec<&SourceFile> = vec![&f];
-        let merged = merge_matches(
-            &files,
-            vec![
-                (occ(0, 0, 10), occ(0, 20, 30)),
-                (occ(0, 10, 20), occ(0, 30, 40)),
-            ],
-            &Config::default(),
-        );
+        let merged = merge_matches(vec![
+            (occ(0, 0, 10), occ(0, 20, 30)),
+            (occ(0, 10, 20), occ(0, 30, 40)),
+        ]);
         assert_eq!(merged, vec![(occ(0, 0, 20), occ(0, 20, 40))]);
     }
 
     #[test]
     fn drifted_alignments_do_not_merge() {
-        let f = file("a.rs", "x");
-        let files: Vec<&SourceFile> = vec![&f];
-        let merged = merge_matches(
-            &files,
-            vec![
-                (occ(0, 0, 10), occ(0, 20, 30)),
-                (occ(0, 8, 18), occ(0, 20, 30)),
-            ],
-            &Config::default(),
-        );
+        let merged = merge_matches(vec![
+            (occ(0, 0, 10), occ(0, 20, 30)),
+            (occ(0, 8, 18), occ(0, 20, 30)),
+        ]);
         assert_eq!(merged.len(), 2);
     }
 
     #[test]
-    fn cluster_drops_glued_occurrences_when_type3_disabled() {
+    fn cluster_drops_glued_occurrences() {
         let f = file("a.rs", "let a = b; let a = b; let c = d; let e = f;");
         let files: Vec<&SourceFile> = vec![&f];
         let cfg = Config {
@@ -1431,7 +993,6 @@ fn compute_total(items: Vec<i32>) -> i32 {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].occurrences.len(), 2);
         assert_eq!(groups[0].token_count, 5);
-        assert_ne!(groups[0].clone_type, CloneType::Type3);
     }
 
     #[test]

@@ -138,20 +138,3 @@ fn changed_constants_match_when_literals_are_parameterized() {
     let reported = reported_pairs(&index, &groups);
     assert!(reported.contains(&ordered("a.rs".to_string(), "b.rs".to_string())));
 }
-
-#[test]
-fn added_line_is_type3_when_enabled() {
-    let off = base_config();
-    let (_index, groups) = scan("added_line", &off);
-    assert!(groups.iter().all(|g| g.clone_type != CloneType::Type3));
-
-    let on = Config {
-        type3: true,
-        ..base_config()
-    };
-    let (_index, groups) = scan("added_line", &on);
-    assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].clone_type, CloneType::Type3);
-    assert!(groups[0].similarity < 1.0);
-    assert!(groups[0].similarity >= 0.7);
-}

@@ -75,12 +75,10 @@ pub struct FindClonesParams {
     pub min_occurrences: Option<usize>,
     /// Maximum number of groups to return (default 50).
     pub max_groups: Option<usize>,
-    /// Restrict results to these clone types: "type-1", "type-2", "type-3".
+    /// Restrict results to these clone types: "type-1", "type-2".
     pub types: Option<Vec<CloneType>>,
     /// Allow consistent literal renames to match as clones.
     pub parameterize_literals: Option<bool>,
-    /// Detect Type-3 near-miss clones (a few statements added or removed). Off by default.
-    pub type3: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -95,8 +93,6 @@ pub struct FindClonesInFileParams {
     pub min_occurrences: Option<usize>,
     /// Maximum number of groups to return (default 50).
     pub max_groups: Option<usize>,
-    /// Detect Type-3 near-miss clones (a few statements added or removed). Off by default.
-    pub type3: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -113,8 +109,6 @@ pub struct FindClonesForRegionParams {
     pub min_tokens: Option<usize>,
     /// Maximum number of groups to return (default 50).
     pub max_groups: Option<usize>,
-    /// Detect Type-3 near-miss clones (a few statements added or removed). Off by default.
-    pub type3: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -143,7 +137,6 @@ impl ScanResponse {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CloneGroupDto {
     pub token_count: usize,
-    pub similarity: f64,
     pub clone_type: CloneType,
     pub occurrences: Vec<OccurrenceDto>,
 }
@@ -177,17 +170,9 @@ fn to_dto(files: &[&SourceFile], group: &CloneGroup) -> CloneGroupDto {
         .collect();
     CloneGroupDto {
         token_count: group.token_count,
-        similarity: group.similarity,
         clone_type: group.clone_type,
         occurrences,
     }
-}
-
-fn apply_type3(mut config: Config, type3: Option<bool>) -> Config {
-    if let Some(v) = type3 {
-        config.type3 = v;
-    }
-    config
 }
 
 fn resolve_file(root: &Path, file: &str) -> Option<PathBuf> {
@@ -214,7 +199,7 @@ fn token_span_for_lines(
 #[tool_router(server_handler)]
 impl CloneServer {
     #[tool(
-        description = "Find duplicated code across the project (or a subdirectory). Returns clone groups sorted by size; each group lists its file paths, line ranges, token count and similarity. Token-efficient: does not include source excerpts."
+        description = "Find duplicated code across the project (or a subdirectory). Returns clone groups sorted by size; each group lists its file paths, line ranges, token count and clone type. Token-efficient: does not include source excerpts."
     )]
     async fn find_clones(
         &self,
@@ -232,9 +217,6 @@ impl CloneServer {
                     );
                     if let Some(v) = params.parameterize_literals {
                         cfg.parameterize_literals = v;
-                    }
-                    if let Some(v) = params.type3 {
-                        cfg.type3 = v;
                     }
                     let groups: Vec<CloneGroup> = index
                         .find_clones(&cfg)
@@ -283,7 +265,6 @@ impl CloneServer {
                         params.min_occurrences,
                         params.max_groups,
                     );
-                    let cfg = apply_type3(cfg, params.type3);
                     let groups: Vec<CloneGroup> = index
                         .find_clones(&cfg)
                         .into_iter()
@@ -344,12 +325,9 @@ impl CloneServer {
                     let min_tokens = params
                         .min_tokens
                         .unwrap_or(config.min_tokens.min(span_end - span_start));
-                    let cfg = apply_type3(
-                        config
-                            .clone()
-                            .with_limits(Some(min_tokens), None, params.max_groups),
-                        params.type3,
-                    );
+                    let cfg = config
+                        .clone()
+                        .with_limits(Some(min_tokens), None, params.max_groups);
                     let groups: Vec<CloneGroup> = crate::detect::detect(&files, &cfg)
                         .into_iter()
                         .filter(|g| {

@@ -9,11 +9,6 @@ pub struct Config {
     pub max_groups: usize,
     pub parameterize_literals: bool,
     pub languages: Vec<LanguageId>,
-    pub type3: bool,
-    pub type3_max_gap: usize,
-    pub type3_min_run: usize,
-    pub type3_min_similarity: f64,
-    pub type3_max_lcs_span: usize,
 }
 
 impl Default for Config {
@@ -26,11 +21,6 @@ impl Default for Config {
             max_groups: 50,
             parameterize_literals: false,
             languages: LanguageId::ALL.to_vec(),
-            type3: false,
-            type3_max_gap: 12,
-            type3_min_run: 4,
-            type3_min_similarity: 0.7,
-            type3_max_lcs_span: 1500,
         }
     }
 }

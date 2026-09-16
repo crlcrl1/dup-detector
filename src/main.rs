@@ -41,9 +41,6 @@ enum Command {
         /// Allow consistent literal renames to match as clones
         #[arg(long)]
         parameterize_literals: bool,
-        /// Detect Type-3 near-miss clones (a few statements added or removed)
-        #[arg(long)]
-        type3: bool,
         /// Restrict scanning to these languages (e.g. --lang rust --lang cpp)
         #[arg(long = "lang", value_name = "LANG")]
         languages: Vec<String>,
@@ -69,7 +66,6 @@ fn main() -> anyhow::Result<()> {
             min_occurrences,
             max_groups,
             parameterize_literals,
-            type3,
             languages,
             json,
         } => run_scan(
@@ -78,7 +74,6 @@ fn main() -> anyhow::Result<()> {
             min_occurrences,
             max_groups,
             parameterize_literals,
-            type3,
             &languages,
             json,
         ),
@@ -104,7 +99,6 @@ fn run_scan(
     min_occurrences: Option<usize>,
     max_groups: Option<usize>,
     parameterize_literals: bool,
-    type3: bool,
     languages: &[String],
     json: bool,
 ) -> anyhow::Result<()> {
@@ -112,7 +106,6 @@ fn run_scan(
     if parameterize_literals {
         config.parameterize_literals = true;
     }
-    config.type3 = type3;
     if !languages.is_empty() {
         let ids: Vec<LanguageId> = languages
             .iter()
@@ -145,10 +138,9 @@ fn run_scan(
 fn print_group(n: usize, group: &CloneGroup, index: &SourceIndex) {
     let files = index.files();
     println!(
-        "#{n}: {} tokens, {:?}, similarity {:.2}, {} occurrence(s)",
+        "#{n}: {} tokens, {:?}, {} occurrence(s)",
         group.token_count,
         group.clone_type,
-        group.similarity,
         group.occurrences.len()
     );
     for occ in &group.occurrences {
