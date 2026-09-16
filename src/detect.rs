@@ -1168,7 +1168,10 @@ fn compute_total(items: Vec<i32>) -> i32 {
 
     #[test]
     fn finds_same_file_duplicate() {
-        let source = format!("{FN}\n{FN}");
+        let source = format!(
+            r"{FN}
+{FN}"
+        );
         let f = file("a.rs", &source);
         let groups = detect(&[&f], &config());
         assert_eq!(groups.len(), 1);
@@ -1179,7 +1182,29 @@ fn compute_total(items: Vec<i32>) -> i32 {
 
     #[test]
     fn adjacent_clone_after_identifier_tail_is_reported() {
-        let source = "fn pre() -> i32 {\n    let signatures = 1;\n    signatures\n}\n\nfn parameterized(previous: u32, start: usize, index: usize, tag: u64) -> u64 {\n    let distance = if previous != u32::MAX && previous as usize >= start {\n        (index - previous as usize) as u64\n    } else {\n        0\n    };\n    (distance & !TAG_MASK) | tag\n}\n\nfn parameterized111(previous: u32, start: usize, index: usize, tag: u64) -> u64 {\n    let distance = if previous != u32::MAX && previous as usize >= start {\n        (index - previous as usize) as u64\n    } else {\n        0\n    };\n    (distance & !TAG_MASK) | tag\n}\n";
+        let source = r#"fn pre() -> i32 {
+    let signatures = 1;
+    signatures
+}
+
+fn parameterized(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
+    let distance = if previous != u32::MAX && previous as usize >= start {
+        (index - previous as usize) as u64
+    } else {
+        0
+    };
+    (distance & !TAG_MASK) | tag
+}
+
+fn parameterized2(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
+    let distance = if previous != u32::MAX && previous as usize >= start {
+        (index - previous as usize) as u64
+    } else {
+        0
+    };
+    (distance & !TAG_MASK) | tag
+}
+"#;
         let f = file("a.rs", source);
         let groups = detect(&[&f], &config());
         assert!(
@@ -1304,11 +1329,17 @@ fn compute_total(items: Vec<i32>) -> i32 {
     fn partial_statements_are_not_reported() {
         let a = file(
             "a.rs",
-            "fn alpha(items: Vec<i32>) -> i32 {\n    let total = first(items) + second(items) + third(items);\n    total\n}",
+            r#"fn alpha(items: Vec<i32>) -> i32 {
+    let total = first(items) + second(items) + third(items);
+    total
+}"#,
         );
         let b = file(
             "b.rs",
-            "fn beta(items: Vec<i32>) -> i32 {\n    let total = first(items) + second(items) * fourth(items);\n    total\n}",
+            r#"fn beta(items: Vec<i32>) -> i32 {
+    let total = first(items) + second(items) * fourth(items);
+    total
+}"#,
         );
         assert!(detect(&[&a, &b], &fine_config()).is_empty());
     }
@@ -1317,11 +1348,17 @@ fn compute_total(items: Vec<i32>) -> i32 {
     fn complete_units_are_reported() {
         let a = file(
             "a.rs",
-            "fn alpha(items: Vec<i32>) -> i32 {\n    let total = first(items) + second(items) + third(items);\n    total + 1\n}",
+            r#"fn alpha(items: Vec<i32>) -> i32 {
+    let total = first(items) + second(items) + third(items);
+    total + 1
+}"#,
         );
         let b = file(
             "b.rs",
-            "fn beta(items: Vec<i32>) -> i32 {\n    let total = first(items) + second(items) + third(items);\n    total + 2\n}",
+            r#"fn beta(items: Vec<i32>) -> i32 {
+    let total = first(items) + second(items) + third(items);
+    total + 2
+}"#,
         );
         let groups = detect(&[&a, &b], &fine_config());
         assert_eq!(groups.len(), 1);
@@ -1343,11 +1380,29 @@ fn compute_total(items: Vec<i32>) -> i32 {
     fn default_threshold_reports_medium_statements() {
         let a = file(
             "a.rs",
-            "fn alpha(index: &Index, params: &Params) -> Result<i32, Error> {\n    let total = compute_first(index.root())\n        .and_then(|value| compute_second(value))\n        .and_then(|value| compute_third(value))\n        .and_then(|value| compute_fourth(value))\n        .and_then(|value| compute_fifth(value))\n        .and_then(|value| compute_sixth(value))\n        .unwrap_or_default();\n    Ok(total + 1)\n}",
+            r#"fn alpha(index: &Index, params: &Params) -> Result<i32, Error> {
+    let total = compute_first(index.root())
+        .and_then(|value| compute_second(value))
+        .and_then(|value| compute_third(value))
+        .and_then(|value| compute_fourth(value))
+        .and_then(|value| compute_fifth(value))
+        .and_then(|value| compute_sixth(value))
+        .unwrap_or_default();
+    Ok(total + 1)
+}"#,
         );
         let b = file(
             "b.rs",
-            "fn beta(index: &Index, params: &Params) -> Result<i32, Error> {\n    let total = compute_first(index.root())\n        .and_then(|value| compute_second(value))\n        .and_then(|value| compute_third(value))\n        .and_then(|value| compute_fourth(value))\n        .and_then(|value| compute_fifth(value))\n        .and_then(|value| compute_sixth(value))\n        .unwrap_or_default();\n    Ok(total + 2)\n}",
+            r#"fn beta(index: &Index, params: &Params) -> Result<i32, Error> {
+    let total = compute_first(index.root())
+        .and_then(|value| compute_second(value))
+        .and_then(|value| compute_third(value))
+        .and_then(|value| compute_fourth(value))
+        .and_then(|value| compute_fifth(value))
+        .and_then(|value| compute_sixth(value))
+        .unwrap_or_default();
+    Ok(total + 2)
+}"#,
         );
         let groups = detect(&[&a, &b], &Config::default());
         assert_eq!(groups.len(), 1);
@@ -1370,11 +1425,19 @@ fn compute_total(items: Vec<i32>) -> i32 {
     fn statement_runs_are_split_into_units() {
         let a = file(
             "a.rs",
-            "fn alpha() {\n    let first = compute_one(alpha_input, beta_input, gamma_input);\n    let second = compute_two(alpha_input, beta_input) + extra_value;\n    let marker = 1;\n}",
+            r#"fn alpha() {
+    let first = compute_one(alpha_input, beta_input, gamma_input);
+    let second = compute_two(alpha_input, beta_input) + extra_value;
+    let marker = 1;
+}"#,
         );
         let b = file(
             "b.rs",
-            "fn beta() {\n    let first = compute_one(alpha_input, beta_input, gamma_input);\n    let second = compute_two(alpha_input, beta_input) + extra_value;\n    let marker = 2;\n}",
+            r#"fn beta() {
+    let first = compute_one(alpha_input, beta_input, gamma_input);
+    let second = compute_two(alpha_input, beta_input) + extra_value;
+    let marker = 2;
+}"#,
         );
         let groups = detect(&[&a, &b], &fine_config());
         assert_eq!(groups.len(), 2);
@@ -1401,15 +1464,27 @@ fn compute_total(items: Vec<i32>) -> i32 {
     fn nested_clones_are_reported_separately() {
         let a = file(
             "a.rs",
-            "fn outer_one(input: &[i32], scale: i32) -> i32 {\n    let adjusted = input.iter().map(|value| value * scale).collect::<Vec<i32>>();\n    adjusted.iter().sum()\n}\n",
+            r#"fn outer_one(input: &[i32], scale: i32) -> i32 {
+    let adjusted = input.iter().map(|value| value * scale).collect::<Vec<i32>>();
+    adjusted.iter().sum()
+}
+"#,
         );
         let b = file(
             "b.rs",
-            "fn outer_two(input: &[i32], scale: i32) -> i32 {\n    let adjusted = input.iter().map(|value| value * scale).collect::<Vec<i32>>();\n    adjusted.iter().sum()\n}\n",
+            r#"fn outer_two(input: &[i32], scale: i32) -> i32 {
+    let adjusted = input.iter().map(|value| value * scale).collect::<Vec<i32>>();
+    adjusted.iter().sum()
+}
+"#,
         );
         let c = file(
             "c.rs",
-            "fn unrelated(input: &[i32], scale: i32) -> usize {\n    let adjusted = input.iter().map(|value| value * scale).collect::<Vec<i32>>();\n    adjusted.len()\n}\n",
+            r#"fn unrelated(input: &[i32], scale: i32) -> usize {
+    let adjusted = input.iter().map(|value| value * scale).collect::<Vec<i32>>();
+    adjusted.len()
+}
+"#,
         );
         let groups = detect(&[&a, &b, &c], &fine_config());
         assert_eq!(groups.len(), 2);
@@ -1437,12 +1512,28 @@ fn compute_total(items: Vec<i32>) -> i32 {
     fn python_multi_line_statement_is_a_semantic_unit() {
         let a = file_with(
             "a.py",
-            "def alpha():\n    total = compute(\n        first,\n        second,\n        third,\n        fourth,\n    )\n    return total\n",
+            r#"def alpha():
+    total = compute(
+        first,
+        second,
+        third,
+        fourth,
+    )
+    return total
+"#,
             LanguageId::Python,
         );
         let b = file_with(
             "b.py",
-            "def beta():\n    total = compute(\n        first,\n        second,\n        third,\n        fourth,\n    )\n    return total + 1\n",
+            r#"def beta():
+    total = compute(
+        first,
+        second,
+        third,
+        fourth,
+    )
+    return total + 1
+"#,
             LanguageId::Python,
         );
         let groups = detect(&[&a, &b], &config());
@@ -1465,12 +1556,30 @@ fn compute_total(items: Vec<i32>) -> i32 {
     fn javascript_multi_line_statement_is_a_semantic_unit() {
         let a = file_with(
             "a.js",
-            "function alpha() {\n    const total = compute(\n        first,\n        second,\n        third,\n        fourth,\n    );\n    return total;\n}\n",
+            r#"function alpha() {
+    const total = compute(
+        first,
+        second,
+        third,
+        fourth,
+    );
+    return total;
+}
+"#,
             LanguageId::JavaScript,
         );
         let b = file_with(
             "b.js",
-            "function beta() {\n    const total = compute(\n        first,\n        second,\n        third,\n        fourth,\n    );\n    return total + 1;\n}\n",
+            r#"function beta() {
+    const total = compute(
+        first,
+        second,
+        third,
+        fourth,
+    );
+    return total + 1;
+}
+"#,
             LanguageId::JavaScript,
         );
         let groups = detect(&[&a, &b], &config());
@@ -1493,11 +1602,17 @@ fn compute_total(items: Vec<i32>) -> i32 {
     fn import_blocks_are_not_reported() {
         let a = file(
             "a.rs",
-            "use std::collections::HashMap;\nuse std::path::{Path, PathBuf};\nuse serde::Serialize;\n",
+            r#"use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use serde::Serialize;
+"#,
         );
         let b = file(
             "b.rs",
-            "use core::mem::size_of;\nuse core::fmt::{Debug, Display};\nuse anyhow::Result;\n",
+            r#"use core::mem::size_of;
+use core::fmt::{Debug, Display};
+use anyhow::Result;
+"#,
         );
         assert!(detect(&[&a, &b], &config()).is_empty());
     }
