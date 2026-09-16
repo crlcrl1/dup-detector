@@ -1,5 +1,5 @@
-id = "dup-detector"
-name = "dup-detector"
+id = "dup-detector-lsp"
+name = "dup-detector-lsp"
 version = "0.1.0"
 schema_version = 1
 description = "Show duplicated code as diagnostics and jump between clone occurrences."

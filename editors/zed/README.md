@@ -23,7 +23,10 @@ that.
 ## Install
 
 1. In Zed, run `zed: install dev extension` and select this directory
-   (`editors/zed`). Zed compiles the extension to WebAssembly.
+   (`editors/zed`). The extension is installed as `dup-detector-lsp` (its `id`
+   in `extension.toml`). Zed compiles it to WebAssembly. If an extension with
+   the old `dup-detector` id is installed, uninstall it first with
+   `zed: extensions` to avoid two extensions registering the same server.
 2. Enable the server per language in `~/.config/zed/settings.json`:
 
    ```json
