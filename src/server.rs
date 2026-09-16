@@ -93,6 +93,8 @@ pub struct FindClonesInFileParams {
     pub min_occurrences: Option<usize>,
     /// Maximum number of groups to return (default 50).
     pub max_groups: Option<usize>,
+    /// Restrict results to these clone types: "type-1", "type-2".
+    pub types: Option<Vec<CloneType>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -109,6 +111,8 @@ pub struct FindClonesForRegionParams {
     pub min_tokens: Option<usize>,
     /// Maximum number of groups to return (default 50).
     pub max_groups: Option<usize>,
+    /// Restrict results to these clone types: "type-1", "type-2".
+    pub types: Option<Vec<CloneType>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -268,7 +272,13 @@ impl CloneServer {
                     let groups: Vec<CloneGroup> = index
                         .find_clones(&cfg)
                         .into_iter()
-                        .filter(|g| g.occurrences.iter().any(|o| o.file as usize == file_index))
+                        .filter(|g| {
+                            g.occurrences.iter().any(|o| o.file as usize == file_index)
+                                && params
+                                    .types
+                                    .as_ref()
+                                    .is_none_or(|types| types.contains(&g.clone_type))
+                        })
                         .collect();
                     Ok(ScanResponse::from_groups(index, groups))
                 },
@@ -335,7 +345,10 @@ impl CloneServer {
                                 o.file as usize == file_idx
                                     && o.start < span_end as u32
                                     && o.end > span_start as u32
-                            })
+                            }) && params
+                                .types
+                                .as_ref()
+                                .is_none_or(|types| types.contains(&g.clone_type))
                         })
                         .collect();
                     Ok(ScanResponse {

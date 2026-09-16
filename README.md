@@ -78,7 +78,7 @@ Scan options:
 
 | Flag                      | Default | Description                                  |
 | ------------------------- | ------- | -------------------------------------------- |
-| `--min-tokens <N>`        | `50`    | Minimum token count for a clone group        |
+| `--min-tokens <N>`        | `40`    | Minimum token count for a clone group        |
 | `--min-occurrences <N>`   | `2`     | Minimum occurrences per group                |
 | `--max-groups <N>`        | `50`    | Maximum number of groups to report           |
 | `--parameterize-literals` | off     | Treat consistently renamed literals as equal |
@@ -107,8 +107,8 @@ The server keeps an in-memory index per workspace root and refreshes it incremen
 | Tool                     | Purpose                               | Parameters                                                                                               |
 | ------------------------ | ------------------------------------- | -------------------------------------------------------------------------------------------------------- |
 | `find_clones`            | Project-wide duplicated code          | `scope?`, `min_tokens?`, `min_occurrences?`, `max_groups?`, `types?`, `parameterize_literals?` |
-| `find_clones_in_file`    | Clones involving a given file         | `file`, `scope?`, `min_tokens?`, `min_occurrences?`, `max_groups?`                             |
-| `find_clones_for_region` | "Is the code I'm writing duplicated?" | `file`, `start_line`, `end_line`, `scope?`, `min_tokens?`, `max_groups?`                       |
+| `find_clones_in_file`    | Clones involving a given file         | `file`, `scope?`, `min_tokens?`, `min_occurrences?`, `max_groups?`, `types?`                             |
+| `find_clones_for_region` | "Is the code I'm writing duplicated?" | `file`, `start_line`, `end_line`, `scope?`, `min_tokens?`, `max_groups?`, `types?`                       |
 | `reindex`                | Rebuild the in-memory index           | `path?`                                                                                                  |
 
 - `scope` defaults to the current working directory.

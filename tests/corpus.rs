@@ -69,6 +69,8 @@ fn corpus_precision_and_recall() {
         ("rename_python", &[("a.py", "b.py")]),
         ("rename_cpp", &[("a.cpp", "b.cpp")]),
         ("rename_typescript", &[("a.ts", "b.ts")]),
+        ("rename_javascript", &[("a.js", "b.js")]),
+        ("rename_tsx", &[("a.tsx", "b.tsx")]),
         ("added_line", &[]),
         ("same_file", &[("a.rs", "a.rs")]),
         ("unrelated", &[]),
@@ -101,7 +103,7 @@ fn corpus_precision_and_recall() {
     assert!(recall >= 0.9, "recall {recall}");
     assert_eq!(
         (true_positives, false_positives, false_negatives),
-        (5, 0, 0)
+        (7, 0, 0)
     );
 }
 
@@ -113,6 +115,8 @@ fn renamed_clones_are_type2() {
         "rename_python",
         "rename_cpp",
         "rename_typescript",
+        "rename_javascript",
+        "rename_tsx",
     ] {
         let (_index, groups) = scan(case, &config);
         assert_eq!(groups.len(), 1, "{case}: expected a single group");

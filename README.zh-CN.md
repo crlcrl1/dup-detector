@@ -78,7 +78,7 @@ dup-detector scan <path> --parameterize-literals
 
 | 参数                      | 默认值 | 说明                         |
 | ------------------------- | ------ | ---------------------------- |
-| `--min-tokens <N>`        | `50`   | 克隆组的最小 token 数        |
+| `--min-tokens <N>`        | `40`   | 克隆组的最小 token 数        |
 | `--min-occurrences <N>`   | `2`    | 每个克隆组的最小出现次数     |
 | `--max-groups <N>`        | `50`   | 最多返回的克隆组数量         |
 | `--parameterize-literals` | 关闭   | 将一致重命名的字面量视为相同 |
@@ -107,8 +107,8 @@ dup-detector scan <path> --parameterize-literals
 | 工具                     | 用途                           | 参数                                                                                                     |
 | ------------------------ | ------------------------------ | -------------------------------------------------------------------------------------------------------- |
 | `find_clones`            | 全项目范围的重复代码           | `scope?`、`min_tokens?`、`min_occurrences?`、`max_groups?`、`types?`、`parameterize_literals?` |
-| `find_clones_in_file`    | 涉及指定文件的克隆             | `file`、`scope?`、`min_tokens?`、`min_occurrences?`、`max_groups?`                             |
-| `find_clones_for_region` | “我正在写的这段代码是否重复？” | `file`、`start_line`、`end_line`、`scope?`、`min_tokens?`、`max_groups?`                       |
+| `find_clones_in_file`    | 涉及指定文件的克隆             | `file`、`scope?`、`min_tokens?`、`min_occurrences?`、`max_groups?`、`types?`                             |
+| `find_clones_for_region` | “我正在写的这段代码是否重复？” | `file`、`start_line`、`end_line`、`scope?`、`min_tokens?`、`max_groups?`、`types?`                       |
 | `reindex`                | 重建内存索引                   | `path?`                                                                                                  |
 
 - `scope` 默认为当前工作目录。
