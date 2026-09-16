@@ -20,7 +20,7 @@ fn base_config() -> Config {
 
 fn scan(case: &str, config: &Config) -> (SourceIndex, Vec<CloneGroup>) {
     let dir = corpus_root().join(case);
-    let index = SourceIndex::build(&dir, config).expect("index builds");
+    let index = SourceIndex::build_with_cache(&dir, config, None).expect("index builds");
     let groups = index.find_clones(config);
     (index, groups)
 }

@@ -51,7 +51,8 @@ src/
   tokenize.rs    Source file -> CST -> leaf token stream
   encode.rs      Token stream -> parameterized encoding (rename-invariant)
   detect.rs      seed-and-extend detection + bijection check + clone clustering
-  index.rs       Project-level index (file discovery, parallel parsing, incremental invalidation, cache)
+  index.rs       Project-level index (file discovery, parallel parsing, incremental invalidation)
+  cache.rs       On-disk token cache (`.dup-detector/`, one entry per source file named by a hash of its root-relative path, mtime/size/text-hash validated)
   server.rs      rmcp ServerHandler + #[tool] tool definitions
 ```
 
@@ -84,7 +85,7 @@ The server is long-running, maintains an in-memory index keyed by workspace root
 | `find_clones` | Project-wide duplicated code | `scope?`, `min_tokens?`, `min_occurrences?`, `max_groups?`, `types?`, `parameterize_literals?` |
 | `find_clones_in_file` | Clones involving a given file | `file`, `scope?`, `min_tokens?`, `min_occurrences?`, `max_groups?`, `types?` |
 | `find_clones_for_region` | **Most used by agents**: is the code I'm writing duplicated? | `file`, `start_line`, `end_line`, `scope?`, `min_tokens?`, `max_groups?`, `types?` |
-| `reindex` | Manually rebuild the index | `path?` |
+| `reindex` | Manually rebuild the index and clear its on-disk cache | `path?` |
 
 Defaults: `min_tokens = 40`, `min_occurrences = 2`, `max_groups = 50`, `max_bucket = 32`, seed window 8. `types` accepts `"type-1"` / `"type-2"`. `find_clones_for_region` defaults `min_tokens` to the size of the queried region and parses the file on the fly if it is not indexed yet.
 
@@ -121,7 +122,7 @@ Note: the `rmcp` server must not write to stdout; all logs go to stderr (set `tr
 - **Phase 2** Done: tree-sitter token extraction and parameterized encoding, with unit tests.
 - **Phase 3** Done: seed-and-extend detection + bijection check + maximal matching + clone clustering; `find_clones` usable.
 - **Phase 4** Done: filtering/sorting/clustering for Type-1/Type-2 clones.
-- **Phase 5** Partial: in-memory index with mtime-based incremental refresh; no on-disk cache yet.
+- **Phase 5** Done: project index with mtime/size incremental refresh and a best-effort on-disk token cache (`.dup-detector/` in the scanned root; one entry per source file, named by a hash of its root-relative path and validated by mtime/size/text hash; corrupt/missing entries fall back to parsing; refresh only rewrites changed entries and drops entries for removed files; `reindex` clears the whole directory).
 - **Phase 6** Done: corpus regression under `tests/corpus/` (rename / change constant / add line / same file / unrelated) with precision/recall assertions in `tests/corpus.rs`.
 
 ## 9. Working Agreements for Agents

@@ -18,7 +18,7 @@
 - **语义级而非文本级** —— 注释、空白和格式完全不影响结果。
 - **重命名不变** —— `a = b + c` 与 `x = y + z` 视为同一克隆。
 - **多语言** —— Rust、Python、JavaScript、TypeScript/TSX、C++。
-- **高性能** —— 并行解析（`rayon`）、遵循 `.gitignore` 的文件发现（`ignore`）、哈希种子分桶、基于 mtime 增量刷新的内存索引。
+- **高性能** —— 并行解析（`rayon`）、遵循 `.gitignore` 的文件发现（`ignore`）、哈希种子分桶、基于 mtime 增量刷新的内存索引，以及跨进程复用的磁盘 token 缓存。
 - **响应精简** —— 仅返回文件路径 + 行号范围 + 令牌数 + 克隆类型，不返回源码片段。
 - **两种使用方式** —— 面向编码代理的常驻 MCP 服务器，以及 `scan` 命令行。
 
@@ -100,7 +100,7 @@ dup-detector scan <path> --parameterize-literals
 }
 ```
 
-服务器按工作区根目录维护内存索引，并依据文件 mtime/大小进行增量刷新。所有日志都写入 stderr，以保持 stdio 协议干净。
+服务器按工作区根目录维护内存索引，并依据文件 mtime/大小进行增量刷新。解析后的 token 流还会缓存到扫描根目录下的 `.dup-detector/` 目录中，每个源文件一个条目、条目名为其相对根目录路径的哈希（通过 mtime、大小和文本哈希校验），因此新进程只需重新解析发生变化的文件，且只重写变化的条目；可用 `reindex` 清空该目录。如不希望它被纳入版本控制，请将 `.dup-detector/` 加入 `.gitignore`。所有日志都写入 stderr，以保持 stdio 协议干净。
 
 ### 工具
 
@@ -146,6 +146,7 @@ src/
   encode.rs     token 流 -> 参数化编码
   detect.rs     seed-and-extend、双射校验、聚类
   index.rs      文件发现、并行解析、增量刷新
+  cache.rs      磁盘 token 缓存（mtime/大小/文本哈希校验）
   server.rs     rmcp 服务器 + MCP 工具定义
 tests/
   corpus.rs     语料回归（重命名 / 常量 / 增行 / ……）
@@ -165,8 +166,7 @@ cargo clippy --all-targets -- -D warnings
 
 ## 路线图
 
-- Phase 0–4、6 已完成：token 提取、编码、检测、Type-1/2、语料回归。
-- **Phase 5（部分完成）**：具备基于 mtime 刷新的内存索引；尚未实现磁盘缓存。
+- Phase 0–6 已完成：token 提取、编码、检测、Type-1/2、基于 mtime 刷新的内存索引 + 磁盘 token 缓存、语料回归。
 
 ## 许可证
 

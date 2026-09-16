@@ -362,7 +362,7 @@ impl CloneServer {
     }
 
     #[tool(
-        description = "Rebuild the in-memory index for `path` (defaults to the current working directory). The next scan re-indexes that root from scratch."
+        description = "Rebuild the in-memory index for `path` (defaults to the current working directory) and drop its on-disk token cache. The next scan re-indexes that root from scratch."
     )]
     async fn reindex(
         &self,
@@ -379,6 +379,7 @@ impl CloneServer {
                 .lock()
                 .map_err(|_| "index lock poisoned".to_string())?;
             indexes.remove(&root);
+            SourceIndex::clear_cache(&root);
             Ok(Json(ReindexResponse { ok: true }))
         })
         .await

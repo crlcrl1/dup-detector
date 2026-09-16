@@ -104,6 +104,8 @@ impl std::fmt::Display for LanguageId {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[test]
@@ -127,16 +129,20 @@ mod tests {
 
     #[test]
     fn maps_paths() {
+        let path = |parts: &[&str]| parts.iter().collect::<PathBuf>();
         assert_eq!(
-            LanguageId::from_path("src/foo/bar.cc"),
+            LanguageId::from_path(path(&["src", "foo", "bar.cc"])),
             Some(LanguageId::Cpp)
         );
         assert_eq!(
-            LanguageId::from_path("include/bar.hpp"),
+            LanguageId::from_path(path(&["include", "bar.hpp"])),
             Some(LanguageId::Cpp)
         );
-        assert_eq!(LanguageId::from_path("src/lib.rs"), Some(LanguageId::Rust));
-        assert_eq!(LanguageId::from_path("README.md"), None);
+        assert_eq!(
+            LanguageId::from_path(path(&["src", "lib.rs"])),
+            Some(LanguageId::Rust)
+        );
+        assert_eq!(LanguageId::from_path(path(&["README.md"])), None);
     }
 
     fn parses(language: LanguageId, source: &str) -> bool {

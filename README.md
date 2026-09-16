@@ -18,7 +18,7 @@ Unlike text/regex based tools, `dup-detector` works on the **token stream produc
 - **Semantic, not textual** — comments, whitespace and formatting never matter.
 - **Rename invariant** — `a = b + c` and `x = y + z` are the same clone.
 - **Multi-language** — Rust, Python, JavaScript, TypeScript/TSX, C++.
-- **Fast** — parallel parsing (`rayon`), `.gitignore`-aware discovery (`ignore`), hashed seed buckets, in-memory index with mtime-based incremental refresh.
+- **Fast** — parallel parsing (`rayon`), `.gitignore`-aware discovery (`ignore`), hashed seed buckets, in-memory index with mtime-based incremental refresh, and an on-disk token cache that survives restarts.
 - **Token-efficient responses** — file paths + line ranges + size + clone type, no source excerpts.
 - **Two ways to use it** — a long-running MCP server for coding agents, and a `scan` CLI.
 
@@ -100,7 +100,7 @@ Register the release binary with your MCP client. Example configuration:
 }
 ```
 
-The server keeps an in-memory index per workspace root and refreshes it incrementally by file mtime/size. All logs go to stderr so the stdio protocol stays clean.
+The server keeps an in-memory index per workspace root and refreshes it incrementally by file mtime/size. Parsed token streams are also cached in the `.dup-detector/` directory at the scanned root, one entry per source file named by a hash of its root-relative path (validated by mtime, size and a text hash), so new processes only reparse changed files and only changed entries are rewritten; use `reindex` to clear the directory. Add `.dup-detector/` to `.gitignore` if you don't want it tracked. All logs go to stderr so the stdio protocol stays clean.
 
 ### Tools
 
@@ -146,6 +146,7 @@ src/
   encode.rs     token stream -> parameterized encoding
   detect.rs     seed-and-extend, bijection, clustering
   index.rs      file discovery, parallel parsing, incremental refresh
+  cache.rs      on-disk token cache (mtime/size/text-hash validated)
   server.rs     rmcp server + MCP tool definitions
 tests/
   corpus.rs     corpus regression (rename / constants / added line / ...)
@@ -165,8 +166,7 @@ cargo clippy --all-targets -- -D warnings
 
 ## Roadmap
 
-- Phases 0–4, 6 done: tokens, encoding, detection, Type-1/2, corpus regression.
-- **Phase 5 (partial)**: in-memory index with mtime-based refresh; an on-disk cache is not implemented yet.
+- Phases 0–6 done: tokens, encoding, detection, Type-1/2, in-memory index with mtime-based refresh plus an on-disk token cache, corpus regression.
 
 ## License
 
