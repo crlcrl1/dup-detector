@@ -28,34 +28,23 @@ pub fn detect_filtered(
 ) -> Vec<CloneGroup> {
     let started = std::time::Instant::now();
     let window = config.seed_window;
-    let hashes: Vec<Vec<u64>> = files
-        .par_iter()
-        .map(|file| encode::token_hashes(&file.text, &file.tokens))
-        .collect();
-
     let parameterize_literals = config.parameterize_literals;
     let mut seeds: Vec<(u64, u32, u32)> = (0..files.len())
         .into_par_iter()
         .flat_map_iter(|file_index| {
             let file = files[file_index];
-            if file.tokens.len() < window {
+            if window == 0 || file.tokens.len() < window {
                 return Vec::new();
             }
-            let file_hashes = &hashes[file_index];
             let mut local = Vec::with_capacity(file.tokens.len() - window + 1);
-            for start in 0..=(file.tokens.len() - window) {
-                let signature = encode::window_signature(
-                    &file.tokens,
-                    file_hashes,
-                    start,
-                    window,
-                    parameterize_literals,
-                );
-                if allowed.is_some_and(|allowed| !allowed.contains(&signature)) {
-                    continue;
+            file.for_each_window_signature(window, parameterize_literals, |signatures| {
+                for (start, &signature) in signatures.iter().enumerate() {
+                    if allowed.is_some_and(|allowed| !allowed.contains(&signature)) {
+                        continue;
+                    }
+                    local.push((signature, file_index as u32, start as u32));
                 }
-                local.push((signature, file_index as u32, start as u32));
-            }
+            });
             local
         })
         .collect();
@@ -100,7 +89,7 @@ pub fn detect_filtered(
         .collect();
     let processed: Vec<Vec<(Occurrence, Occurrence)>> = groups
         .par_iter()
-        .map(|candidates| process_group(files, &hashes, candidates, window, config))
+        .map(|candidates| process_group(files, candidates, window, config))
         .collect();
     drop(groups);
     drop(candidates);
@@ -109,11 +98,15 @@ pub fn detect_filtered(
 
     let matches = merge_matches(matches);
     let matches = filter_matches(files, matches, config);
-    let groups = cluster(files, &hashes, matches, config);
+    let merge_ms = started.elapsed().as_millis();
+    let groups = cluster(files, matches, config);
+    let cluster_ms = started.elapsed().as_millis() - merge_ms;
     tracing::debug!(
         seed_ms,
         candidate_ms,
         extend_ms,
+        merge_ms,
+        cluster_ms,
         total_ms = started.elapsed().as_millis(),
         seeds = seed_count,
         candidates = candidate_count,
@@ -132,29 +125,23 @@ pub fn span_window_signatures(
     let window = config.seed_window;
     let mut allowed = HashSet::new();
     let total = file.tokens.len();
-    if total < window || start >= end || end > total {
+    if window == 0 || total < window || start >= end || end > total {
         return allowed;
     }
-    let hashes = encode::token_hashes(&file.text, &file.tokens);
     let first = start.saturating_sub(window - 1);
     let last = end - 1;
-    for window_start in first..=last {
-        if window_start + window <= total {
-            allowed.insert(encode::window_signature(
-                &file.tokens,
-                &hashes,
-                window_start,
-                window,
-                config.parameterize_literals,
-            ));
+    file.for_each_window_signature(window, config.parameterize_literals, |signatures| {
+        for window_start in first..=last {
+            if let Some(&signature) = signatures.get(window_start) {
+                allowed.insert(signature);
+            }
         }
-    }
+    });
     allowed
 }
 
 fn process_group(
     files: &[&SourceFile],
-    hashes: &[Vec<u64>],
     candidates: &[Candidate],
     window: usize,
     config: &Config,
@@ -171,8 +158,7 @@ fn process_group(
         }) {
             continue;
         }
-        let Some(pair) = extend_match(files, hashes, candidate, window, config, &mut bijection)
-        else {
+        let Some(pair) = extend_match(files, candidate, window, config, &mut bijection) else {
             continue;
         };
         recorded.push(pair);
@@ -183,7 +169,6 @@ fn process_group(
 
 fn extend_match(
     files: &[&SourceFile],
-    hashes: &[Vec<u64>],
     candidate: &Candidate,
     window: usize,
     config: &Config,
@@ -193,8 +178,8 @@ fn extend_match(
     let file_b = candidate.file_b as usize;
     let tokens_a = files[file_a].tokens.as_slice();
     let tokens_b = files[file_b].tokens.as_slice();
-    let hashes_a = hashes[file_a].as_slice();
-    let hashes_b = hashes[file_b].as_slice();
+    let hashes_a = files[file_a].hashes.as_slice();
+    let hashes_b = files[file_b].hashes.as_slice();
     let start_a = candidate.start_a as usize;
     let start_b = candidate.start_b as usize;
     bijection.clear();
@@ -412,7 +397,6 @@ impl Dsu {
 
 fn cluster(
     files: &[&SourceFile],
-    hashes: &[Vec<u64>],
     matches: Vec<(Occurrence, Occurrence)>,
     config: &Config,
 ) -> Vec<CloneGroup> {
@@ -448,6 +432,7 @@ fn cluster(
     }
 
     let mut refined_groups: Vec<Vec<Occurrence>> = Vec::new();
+    let mut scratch = ClusterScratch::default();
     for ids in roots.values() {
         let mut occs: Vec<Occurrence> = ids.iter().map(|&id| occurrences[id]).collect();
         occs.sort();
@@ -455,20 +440,18 @@ fn cluster(
         if occs.len() < config.min_occurrences {
             continue;
         }
-        let representative = occs[best_representative(files, hashes, &occs, config)];
-        let merged: Vec<Occurrence> = occs
-            .into_iter()
-            .filter(|occ| occurrences_match(files, hashes, representative, *occ, config))
-            .collect();
+        let (representative_index, merged) =
+            representative_class(files, &occs, config, &mut scratch);
+        let representative = occs[representative_index];
         if merged.len() < config.min_occurrences {
             continue;
         }
-        if let Some(refined) = refine_groups(files, hashes, &metas, &merged, representative, config)
+        if let Some(refined) =
+            refine_groups(files, &metas, &merged, representative, config, &mut scratch)
         {
             refined_groups.extend(refined);
         }
     }
-
     let mut dsu = Dsu::new(refined_groups.len());
     let mut seen_occurrence: HashMap<Occurrence, usize> = HashMap::new();
     for (index, group) in refined_groups.iter().enumerate() {
@@ -549,11 +532,11 @@ fn drop_contained(occs: Vec<Occurrence>) -> Vec<Occurrence> {
 
 fn refine_groups(
     files: &[&SourceFile],
-    hashes: &[Vec<u64>],
     metas: &HashMap<u32, SpanMeta>,
     occurrences: &[Occurrence],
     representative: Occurrence,
     config: &Config,
+    scratch: &mut ClusterScratch,
 ) -> Option<Vec<Vec<Occurrence>>> {
     let representative_index = occurrences.iter().position(|occ| *occ == representative)?;
     let expanded: Option<Vec<Occurrence>> = occurrences
@@ -575,10 +558,10 @@ fn refine_groups(
             if candidates.iter().all(|occ| {
                 occurrences_match(
                     files,
-                    hashes,
                     candidates[representative_index],
                     *occ,
                     config,
+                    &mut scratch.span,
                 )
             }) =>
         {
@@ -587,27 +570,33 @@ fn refine_groups(
         _ => {
             let base = files[representative.file as usize];
             let base_meta = metas.get(&representative.file)?;
-            let (run_start, run_end) = complete_ranges(
+            complete_ranges(
                 base,
                 base_meta,
                 representative.start as usize,
                 representative.end as usize,
-            )
-            .into_iter()
-            .find(|&(start, end)| {
-                let head = start as u32 - representative.start;
-                let tail = representative.end - end as u32;
-                occurrences.iter().all(|occ| {
-                    metas.get(&occ.file).is_some_and(|meta| {
-                        is_complete_span(
-                            files[occ.file as usize],
-                            meta,
-                            (occ.start + head) as usize,
-                            (occ.end - tail) as usize,
-                        )
-                    })
-                })
-            })?;
+                &mut scratch.complete,
+            );
+            let (run_start, run_end) =
+                scratch
+                    .complete
+                    .ranges
+                    .iter()
+                    .copied()
+                    .find(|&(start, end)| {
+                        let head = start as u32 - representative.start;
+                        let tail = representative.end - end as u32;
+                        occurrences.iter().all(|occ| {
+                            metas.get(&occ.file).is_some_and(|meta| {
+                                is_complete_span(
+                                    files[occ.file as usize],
+                                    meta,
+                                    (occ.start + head) as usize,
+                                    (occ.end - tail) as usize,
+                                )
+                            })
+                        })
+                    })?;
             let head = run_start as u32 - representative.start;
             let tail = representative.end - run_end as u32;
             occurrences
@@ -648,7 +637,7 @@ fn refine_groups(
         let representative = refined[representative_index];
         if refined
             .iter()
-            .all(|occ| occurrences_match(files, hashes, representative, *occ, config))
+            .all(|occ| occurrences_match(files, representative, *occ, config, &mut scratch.span))
         {
             groups.push(refined);
         }
@@ -756,19 +745,17 @@ fn is_complete_span(file: &SourceFile, meta: &SpanMeta, start: usize, end: usize
     if meta.balance[end] != meta.balance[start] || meta.next_lower[start] <= end as u32 {
         return false;
     }
-    for index in start..end {
+    for index in start..end - 1 {
         let token = &file.tokens[index];
         if token.unit_start && token.unit_end_of_start as usize > end {
             return false;
         }
-    }
-    for index in start..end - 1 {
-        let token = &file.tokens[index];
         if token.unit_end && (token.unit_start_of_end as usize) < start {
             return false;
         }
     }
-    true
+    let last = &file.tokens[end - 1];
+    !(last.unit_start && last.unit_end_of_start as usize > end)
 }
 
 fn token_text(file: &SourceFile, index: usize) -> &str {
@@ -805,17 +792,26 @@ fn snap_out(
             return Some((snap_start, snap_end));
         }
         let mut changed = false;
-        let mut open: Vec<usize> = Vec::new();
+        let mut first_open: Option<usize> = None;
+        let mut depth = 0usize;
         for index in snap_start..snap_end {
             match token_text(file, index) {
-                "(" | "[" | "{" => open.push(index),
+                "(" | "[" | "{" => {
+                    if depth == 0 {
+                        first_open = Some(index);
+                    }
+                    depth += 1;
+                }
                 ")" | "]" | "}" => {
-                    open.pop()?;
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        first_open = None;
+                    }
                 }
                 _ => {}
             }
         }
-        if let Some(&first_open) = open.first() {
+        if let Some(first_open) = first_open {
             let close = meta.pairs[first_open];
             if close == u32::MAX {
                 return None;
@@ -861,42 +857,51 @@ fn complete_ranges(
     meta: &SpanMeta,
     start: usize,
     end: usize,
-) -> Vec<(usize, usize)> {
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    scratch: &mut CompleteScratch,
+) {
+    scratch.ranges.clear();
     if start >= end || end > file.tokens.len() {
-        return ranges;
+        return;
     }
     let len = end - start;
     if len > 4096 {
-        return ranges;
+        return;
     }
-    let mut depth = Vec::with_capacity(len + 1);
-    depth.push(0i32);
+    scratch.depth.clear();
+    scratch.depth.push(0i32);
     for index in start..end {
         let delta = match token_text(file, index) {
             "(" | "[" | "{" => 1,
             ")" | "]" | "}" => -1,
             _ => 0,
         };
-        depth.push(depth.last().copied().unwrap_or(0) + delta);
+        let last = scratch.depth.last().copied().unwrap_or(0);
+        scratch.depth.push(last + delta);
     }
-    let mut limit = vec![len; len + 1];
-    let mut stack: Vec<usize> = Vec::new();
+    scratch.limit.clear();
+    scratch.limit.resize(len + 1, len as u32);
+    scratch.stack.clear();
     for i in 0..=len {
-        while let Some(&top) = stack.last() {
-            if depth[i] < depth[top] {
-                limit[top] = i;
-                stack.pop();
+        while let Some(&top) = scratch.stack.last() {
+            if scratch.depth[i] < scratch.depth[top as usize] {
+                scratch.limit[top as usize] = i as u32;
+                scratch.stack.pop();
             } else {
                 break;
             }
         }
-        stack.push(i);
+        scratch.stack.push(i as u32);
     }
-    let mut ends_by_depth: HashMap<i32, Vec<usize>> = HashMap::new();
-    for (j, depth) in depth.iter().enumerate().skip(1) {
+    for ends in scratch.ends_by_depth.values_mut() {
+        ends.clear();
+    }
+    for (j, depth) in scratch.depth.iter().enumerate().skip(1) {
         if file.tokens[start + j - 1].unit_end {
-            ends_by_depth.entry(*depth).or_default().push(j);
+            scratch
+                .ends_by_depth
+                .entry(*depth)
+                .or_default()
+                .push(j as u32);
         }
     }
     for i in 0..len {
@@ -904,46 +909,117 @@ fn complete_ranges(
         if !token.unit_start {
             continue;
         }
-        let Some(ends) = ends_by_depth.get(&depth[i]) else {
+        let Some(ends) = scratch.ends_by_depth.get(&scratch.depth[i]) else {
             continue;
         };
-        let cut = ends.partition_point(|&j| j <= limit[i]);
+        let cut = ends.partition_point(|&j| j as usize <= scratch.limit[i] as usize);
+        let next_lower = meta.next_lower[start + i] as usize;
         let mut accepted = 0;
         for k in (0..cut).rev() {
-            let j = ends[k];
+            let j = ends[k] as usize;
             if j <= i || accepted >= 4 || token.unit_end_of_start as usize > start + j {
                 break;
             }
+            if next_lower <= start + j {
+                break;
+            }
             if is_complete_span(file, meta, start + i, start + j) {
-                ranges.push((start + i, start + j));
+                scratch.ranges.push((start + i, start + j));
                 accepted += 1;
             }
         }
     }
-    ranges.sort_by_key(|&(start, end)| std::cmp::Reverse(end - start));
-    ranges.truncate(64);
-    ranges
+    scratch
+        .ranges
+        .sort_by_key(|&(start, end)| std::cmp::Reverse(end - start));
+    scratch.ranges.truncate(64);
 }
 
-fn best_representative(
+#[derive(Default)]
+struct ClusterScratch {
+    span: encode::SpanScratch,
+    class_fingerprints: Vec<u64>,
+    class_representatives: Vec<u32>,
+    class_sizes: Vec<u32>,
+    assignments: Vec<u32>,
+    complete: CompleteScratch,
+}
+
+#[derive(Default)]
+struct CompleteScratch {
+    depth: Vec<i32>,
+    limit: Vec<u32>,
+    stack: Vec<u32>,
+    ends_by_depth: HashMap<i32, Vec<u32>>,
+    ranges: Vec<(usize, usize)>,
+}
+
+fn representative_class(
     files: &[&SourceFile],
-    hashes: &[Vec<u64>],
     occs: &[Occurrence],
     config: &Config,
-) -> usize {
+    scratch: &mut ClusterScratch,
+) -> (usize, Vec<Occurrence>) {
+    if occs.is_empty() {
+        return (0, Vec::new());
+    }
+    scratch.class_fingerprints.clear();
+    scratch.class_representatives.clear();
+    scratch.class_sizes.clear();
+    scratch.assignments.clear();
+    for (occ_index, occ) in occs.iter().enumerate() {
+        let file = files[occ.file as usize];
+        let fingerprint = encode::span_fingerprint(
+            &mut scratch.span,
+            &file.tokens,
+            &file.hashes,
+            occ.start as usize,
+            (occ.end - occ.start) as usize,
+            config.parameterize_literals,
+        );
+        let mut class = None;
+        for index in 0..scratch.class_representatives.len() {
+            if scratch.class_fingerprints[index] == fingerprint
+                && occurrences_match(
+                    files,
+                    occs[scratch.class_representatives[index] as usize],
+                    *occ,
+                    config,
+                    &mut scratch.span,
+                )
+            {
+                class = Some(index);
+                break;
+            }
+        }
+        let class = match class {
+            Some(index) => index,
+            None => {
+                scratch.class_fingerprints.push(fingerprint);
+                scratch.class_representatives.push(occ_index as u32);
+                scratch.class_sizes.push(0);
+                scratch.class_sizes.len() - 1
+            }
+        };
+        scratch.class_sizes[class] += 1;
+        scratch.assignments.push(class as u32);
+    }
     let mut best = 0;
-    let mut best_count = 0;
-    for (index, candidate) in occs.iter().enumerate() {
-        let count = occs
-            .iter()
-            .filter(|other| occurrences_match(files, hashes, *candidate, **other, config))
-            .count();
-        if count > best_count {
+    let mut best_size = 0;
+    for (index, &size) in scratch.class_sizes.iter().enumerate() {
+        if size > best_size {
             best = index;
-            best_count = count;
+            best_size = size;
         }
     }
-    best
+    let representative = scratch.class_representatives[best] as usize;
+    let merged = occs
+        .iter()
+        .zip(&scratch.assignments)
+        .filter(|(_, class)| **class as usize == best)
+        .map(|(occ, _)| *occ)
+        .collect();
+    (representative, merged)
 }
 
 const LOGIC_MARKERS: &[&str] = &[
@@ -966,10 +1042,10 @@ fn is_boilerplate(files: &[&SourceFile], occurrences: &[Occurrence]) -> bool {
 
 fn occurrences_match(
     files: &[&SourceFile],
-    hashes: &[Vec<u64>],
     a: Occurrence,
     b: Occurrence,
     config: &Config,
+    scratch: &mut encode::SpanScratch,
 ) -> bool {
     let len = (a.end - a.start) as usize;
     if len != (b.end - b.start) as usize {
@@ -978,11 +1054,12 @@ fn occurrences_match(
     let file_a = a.file as usize;
     let file_b = b.file as usize;
     encode::spans_equal(
+        scratch,
         &files[file_a].tokens,
-        &hashes[file_a],
+        &files[file_a].hashes,
         a.start as usize,
         &files[file_b].tokens,
-        &hashes[file_b],
+        &files[file_b].hashes,
         b.start as usize,
         len,
         config.parameterize_literals,
@@ -1035,14 +1112,14 @@ fn compute_total(items: Vec<i32>) -> i32 {
     }
 
     fn file_with(name: &str, source: &str, language: LanguageId) -> SourceFile {
-        SourceFile {
-            path: PathBuf::from(name),
+        SourceFile::new(
+            PathBuf::from(name),
             language,
-            text: source.to_string(),
-            tokens: tokenize(source, language).unwrap(),
-            modified: None,
-            size: 0,
-        }
+            source.to_string(),
+            tokenize(source, language).unwrap(),
+            None,
+            0,
+        )
     }
 
     fn config() -> Config {
@@ -1129,6 +1206,20 @@ fn compute_total(items: Vec<i32>) -> i32 {
     }
 
     #[test]
+    fn seed_cache_respects_configuration() {
+        let a = file("a.rs", "fn one() -> i32 { 100 + 200 }");
+        let b = file("b.rs", "fn one() -> i32 { 100 + 300 }");
+        let plain = fine_config();
+        let parameterized = Config {
+            parameterize_literals: true,
+            ..fine_config()
+        };
+        assert!(detect(&[&a, &b], &plain).is_empty());
+        assert_eq!(detect(&[&a, &b], &parameterized).len(), 1);
+        assert!(detect(&[&a, &b], &plain).is_empty());
+    }
+
+    #[test]
     fn inconsistent_rename_is_not_a_clone() {
         let a = file("a.rs", "fn f(x: i32, y: i32) -> i32 { x + y + x }");
         let b = file("b.rs", "fn f(a: i32, b: i32) -> i32 { a + b + c }");
@@ -1170,11 +1261,28 @@ fn compute_total(items: Vec<i32>) -> i32 {
             (occ(0, 0, 5), occ(0, 5, 10)),
             (occ(0, 0, 5), occ(0, 10, 17)),
         ];
-        let hashes = vec![encode::token_hashes(&f.text, &f.tokens)];
-        let groups = cluster(&files, &hashes, matches, &cfg);
+        let groups = cluster(&files, matches, &cfg);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].occurrences.len(), 2);
         assert_eq!(groups[0].token_count, 5);
+    }
+
+    #[test]
+    fn representative_class_prefers_largest_class() {
+        let f = file(
+            "a.rs",
+            "let alpha = 1; let gamma = 2; let alpha = 1; let gamma = 2;",
+        );
+        let files: Vec<&SourceFile> = vec![&f];
+        let occs = vec![occ(0, 0, 5), occ(0, 5, 10), occ(0, 10, 15), occ(0, 15, 20)];
+        let cfg = Config {
+            min_lines: 1,
+            ..Config::default()
+        };
+        let mut scratch = ClusterScratch::default();
+        let (representative, merged) = representative_class(&files, &occs, &cfg, &mut scratch);
+        assert_eq!(representative, 0);
+        assert_eq!(merged, vec![occ(0, 0, 5), occ(0, 10, 15)]);
     }
 
     #[test]

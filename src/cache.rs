@@ -7,7 +7,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::model::{SourceFile, Token, TokenKind};
 
-const MAGIC: &[u8; 8] = b"DUPCDT03";
+const MAGIC: &[u8; 8] = b"DUPCDT04";
 const HEADER_BYTES: usize = 12;
 const TOKEN_BYTES: usize = 34;
 
@@ -19,6 +19,7 @@ pub struct CacheEntry {
     pub size: u64,
     pub text_hash: u64,
     pub tokens: Vec<Token>,
+    pub hashes: Vec<u64>,
 }
 
 pub fn dir_in(root: &Path) -> PathBuf {
@@ -86,8 +87,15 @@ fn encode_entry(root: &Path, file: &SourceFile) -> Option<Vec<u8>> {
     let (secs, nanos) = mtime_parts(modified)?;
     let path_bytes = path.as_bytes();
     let token_count = u32::try_from(file.tokens.len()).ok()?;
-    let mut out =
-        Vec::with_capacity(HEADER_BYTES + path_bytes.len() + 28 + file.tokens.len() * TOKEN_BYTES);
+    if file.hashes.len() != file.tokens.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(
+        HEADER_BYTES
+            + path_bytes.len()
+            + 28
+            + file.tokens.len() * (TOKEN_BYTES + std::mem::size_of::<u64>()),
+    );
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&u32::try_from(path_bytes.len()).ok()?.to_le_bytes());
     out.extend_from_slice(path_bytes);
@@ -97,6 +105,9 @@ fn encode_entry(root: &Path, file: &SourceFile) -> Option<Vec<u8>> {
     out.extend_from_slice(&text_hash(&file.text).to_le_bytes());
     out.extend_from_slice(&token_count.to_le_bytes());
     encode_tokens(&mut out, &file.tokens);
+    for hash in &file.hashes {
+        out.extend_from_slice(&hash.to_le_bytes());
+    }
     Some(out)
 }
 
@@ -119,12 +130,21 @@ fn decode_entry(bytes: &[u8]) -> Option<CacheEntry> {
     let token_count = read_u32(bytes, &mut cursor)? as usize;
     let tokens_end = cursor.checked_add(token_count.checked_mul(TOKEN_BYTES)?)?;
     let tokens = decode_tokens(bytes.get(cursor..tokens_end)?, token_count)?;
+    let hashes_end = tokens_end.checked_add(token_count.checked_mul(8)?)?;
+    let hashes = bytes
+        .get(tokens_end..hashes_end)?
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|chunk| u64::from_le_bytes(*chunk))
+        .collect();
     Some(CacheEntry {
         path,
         modified: UNIX_EPOCH + Duration::new(secs, nanos),
         size,
         text_hash,
         tokens,
+        hashes,
     })
 }
 
@@ -238,11 +258,11 @@ mod tests {
     use crate::language::LanguageId;
 
     fn source(path: &Path, text: &str) -> SourceFile {
-        SourceFile {
-            path: path.to_path_buf(),
-            language: LanguageId::Rust,
-            text: text.to_string(),
-            tokens: vec![Token {
+        SourceFile::new(
+            path.to_path_buf(),
+            LanguageId::Rust,
+            text.to_string(),
+            vec![Token {
                 kind: TokenKind::Identifier,
                 start: 0,
                 end: 3,
@@ -256,9 +276,9 @@ mod tests {
                 container_start: false,
                 container_end_of_start: 0,
             }],
-            modified: Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
-            size: text.len() as u64,
-        }
+            Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            text.len() as u64,
+        )
     }
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -284,6 +304,7 @@ mod tests {
         assert_eq!(loaded.tokens.len(), 1);
         assert_eq!(loaded.tokens[0].kind, TokenKind::Identifier);
         assert!(loaded.tokens[0].unit_start);
+        assert_eq!(loaded.hashes, file.hashes);
         clear(&dir).unwrap();
     }
 
@@ -307,7 +328,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(&path, b"not a cache").unwrap();
         assert!(load_entry(&path).is_none());
-        fs::write(&path, b"DUPCDT03\x01\x00\x00\x00garbage").unwrap();
+        fs::write(&path, b"DUPCDT04\x01\x00\x00\x00garbage").unwrap();
         assert!(load_entry(&path).is_none());
         clear(&dir).unwrap();
     }

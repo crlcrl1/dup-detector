@@ -234,14 +234,15 @@ fn file_from_cache(
     if cache::text_hash(&text) != entry.text_hash {
         return None;
     }
-    Some(SourceFile {
-        path: path.to_path_buf(),
+    Some(SourceFile::with_hashes(
+        path.to_path_buf(),
         language,
         text,
-        tokens: entry.tokens,
-        modified: Some(entry.modified),
-        size: entry.size,
-    })
+        entry.tokens,
+        entry.hashes,
+        Some(entry.modified),
+        entry.size,
+    ))
 }
 
 fn discover(root: &Path, config: &Config) -> Result<Vec<(PathBuf, LanguageId)>, IndexError> {
@@ -291,14 +292,14 @@ pub(crate) fn parse_file(path: &Path, language: LanguageId) -> Option<SourceFile
             return None;
         }
     };
-    Some(SourceFile {
-        path: path.to_path_buf(),
+    Some(SourceFile::new(
+        path.to_path_buf(),
         language,
         text,
         tokens,
-        modified: meta.modified().ok(),
-        size: meta.len(),
-    })
+        meta.modified().ok(),
+        meta.len(),
+    ))
 }
 
 #[cfg(test)]
