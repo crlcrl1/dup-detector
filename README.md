@@ -173,6 +173,13 @@ vim.lsp.start({
 
 The project config (`dup-detector.toml`) is loaded from the workspace root (the server also falls back to its startup directory).
 
+### Bundled editor plugins
+
+Ready-to-install plugins live under [`editors/`](editors/):
+
+- [`editors/vscode`](editors/vscode) — a VS Code extension (compiles the LSP client and packages to `.vsix`).
+- [`editors/zed`](editors/zed) — a Zed extension. Zed cannot launch an arbitrary language server from settings alone (the server name must be registered by an extension), so this registers `dup-detector` for the supported languages.
+
 ### How the LSP stays fast
 
 Detection is project-wide, so re-running it on every keystroke would be wasteful. The server:

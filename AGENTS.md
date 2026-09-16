@@ -56,6 +56,9 @@ src/
   cache.rs       On-disk token cache (`.dup-detector/`, one entry per source file named by a hash of its root-relative path, mtime/size/text-hash validated)
   server.rs      rmcp ServerHandler + #[tool] tool definitions
   lsp.rs         tower-lsp LanguageServer (diagnostics, definition, references, hover)
+editors/
+  vscode/        VS Code extension (vscode-languageclient, packages to .vsix)
+  zed/           Zed extension (wasm, registers the language server name)
 ```
 
 Data flow:

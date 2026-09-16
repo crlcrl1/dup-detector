@@ -173,6 +173,13 @@ vim.lsp.start({
 
 项目配置（`dup-detector.toml`）从工作区根目录读取（若不存在则回退到服务器启动目录）。
 
+### 内置编辑器插件
+
+可直接安装的插件位于 [`editors/`](editors/)：
+
+- [`editors/vscode`](editors/vscode) —— VS Code 扩展（编译 LSP 客户端并打包为 `.vsix`）。
+- [`editors/zed`](editors/zed) —— Zed 扩展。Zed 无法仅靠配置启动任意语言服务器（服务器名必须由扩展注册），因此该扩展负责注册 `dup-detector`。
+
 ### LSP 的效率设计
 
 检测是项目级的，若每次按键都重新检测将非常浪费。服务器因此：
