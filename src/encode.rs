@@ -1,16 +1,106 @@
 use std::collections::HashMap;
-use std::hash::BuildHasherDefault;
+use std::hash::{BuildHasherDefault, Hasher};
 
-use xxhash_rust::xxh3::{Xxh3, xxh3_64};
+use xxhash_rust::xxh3::xxh3_64;
 
 use crate::model::{Token, TokenKind};
 
-type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<Xxh3>>;
+#[derive(Default, Clone, Copy)]
+pub struct FastHasher(u64);
+
+impl FastHasher {
+    #[inline]
+    fn mix(&mut self, value: u64) {
+        self.0 = (self.0 ^ value).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+impl Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^= x >> 31;
+        x
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        self.mix(xxh3_64(bytes));
+    }
+
+    #[inline]
+    fn write_u8(&mut self, n: u8) {
+        self.mix(n as u64);
+    }
+
+    #[inline]
+    fn write_u16(&mut self, n: u16) {
+        self.mix(n as u64);
+    }
+
+    #[inline]
+    fn write_u32(&mut self, n: u32) {
+        self.mix(n as u64);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        self.mix(n);
+    }
+
+    #[inline]
+    fn write_u128(&mut self, n: u128) {
+        self.mix(n as u64);
+        self.mix((n >> 64) as u64);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, n: usize) {
+        self.mix(n as u64);
+    }
+
+    #[inline]
+    fn write_i8(&mut self, n: i8) {
+        self.mix(n as u64);
+    }
+
+    #[inline]
+    fn write_i16(&mut self, n: i16) {
+        self.mix(n as u64);
+    }
+
+    #[inline]
+    fn write_i32(&mut self, n: i32) {
+        self.mix(n as u64);
+    }
+
+    #[inline]
+    fn write_i64(&mut self, n: i64) {
+        self.mix(n as u64);
+    }
+
+    #[inline]
+    fn write_i128(&mut self, n: i128) {
+        self.write_u128(n as u128);
+    }
+
+    #[inline]
+    fn write_isize(&mut self, n: isize) {
+        self.mix(n as u64);
+    }
+}
+
+pub(crate) type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
 
 const TAG_MASK: u64 = 0b11 << 62;
 const FIXED_TAG: u64 = 0b00 << 62;
 const IDENTIFIER_TAG: u64 = 0b01 << 62;
 const LITERAL_TAG: u64 = 0b10 << 62;
+const PARAM_TAG: u64 = 0b11 << 62;
 
 pub fn token_hashes(text: &str, tokens: &[Token]) -> Vec<u64> {
     tokens
@@ -29,6 +119,15 @@ pub fn window_signatures(
         return Vec::new();
     }
     let total = tokens.len();
+    let base: Vec<u64> = tokens
+        .iter()
+        .zip(hashes)
+        .map(|(token, &hash)| match token.kind {
+            TokenKind::Fixed => (hash & !TAG_MASK) | FIXED_TAG,
+            TokenKind::Literal if !parameterize_literals => (hash & !TAG_MASK) | LITERAL_TAG,
+            _ => PARAM_TAG,
+        })
+        .collect();
     let mut last_position: FastMap<(u64, TokenKind), u32> = FastMap::default();
     let mut previous = vec![u32::MAX; total];
     for (index, token) in tokens.iter().enumerate() {
@@ -43,15 +142,14 @@ pub fn window_signatures(
     for start in 0..=total - window {
         for i in 0..window {
             let index = start + i;
-            let value = match tokens[index].kind {
-                TokenKind::Fixed => (hashes[index] & !TAG_MASK) | FIXED_TAG,
-                TokenKind::Identifier => {
-                    parameterized(previous[index], start, index, IDENTIFIER_TAG)
-                }
-                TokenKind::Literal if parameterize_literals => {
-                    parameterized(previous[index], start, index, LITERAL_TAG)
-                }
-                TokenKind::Literal => (hashes[index] & !TAG_MASK) | LITERAL_TAG,
+            let value = if base[index] != PARAM_TAG {
+                base[index]
+            } else {
+                let tag = match tokens[index].kind {
+                    TokenKind::Literal => LITERAL_TAG,
+                    _ => IDENTIFIER_TAG,
+                };
+                parameterized(previous[index], start, index, tag)
             };
             bytes[i * 8..i * 8 + 8].copy_from_slice(&value.to_le_bytes());
         }

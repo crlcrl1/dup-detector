@@ -7,9 +7,9 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::model::{SourceFile, Token, TokenKind};
 
-const MAGIC: &[u8; 8] = b"DUPCDT04";
+const MAGIC: &[u8; 8] = b"DUPCDT05";
 const HEADER_BYTES: usize = 12;
-const TOKEN_BYTES: usize = 34;
+const TOKEN_BYTES: usize = 30;
 
 pub const CACHE_DIR: &str = ".dup-detector";
 
@@ -91,10 +91,7 @@ fn encode_entry(root: &Path, file: &SourceFile) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(
-        HEADER_BYTES
-            + path_bytes.len()
-            + 28
-            + file.tokens.len() * (TOKEN_BYTES + std::mem::size_of::<u64>()),
+        HEADER_BYTES + path_bytes.len() + 28 + file.tokens.len() * (TOKEN_BYTES + size_of::<u64>()),
     );
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&u32::try_from(path_bytes.len()).ok()?.to_le_bytes());
@@ -156,27 +153,16 @@ fn mtime_parts(time: SystemTime) -> Option<(u64, u32)> {
 
 fn encode_tokens(out: &mut Vec<u8>, tokens: &[Token]) {
     for token in tokens {
-        let mut flags = 0u8;
-        if token.unit_start {
-            flags |= 1;
-        }
-        if token.unit_end {
-            flags |= 2;
-        }
-        if token.container_start {
-            flags |= 4;
-        }
         out.push(match token.kind {
             TokenKind::Identifier => 0,
             TokenKind::Literal => 1,
             TokenKind::Fixed => 2,
         });
-        out.push(flags);
+        out.push(token.flags);
         out.extend_from_slice(&token.start.to_le_bytes());
         out.extend_from_slice(&token.end.to_le_bytes());
         out.extend_from_slice(&token.line.to_le_bytes());
         out.extend_from_slice(&token.end_line.to_le_bytes());
-        out.extend_from_slice(&token.column.to_le_bytes());
         out.extend_from_slice(&token.unit_end_of_start.to_le_bytes());
         out.extend_from_slice(&token.unit_start_of_end.to_le_bytes());
         out.extend_from_slice(&token.container_end_of_start.to_le_bytes());
@@ -195,20 +181,16 @@ fn decode_tokens(raw: &[u8], count: usize) -> Option<Vec<Token>> {
             2 => TokenKind::Fixed,
             _ => return None,
         };
-        let flags = chunk[1];
         tokens.push(Token {
             kind,
+            flags: chunk[1],
             start: read_u32_from(chunk, 2)?,
             end: read_u32_from(chunk, 6)?,
             line: read_u32_from(chunk, 10)?,
             end_line: read_u32_from(chunk, 14)?,
-            column: read_u32_from(chunk, 18)?,
-            unit_start: flags & 1 != 0,
-            unit_end: flags & 2 != 0,
-            unit_end_of_start: read_u32_from(chunk, 22)?,
-            unit_start_of_end: read_u32_from(chunk, 26)?,
-            container_start: flags & 4 != 0,
-            container_end_of_start: read_u32_from(chunk, 30)?,
+            unit_end_of_start: read_u32_from(chunk, 18)?,
+            unit_start_of_end: read_u32_from(chunk, 22)?,
+            container_end_of_start: read_u32_from(chunk, 26)?,
         });
     }
     Some(tokens)
@@ -256,6 +238,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::language::LanguageId;
+    use crate::model::{FLAG_UNIT_END, FLAG_UNIT_START};
 
     fn source(path: &Path, text: &str) -> SourceFile {
         SourceFile::new(
@@ -264,16 +247,13 @@ mod tests {
             text.to_string(),
             vec![Token {
                 kind: TokenKind::Identifier,
+                flags: FLAG_UNIT_START | FLAG_UNIT_END,
                 start: 0,
                 end: 3,
                 line: 1,
                 end_line: 1,
-                column: 0,
-                unit_start: true,
-                unit_end: true,
                 unit_end_of_start: 1,
                 unit_start_of_end: 0,
-                container_start: false,
                 container_end_of_start: 0,
             }],
             Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
@@ -303,7 +283,7 @@ mod tests {
         assert_eq!(loaded.text_hash, text_hash(&file.text));
         assert_eq!(loaded.tokens.len(), 1);
         assert_eq!(loaded.tokens[0].kind, TokenKind::Identifier);
-        assert!(loaded.tokens[0].unit_start);
+        assert!(loaded.tokens[0].unit_start());
         assert_eq!(loaded.hashes, file.hashes);
         clear(&dir).unwrap();
     }

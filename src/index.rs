@@ -64,30 +64,36 @@ impl SourceIndex {
         cache_dir: Option<PathBuf>,
     ) -> Result<Self, IndexError> {
         let paths = discover(&root, config)?;
-        let mut slots: Vec<Option<SourceFile>> = Vec::with_capacity(paths.len());
+        let mut slots: Vec<Option<SourceFile>> = paths
+            .par_iter()
+            .map(|(path, language)| {
+                cache_dir
+                    .as_deref()
+                    .and_then(|dir| file_from_cache(dir, &root, path, *language))
+            })
+            .collect();
         let mut misses: Vec<usize> = Vec::new();
-        for (index, (path, language)) in paths.iter().enumerate() {
-            let hit = cache_dir
-                .as_deref()
-                .and_then(|dir| file_from_cache(dir, &root, path, *language));
-            if hit.is_none() {
+        for (index, slot) in slots.iter().enumerate() {
+            if slot.is_none() {
                 misses.push(index);
             }
-            slots.push(hit);
         }
         let cache_hits = paths.len() - misses.len();
         let parsed_files = misses.len();
         let parsed: Vec<Option<SourceFile>> = misses
             .par_iter()
-            .map(|&index| parse_file(&paths[index].0, paths[index].1))
+            .map(|&index| {
+                let file = parse_file(&paths[index].0, paths[index].1);
+                if let Some(file) = &file
+                    && let Some(dir) = &cache_dir
+                    && let Err(error) = cache::store_entry(dir, &root, file)
+                {
+                    tracing::debug!(error = %error, "cannot write cache entry");
+                }
+                file
+            })
             .collect();
         for (slot, file) in misses.into_iter().zip(parsed) {
-            if let Some(file) = &file
-                && let Some(dir) = &cache_dir
-                && let Err(error) = cache::store_entry(dir, &root, file)
-            {
-                tracing::debug!(error = %error, "cannot write cache entry");
-            }
             slots[slot] = file;
         }
         let files: Vec<SourceFile> = slots.into_iter().flatten().collect();
@@ -122,32 +128,50 @@ impl SourceIndex {
                 return Vec::new();
             }
         };
-        let mut old: HashMap<PathBuf, SourceFile> = std::mem::take(&mut self.files)
+        let old: HashMap<PathBuf, SourceFile> = std::mem::take(&mut self.files)
             .into_iter()
             .map(|f| (f.path.clone(), f))
             .collect();
-        let mut files = Vec::with_capacity(paths.len());
+        let reusable: Vec<bool> = paths
+            .par_iter()
+            .map(|(path, _)| {
+                old.get(path).is_some_and(|f| {
+                    fs::metadata(path).is_ok_and(|meta| {
+                        f.modified == meta.modified().ok() && f.size == meta.len()
+                    })
+                })
+            })
+            .collect();
+        let mut old = old;
+        let mut slots: Vec<Option<SourceFile>> = Vec::with_capacity(paths.len());
         let mut changed = Vec::new();
-        let mut parsed = 0usize;
-        for (path, language) in paths {
-            if let Some(f) = old.remove(&path)
-                && let Ok(meta) = fs::metadata(&path)
-                && f.modified == meta.modified().ok()
-                && f.size == meta.len()
-            {
-                files.push(f);
+        let mut misses: Vec<usize> = Vec::new();
+        for (index, (path, _)) in paths.iter().enumerate() {
+            let existing = old.remove(path);
+            if reusable[index] {
+                slots.push(existing);
                 continue;
             }
-            if let Some(f) = parse_file(&path, language) {
-                if let Some(dir) = &self.cache_dir
-                    && let Err(error) = cache::store_entry(dir, &self.root, &f)
+            misses.push(index);
+            changed.push(path.clone());
+            slots.push(None);
+        }
+        let parsed_count = misses.len();
+        let parsed: Vec<Option<SourceFile>> = misses
+            .par_iter()
+            .map(|&index| {
+                let file = parse_file(&paths[index].0, paths[index].1);
+                if let Some(file) = &file
+                    && let Some(dir) = &self.cache_dir
+                    && let Err(error) = cache::store_entry(dir, &self.root, file)
                 {
                     tracing::debug!(error = %error, "cannot write cache entry");
                 }
-                files.push(f);
-            }
-            changed.push(path);
-            parsed += 1;
+                file
+            })
+            .collect();
+        for (slot, file) in misses.into_iter().zip(parsed) {
+            slots[slot] = file;
         }
         if let Some(dir) = &self.cache_dir {
             for removed in old.values() {
@@ -155,7 +179,7 @@ impl SourceIndex {
             }
         }
         changed.extend(old.into_keys());
-        self.files = files;
+        self.files = slots.into_iter().flatten().collect();
         self.by_path = self
             .files
             .iter()
@@ -164,7 +188,7 @@ impl SourceIndex {
             .collect();
         self.stats = BuildStats {
             cache_hits: 0,
-            parsed_files: parsed,
+            parsed_files: parsed_count,
         };
         changed
     }
@@ -254,26 +278,52 @@ fn file_from_cache(
 }
 
 fn discover(root: &Path, config: &Config) -> Result<Vec<(PathBuf, LanguageId)>, IndexError> {
-    let walker = WalkBuilder::new(root)
+    use std::sync::Mutex;
+
+    use ignore::WalkState;
+
+    let paths: Mutex<Vec<(PathBuf, LanguageId)>> = Mutex::new(Vec::new());
+    let failure: Mutex<Option<ignore::Error>> = Mutex::new(None);
+    WalkBuilder::new(root)
         .filter_entry(|entry| entry.file_name() != cache::CACHE_DIR)
-        .build();
-    let mut paths = Vec::new();
-    for entry in walker {
-        let entry = entry.map_err(|e| IndexError::Walk {
+        .build_parallel()
+        .run(|| {
+            Box::new(|entry| match entry {
+                Ok(entry) => {
+                    if entry.file_type().is_some_and(|ft| ft.is_file())
+                        && let Some(language) = LanguageId::from_path(entry.path())
+                        && config.language_enabled(language)
+                    {
+                        paths
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push((entry.path().to_path_buf(), language));
+                    }
+                    WalkState::Continue
+                }
+                Err(error) => {
+                    let mut guard = failure
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if guard.is_none() {
+                        *guard = Some(error);
+                    }
+                    WalkState::Quit
+                }
+            })
+        });
+    if let Some(source) = failure
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    {
+        return Err(IndexError::Walk {
             root: root.to_path_buf(),
-            source: e,
-        })?;
-        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-            continue;
-        }
-        let path = entry.path();
-        let Some(language) = LanguageId::from_path(path) else {
-            continue;
-        };
-        if config.language_enabled(language) {
-            paths.push((path.to_path_buf(), language));
-        }
+            source,
+        });
     }
+    let mut paths = paths
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     paths.sort();
     Ok(paths)
 }

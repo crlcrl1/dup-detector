@@ -1,15 +1,13 @@
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::hash::BuildHasherDefault;
+use std::collections::{BTreeSet, HashSet};
 
 use rayon::prelude::*;
-use xxhash_rust::xxh3::Xxh3;
 
 use crate::config::Config;
-use crate::encode;
+use crate::encode::{self, FastMap};
 use crate::model::{CloneGroup, CloneType, Occurrence, SourceFile, Token, TokenKind};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Candidate {
     file_a: u32,
     file_b: u32,
@@ -89,23 +87,25 @@ pub fn detect_filtered(
         .collect();
     let processed: Vec<Vec<(Occurrence, Occurrence)>> = groups
         .par_iter()
-        .map(|candidates| process_group(files, candidates, window, config))
+        .map_init(Bijection::new, |bijection, candidates| {
+            let matches = process_group(files, candidates, window, config, bijection);
+            finalize_pair(files, matches, config)
+        })
         .collect();
     drop(groups);
     drop(candidates);
-    let matches: Vec<(Occurrence, Occurrence)> = processed.into_iter().flatten().collect();
+    let mut matches: Vec<(Occurrence, Occurrence)> =
+        Vec::with_capacity(processed.iter().map(Vec::len).sum());
+    for list in processed {
+        matches.extend(list);
+    }
     let extend_ms = started.elapsed().as_millis();
-
-    let matches = merge_matches(matches);
-    let matches = filter_matches(files, matches, config);
-    let merge_ms = started.elapsed().as_millis();
     let groups = cluster(files, matches, config);
-    let cluster_ms = started.elapsed().as_millis() - merge_ms;
+    let cluster_ms = started.elapsed().as_millis() - extend_ms;
     tracing::debug!(
         seed_ms,
         candidate_ms,
         extend_ms,
-        merge_ms,
         cluster_ms,
         total_ms = started.elapsed().as_millis(),
         seeds = seed_count,
@@ -145,10 +145,9 @@ fn process_group(
     candidates: &[Candidate],
     window: usize,
     config: &Config,
+    bijection: &mut Bijection,
 ) -> Vec<(Occurrence, Occurrence)> {
-    let mut matches = Vec::new();
     let mut recorded: Vec<(Occurrence, Occurrence)> = Vec::new();
-    let mut bijection = Bijection::new();
     for candidate in candidates {
         if recorded.iter().any(|(a, b)| {
             a.start <= candidate.start_a
@@ -158,13 +157,52 @@ fn process_group(
         }) {
             continue;
         }
-        let Some(pair) = extend_match(files, candidate, window, config, &mut bijection) else {
+        let Some(pair) = extend_match(files, candidate, window, config, bijection) else {
             continue;
         };
         recorded.push(pair);
-        matches.push(pair);
     }
-    matches
+    recorded
+}
+
+fn finalize_pair(
+    files: &[&SourceFile],
+    matches: Vec<(Occurrence, Occurrence)>,
+    config: &Config,
+) -> Vec<(Occurrence, Occurrence)> {
+    let mut chain = chain_merge(matches);
+    chain.retain(|(a, b)| {
+        let lines_a = line_span(files[a.file as usize].tokens.as_slice(), a);
+        let lines_b = line_span(files[b.file as usize].tokens.as_slice(), b);
+        lines_a.min(lines_b) >= config.min_lines
+    });
+    chain
+}
+
+fn chain_merge(mut matches: Vec<(Occurrence, Occurrence)>) -> Vec<(Occurrence, Occurrence)> {
+    matches.sort_unstable_by_key(|(a, b)| (a.start, b.start));
+    let mut chain: Vec<(Occurrence, Occurrence)> = Vec::new();
+    for (a, b) in matches {
+        if let Some((la, lb)) = chain.last_mut()
+            && a.start == la.end
+            && b.start == lb.end
+            && aligned(la, lb, &a, &b)
+        {
+            *la = Occurrence {
+                file: la.file,
+                start: la.start,
+                end: la.end.max(a.end),
+            };
+            *lb = Occurrence {
+                file: lb.file,
+                start: lb.start,
+                end: lb.end.max(b.end),
+            };
+            continue;
+        }
+        chain.push((a, b));
+    }
+    chain
 }
 
 fn extend_match(
@@ -270,90 +308,144 @@ fn compatible(
     }
 }
 
-type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<Xxh3>>;
+const BIJECTION_MIN_BITS: u32 = 8;
+const SLOT_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+
+struct BijectionTable {
+    keys: Vec<u64>,
+    values: Vec<u64>,
+    stamps: Vec<u32>,
+    bits: u32,
+}
+
+impl BijectionTable {
+    fn new() -> Self {
+        Self {
+            keys: Vec::new(),
+            values: Vec::new(),
+            stamps: Vec::new(),
+            bits: 0,
+        }
+    }
+
+    #[inline]
+    fn slot(key: u64, bits: u32) -> usize {
+        (key.wrapping_mul(SLOT_MIX) >> (64 - bits)) as usize
+    }
+
+    fn allocate(&mut self) {
+        let cap = 1usize << BIJECTION_MIN_BITS;
+        self.keys = vec![0; cap];
+        self.values = vec![0; cap];
+        self.stamps = vec![0; cap];
+        self.bits = BIJECTION_MIN_BITS;
+    }
+
+    fn find(&self, generation: u32, key: u64) -> Option<u64> {
+        if self.keys.is_empty() {
+            return None;
+        }
+        let mask = (1usize << self.bits) - 1;
+        let mut index = Self::slot(key, self.bits);
+        while self.stamps[index] == generation {
+            if self.keys[index] == key {
+                return Some(self.values[index]);
+            }
+            index = (index + 1) & mask;
+        }
+        None
+    }
+
+    fn insert_new(&mut self, generation: u32, live: usize, key: u64, value: u64) {
+        if self.keys.is_empty() {
+            self.allocate();
+        } else if (live + 1) * 2 > 1usize << self.bits {
+            self.grow(generation);
+        }
+        let mask = (1usize << self.bits) - 1;
+        let mut index = Self::slot(key, self.bits);
+        while self.stamps[index] == generation {
+            index = (index + 1) & mask;
+        }
+        self.stamps[index] = generation;
+        self.keys[index] = key;
+        self.values[index] = value;
+    }
+
+    fn grow(&mut self, generation: u32) {
+        let bits = self.bits + 2;
+        let cap = 1usize << bits;
+        let mut keys = vec![0u64; cap];
+        let mut values = vec![0u64; cap];
+        let mut stamps = vec![0u32; cap];
+        let mask = cap - 1;
+        for index in 0..self.keys.len() {
+            if self.stamps[index] != generation {
+                continue;
+            }
+            let key = self.keys[index];
+            let mut slot = (key.wrapping_mul(SLOT_MIX) >> (64 - bits)) as usize;
+            while stamps[slot] == generation {
+                slot = (slot + 1) & mask;
+            }
+            stamps[slot] = generation;
+            keys[slot] = key;
+            values[slot] = self.values[index];
+        }
+        self.keys = keys;
+        self.values = values;
+        self.stamps = stamps;
+        self.bits = bits;
+    }
+
+    fn invalidate(&mut self) {
+        self.stamps.iter_mut().for_each(|stamp| *stamp = 0);
+    }
+}
 
 struct Bijection {
-    forward: FastMap<u64, u64>,
-    reverse: FastMap<u64, u64>,
+    forward: BijectionTable,
+    reverse: BijectionTable,
+    generation: u32,
+    live: usize,
 }
 
 impl Bijection {
     fn new() -> Self {
         Self {
-            forward: FastMap::default(),
-            reverse: FastMap::default(),
+            forward: BijectionTable::new(),
+            reverse: BijectionTable::new(),
+            generation: 1,
+            live: 0,
         }
     }
 
     fn clear(&mut self) {
-        self.forward.clear();
-        self.reverse.clear();
+        self.generation += 1;
+        if self.generation == 0 {
+            self.forward.invalidate();
+            self.reverse.invalidate();
+            self.generation = 1;
+        }
+        self.live = 0;
     }
 
     fn insert(&mut self, a: u64, b: u64) -> bool {
-        match (self.forward.get(&a), self.reverse.get(&b)) {
-            (Some(mapped), _) => *mapped == b,
-            (None, Some(mapped)) => *mapped == a,
-            (None, None) => {
-                self.forward.insert(a, b);
-                self.reverse.insert(b, a);
-                true
-            }
+        if let Some(mapped) = self.forward.find(self.generation, a) {
+            return mapped == b;
         }
-    }
-}
-
-fn merge_matches(matches: Vec<(Occurrence, Occurrence)>) -> Vec<(Occurrence, Occurrence)> {
-    let mut by_pair: HashMap<(u32, u32), Vec<(Occurrence, Occurrence)>> = HashMap::new();
-    for (a, b) in matches {
-        by_pair.entry((a.file, b.file)).or_default().push((a, b));
-    }
-    let mut merged: Vec<(Occurrence, Occurrence)> = Vec::new();
-    for mut group in by_pair.into_values() {
-        group.sort_by_key(|(a, b)| (a.start, b.start));
-        let mut chain: Vec<(Occurrence, Occurrence)> = Vec::new();
-        for (a, b) in group {
-            if let Some((la, lb)) = chain.last_mut()
-                && a.start == la.end
-                && b.start == lb.end
-                && aligned(la, lb, &a, &b)
-            {
-                *la = Occurrence {
-                    file: la.file,
-                    start: la.start,
-                    end: la.end.max(a.end),
-                };
-                *lb = Occurrence {
-                    file: lb.file,
-                    start: lb.start,
-                    end: lb.end.max(b.end),
-                };
-                continue;
-            }
-            chain.push((a, b));
+        if let Some(mapped) = self.reverse.find(self.generation, b) {
+            return mapped == a;
         }
-        merged.extend(chain);
+        self.forward.insert_new(self.generation, self.live, a, b);
+        self.reverse.insert_new(self.generation, self.live, b, a);
+        self.live += 1;
+        true
     }
-    merged
 }
 
 fn aligned(la: &Occurrence, lb: &Occurrence, a: &Occurrence, b: &Occurrence) -> bool {
     (la.start as i64 - lb.start as i64) == (a.start as i64 - b.start as i64)
-}
-
-fn filter_matches(
-    files: &[&SourceFile],
-    matches: Vec<(Occurrence, Occurrence)>,
-    config: &Config,
-) -> Vec<(Occurrence, Occurrence)> {
-    matches
-        .into_iter()
-        .filter(|(a, b)| {
-            let lines_a = line_span(files[a.file as usize].tokens.as_slice(), a);
-            let lines_b = line_span(files[b.file as usize].tokens.as_slice(), b);
-            lines_a.min(lines_b) >= config.min_lines
-        })
-        .collect()
 }
 
 fn line_span(tokens: &[Token], occurrence: &Occurrence) -> usize {
@@ -404,9 +496,9 @@ fn cluster(
         return Vec::new();
     }
     let mut occurrences: Vec<Occurrence> = Vec::new();
-    let mut id_of: HashMap<Occurrence, usize> = HashMap::new();
+    let mut id_of: FastMap<Occurrence, usize> = FastMap::default();
     let mut dsu = Dsu::new(matches.len() * 2);
-    let mut metas: HashMap<u32, SpanMeta> = HashMap::new();
+    let mut metas: FastMap<u32, SpanMeta> = FastMap::default();
     for (a, b) in &matches {
         let ia = *id_of.entry(*a).or_insert_with(|| {
             let id = occurrences.len();
@@ -426,7 +518,7 @@ fn cluster(
         }
     }
 
-    let mut roots: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut roots: FastMap<usize, Vec<usize>> = FastMap::default();
     for id in 0..occurrences.len() {
         roots.entry(dsu.find(id)).or_default().push(id);
     }
@@ -455,7 +547,7 @@ fn cluster(
         .flatten()
         .collect();
     let mut dsu = Dsu::new(refined_groups.len());
-    let mut seen_occurrence: HashMap<Occurrence, usize> = HashMap::new();
+    let mut seen_occurrence: FastMap<Occurrence, usize> = FastMap::default();
     for (index, group) in refined_groups.iter().enumerate() {
         for occ in group {
             match seen_occurrence.entry(*occ) {
@@ -468,12 +560,12 @@ fn cluster(
             }
         }
     }
-    let mut by_unit: HashMap<usize, Vec<Occurrence>> = HashMap::new();
+    let mut by_unit: FastMap<usize, Vec<Occurrence>> = FastMap::default();
     for (index, group) in refined_groups.into_iter().enumerate() {
         by_unit.entry(dsu.find(index)).or_default().extend(group);
     }
 
-    let mut seen: BTreeSet<Vec<Occurrence>> = std::collections::BTreeSet::new();
+    let mut seen = BTreeSet::new();
     let mut groups: Vec<CloneGroup> = Vec::new();
     for mut merged in by_unit.into_values() {
         merged.sort();
@@ -534,7 +626,7 @@ fn drop_contained(occs: Vec<Occurrence>) -> Vec<Occurrence> {
 
 fn refine_groups(
     files: &[&SourceFile],
-    metas: &HashMap<u32, SpanMeta>,
+    metas: &FastMap<u32, SpanMeta>,
     occurrences: &[Occurrence],
     representative: Occurrence,
     config: &Config,
@@ -657,13 +749,13 @@ fn top_level_units(file: &SourceFile, start: usize, end: usize) -> Vec<(usize, u
     while index < end {
         let token = &file.tokens[index];
         let mut best: Option<usize> = None;
-        if token.unit_start {
+        if token.unit_start() {
             let unit_end = token.unit_end_of_start as usize;
             if unit_end <= end {
                 best = Some(unit_end);
             }
         }
-        if token.container_start {
+        if token.container_start() {
             let unit_end = token.container_end_of_start as usize;
             if unit_end <= end && best.is_none_or(|current| unit_end > current) {
                 best = Some(unit_end);
@@ -683,8 +775,8 @@ fn is_single_unit_span(file: &SourceFile, start: usize, end: usize) -> bool {
         return false;
     }
     let token = &file.tokens[start];
-    (token.unit_start && token.unit_end_of_start as usize == end)
-        || (token.container_start && token.container_end_of_start as usize == end)
+    (token.unit_start() && token.unit_end_of_start as usize == end)
+        || (token.container_start() && token.container_end_of_start as usize == end)
 }
 
 struct SpanMeta {
@@ -741,7 +833,7 @@ fn is_complete_span(file: &SourceFile, meta: &SpanMeta, start: usize, end: usize
     if start >= end || end > file.tokens.len() {
         return false;
     }
-    if !file.tokens[start].unit_start || !file.tokens[end - 1].unit_end {
+    if !file.tokens[start].unit_start() || !file.tokens[end - 1].unit_end() {
         return false;
     }
     if meta.balance[end] != meta.balance[start] || meta.next_lower[start] <= end as u32 {
@@ -749,15 +841,15 @@ fn is_complete_span(file: &SourceFile, meta: &SpanMeta, start: usize, end: usize
     }
     for index in start..end - 1 {
         let token = &file.tokens[index];
-        if token.unit_start && token.unit_end_of_start as usize > end {
+        if token.unit_start() && token.unit_end_of_start as usize > end {
             return false;
         }
-        if token.unit_end && (token.unit_start_of_end as usize) < start {
+        if token.unit_end() && (token.unit_start_of_end as usize) < start {
             return false;
         }
     }
     let last = &file.tokens[end - 1];
-    !(last.unit_start && last.unit_end_of_start as usize > end)
+    !(last.unit_start() && last.unit_end_of_start as usize > end)
 }
 
 fn token_text(file: &SourceFile, index: usize) -> &str {
@@ -776,16 +868,16 @@ fn snap_out(
         return None;
     }
     let mut snap_start = start;
-    while snap_start > 0 && !file.tokens[snap_start].unit_start {
+    while snap_start > 0 && !file.tokens[snap_start].unit_start() {
         snap_start -= 1;
     }
     let mut snap_end = end;
-    while snap_end < total && !file.tokens[snap_end - 1].unit_end {
+    while snap_end < total && !file.tokens[snap_end - 1].unit_end() {
         snap_end += 1;
     }
-    if !file.tokens[snap_start].unit_start
+    if !file.tokens[snap_start].unit_start()
         || snap_end > total
-        || !file.tokens[snap_end - 1].unit_end
+        || !file.tokens[snap_end - 1].unit_end()
     {
         return None;
     }
@@ -824,7 +916,7 @@ fn snap_out(
             let mut index = snap_start;
             while index < snap_end {
                 let token = &file.tokens[index];
-                if token.unit_start && token.unit_end_of_start as usize > snap_end {
+                if token.unit_start() && token.unit_end_of_start as usize > snap_end {
                     snap_end = token.unit_end_of_start as usize;
                     changed = true;
                     break;
@@ -835,7 +927,7 @@ fn snap_out(
                 let mut index = snap_start;
                 while index + 1 < snap_end {
                     let token = &file.tokens[index];
-                    if token.unit_end && (token.unit_start_of_end as usize) < snap_start {
+                    if token.unit_end() && (token.unit_start_of_end as usize) < snap_start {
                         snap_start = token.unit_start_of_end as usize;
                         changed = true;
                         break;
@@ -844,7 +936,7 @@ fn snap_out(
                 }
             }
         }
-        while snap_end < total && !file.tokens[snap_end - 1].unit_end {
+        while snap_end < total && !file.tokens[snap_end - 1].unit_end() {
             snap_end += 1;
         }
         if snap_end > total || !changed {
@@ -898,7 +990,7 @@ fn complete_ranges(
         ends.clear();
     }
     for (j, depth) in scratch.depth.iter().enumerate().skip(1) {
-        if file.tokens[start + j - 1].unit_end {
+        if file.tokens[start + j - 1].unit_end() {
             scratch
                 .ends_by_depth
                 .entry(*depth)
@@ -908,7 +1000,7 @@ fn complete_ranges(
     }
     for i in 0..len {
         let token = &file.tokens[start + i];
-        if !token.unit_start {
+        if !token.unit_start() {
             continue;
         }
         let Some(ends) = scratch.ends_by_depth.get(&scratch.depth[i]) else {
@@ -952,7 +1044,7 @@ struct CompleteScratch {
     depth: Vec<i32>,
     limit: Vec<u32>,
     stack: Vec<u32>,
-    ends_by_depth: HashMap<i32, Vec<u32>>,
+    ends_by_depth: FastMap<i32, Vec<u32>>,
     ranges: Vec<(usize, usize)>,
 }
 
@@ -1272,7 +1364,7 @@ fn parameterized2(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
 
     #[test]
     fn aligned_matches_merge() {
-        let merged = merge_matches(vec![
+        let merged = chain_merge(vec![
             (occ(0, 0, 10), occ(0, 20, 30)),
             (occ(0, 10, 20), occ(0, 30, 40)),
         ]);
@@ -1281,7 +1373,7 @@ fn parameterized2(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
 
     #[test]
     fn drifted_alignments_do_not_merge() {
-        let merged = merge_matches(vec![
+        let merged = chain_merge(vec![
             (occ(0, 0, 10), occ(0, 20, 30)),
             (occ(0, 8, 18), occ(0, 20, 30)),
         ]);

@@ -1,5 +1,8 @@
+use std::cell::RefCell;
+use std::sync::LazyLock;
+
 use thiserror::Error;
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
 use crate::language::LanguageId;
 use crate::model::{Token, TokenKind};
@@ -50,64 +53,6 @@ const LITERAL_KINDS: &[&str] = &[
     "char",
 ];
 
-pub fn tokenize(source: &str, language: LanguageId) -> Result<Vec<Token>, TokenizeError> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&language.grammar())
-        .map_err(|_| TokenizeError::Grammar(language))?;
-    let tree = parser
-        .parse(source, None)
-        .ok_or(TokenizeError::ParseFailed)?;
-    let mut tokens = Vec::new();
-    collect(tree.root_node(), &mut tokens);
-    Ok(tokens)
-}
-
-fn collect(node: Node<'_>, tokens: &mut Vec<Token>) {
-    if node.is_extra() || node.is_missing() || node.is_error() {
-        return;
-    }
-    if node.child_count() == 0 {
-        let start = node.start_position();
-        let end = node.end_position();
-        tokens.push(Token {
-            kind: classify(node.kind()),
-            start: node.start_byte() as u32,
-            end: node.end_byte() as u32,
-            line: start.row as u32 + 1,
-            end_line: end.row as u32 + 1,
-            column: start.column as u32 + 1,
-            unit_start: false,
-            unit_end: false,
-            unit_end_of_start: 0,
-            unit_start_of_end: u32::MAX,
-            container_start: false,
-            container_end_of_start: 0,
-        });
-        return;
-    }
-    let first = tokens.len();
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect(child, tokens);
-    }
-    if tokens.len() > first && is_unit_kind(node.kind()) {
-        let last = tokens.len() - 1;
-        if is_container_kind(node.kind()) {
-            tokens[first].container_start = true;
-            tokens[first].container_end_of_start = tokens[first]
-                .container_end_of_start
-                .max(tokens.len() as u32);
-        } else {
-            tokens[first].unit_start = true;
-            tokens[first].unit_end_of_start =
-                tokens[first].unit_end_of_start.max(tokens.len() as u32);
-        }
-        tokens[last].unit_end = true;
-        tokens[last].unit_start_of_end = tokens[last].unit_start_of_end.min(first as u32);
-    }
-}
-
 const CONTAINER_KINDS: &[&str] = &[
     "block",
     "statement_block",
@@ -141,6 +86,137 @@ const UNIT_KINDS: &[&str] = &[
     "loop_expression",
     "match_expression",
 ];
+
+struct KindTables {
+    classify: Vec<TokenKind>,
+    unit: Vec<bool>,
+    container: Vec<bool>,
+}
+
+fn build_kind_tables(language: LanguageId) -> KindTables {
+    let grammar = language.grammar();
+    let count = grammar.node_kind_count();
+    let mut tables = KindTables {
+        classify: vec![TokenKind::Fixed; count],
+        unit: vec![false; count],
+        container: vec![false; count],
+    };
+    for id in 0..count {
+        let Some(kind) = grammar.node_kind_for_id(id as u16) else {
+            continue;
+        };
+        tables.classify[id] = classify(kind);
+        tables.unit[id] = is_unit_kind(kind);
+        tables.container[id] = is_container_kind(kind);
+    }
+    tables
+}
+
+static KIND_TABLES: LazyLock<[KindTables; LanguageId::ALL.len()]> =
+    LazyLock::new(|| LanguageId::ALL.map(build_kind_tables));
+
+thread_local! {
+    static PARSERS: RefCell<[Option<Parser>; LanguageId::ALL.len()]> = const {
+        RefCell::new([None, None, None, None, None, None])
+    };
+}
+
+pub fn tokenize(source: &str, language: LanguageId) -> Result<Vec<Token>, TokenizeError> {
+    PARSERS.with(|cell| {
+        let mut parsers = cell.borrow_mut();
+        let slot = &mut parsers[language.index()];
+        if slot.is_none() {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&language.grammar())
+                .map_err(|_| TokenizeError::Grammar(language))?;
+            *slot = Some(parser);
+        }
+        let Some(parser) = slot.as_mut() else {
+            return Err(TokenizeError::Grammar(language));
+        };
+        let tree = parser
+            .parse(source, None)
+            .ok_or(TokenizeError::ParseFailed)?;
+        let mut tokens = Vec::new();
+        collect(&tree, &KIND_TABLES[language.index()], &mut tokens);
+        Ok(tokens)
+    })
+}
+
+fn collect(tree: &Tree, tables: &KindTables, tokens: &mut Vec<Token>) {
+    let mut cursor = tree.walk();
+    let mut stack: Vec<(u32, u16)> = Vec::new();
+    'walk: loop {
+        let node = cursor.node();
+        if !(node.is_extra() || node.is_missing() || node.is_error()) {
+            if node.child_count() == 0 {
+                push_token(&node, tables, tokens);
+            } else {
+                stack.push((tokens.len() as u32, node.kind_id()));
+                cursor.goto_first_child();
+                continue;
+            }
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                continue 'walk;
+            }
+            if !cursor.goto_parent() {
+                return;
+            }
+            let Some((first, kind_id)) = stack.pop() else {
+                return;
+            };
+            apply_marking(tokens, first, kind_id, tables);
+        }
+    }
+}
+
+fn push_token(node: &Node<'_>, tables: &KindTables, tokens: &mut Vec<Token>) {
+    let kind_id = node.kind_id() as usize;
+    let kind = match tables.classify.get(kind_id) {
+        Some(&kind) => kind,
+        None => classify(node.kind()),
+    };
+    let start = node.start_position();
+    let end = node.end_position();
+    tokens.push(Token {
+        kind,
+        flags: 0,
+        start: node.start_byte() as u32,
+        end: node.end_byte() as u32,
+        line: start.row as u32 + 1,
+        end_line: end.row as u32 + 1,
+        unit_end_of_start: 0,
+        unit_start_of_end: u32::MAX,
+        container_end_of_start: 0,
+    });
+}
+
+fn apply_marking(tokens: &mut [Token], first: u32, kind_id: u16, tables: &KindTables) {
+    let id = kind_id as usize;
+    if !tables.unit.get(id).copied().unwrap_or(false) || first as usize >= tokens.len() {
+        return;
+    }
+    let first_index = first as usize;
+    let last = tokens.len() - 1;
+    if tables.container.get(id).copied().unwrap_or(false) {
+        tokens[first_index].set_container_start();
+        let end = tokens[first_index]
+            .container_end_of_start
+            .max(tokens.len() as u32);
+        tokens[first_index].container_end_of_start = end;
+    } else {
+        tokens[first_index].set_unit_start();
+        let end = tokens[first_index]
+            .unit_end_of_start
+            .max(tokens.len() as u32);
+        tokens[first_index].unit_end_of_start = end;
+    }
+    tokens[last].set_unit_end();
+    tokens[last].unit_start_of_end = tokens[last].unit_start_of_end.min(first);
+}
 
 fn is_container_kind(kind: &str) -> bool {
     CONTAINER_KINDS.contains(&kind)
@@ -230,5 +306,155 @@ mod tests {
         let texts = texts(source, &tokens);
         assert!(texts.contains(&"int"));
         assert!(texts.contains(&"main"));
+    }
+
+    fn reference_collect(node: Node<'_>, tokens: &mut Vec<Token>) {
+        if node.is_extra() || node.is_missing() || node.is_error() {
+            return;
+        }
+        if node.child_count() == 0 {
+            let start = node.start_position();
+            let end = node.end_position();
+            tokens.push(Token {
+                kind: classify(node.kind()),
+                flags: 0,
+                start: node.start_byte() as u32,
+                end: node.end_byte() as u32,
+                line: start.row as u32 + 1,
+                end_line: end.row as u32 + 1,
+                unit_end_of_start: 0,
+                unit_start_of_end: u32::MAX,
+                container_end_of_start: 0,
+            });
+            return;
+        }
+        let first = tokens.len();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            reference_collect(child, tokens);
+        }
+        if tokens.len() > first && is_unit_kind(node.kind()) {
+            let last = tokens.len() - 1;
+            if is_container_kind(node.kind()) {
+                tokens[first].set_container_start();
+                tokens[first].container_end_of_start = tokens[first]
+                    .container_end_of_start
+                    .max(tokens.len() as u32);
+            } else {
+                tokens[first].set_unit_start();
+                tokens[first].unit_end_of_start =
+                    tokens[first].unit_end_of_start.max(tokens.len() as u32);
+            }
+            tokens[last].set_unit_end();
+            tokens[last].unit_start_of_end = tokens[last].unit_start_of_end.min(first as u32);
+        }
+    }
+
+    fn reference_tokenize(source: &str, language: LanguageId) -> Vec<Token> {
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut tokens = Vec::new();
+        reference_collect(tree.root_node(), &mut tokens);
+        tokens
+    }
+
+    fn fields(token: &Token) -> (TokenKind, u8, u32, u32, u32, u32, u32, u32, u32) {
+        (
+            token.kind,
+            token.flags,
+            token.start,
+            token.end,
+            token.line,
+            token.end_line,
+            token.unit_end_of_start,
+            token.unit_start_of_end,
+            token.container_end_of_start,
+        )
+    }
+
+    fn assert_matches_reference(source: &str, language: LanguageId) {
+        let fast = tokenize(source, language).unwrap();
+        let reference = reference_tokenize(source, language);
+        assert_eq!(fast.len(), reference.len(), "token count for {language}");
+        for (index, (a, b)) in fast.iter().zip(&reference).enumerate() {
+            assert_eq!(fields(a), fields(b), "token {index} for {language}");
+        }
+    }
+
+    #[test]
+    fn token_is_32_bytes() {
+        assert_eq!(std::mem::size_of::<Token>(), 32);
+    }
+
+    #[test]
+    fn iterative_walk_matches_reference() {
+        let samples: &[(LanguageId, &str)] = &[
+            (LanguageId::Rust, ""),
+            (LanguageId::Rust, "fn broken( { let x = ; }"),
+            (
+                LanguageId::Rust,
+                "// c\nfn a() -> i32 { if x { 1 } else { 2 } }\nstruct S { f: u8 }\n",
+            ),
+            (
+                LanguageId::Python,
+                "def f(a):\n    for i in a:\n        if i:\n            pass\n    return None\n",
+            ),
+            (
+                LanguageId::JavaScript,
+                "function f() { return `t${x}`; }\nclass A {}\n",
+            ),
+            (
+                LanguageId::TypeScript,
+                "interface I { x: number }\nconst f = <T,>(a: T): T => a;\n",
+            ),
+            (
+                LanguageId::Tsx,
+                "const App = () => <div className=\"x\">{v}</div>;\n",
+            ),
+            (
+                LanguageId::Cpp,
+                "#include <vector>\nint main() { auto l = [](int x) { return x; }; return l(0); }\n",
+            ),
+        ];
+        for (language, source) in samples {
+            assert_matches_reference(source, *language);
+        }
+    }
+
+    #[test]
+    fn corpus_files_match_reference() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus"),
+            &mut files,
+        );
+        files.sort();
+        assert!(!files.is_empty());
+        let mut checked = 0usize;
+        for path in files {
+            let Some(language) = LanguageId::from_path(&path) else {
+                continue;
+            };
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            assert_matches_reference(&source, language);
+            checked += 1;
+        }
+        assert!(checked >= 10, "expected corpus coverage, got {checked}");
     }
 }

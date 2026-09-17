@@ -47,6 +47,17 @@ impl LanguageId {
         LanguageId::Cpp,
     ];
 
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            LanguageId::Rust => 0,
+            LanguageId::Python => 1,
+            LanguageId::JavaScript => 2,
+            LanguageId::TypeScript => 3,
+            LanguageId::Tsx => 4,
+            LanguageId::Cpp => 5,
+        }
+    }
+
     pub fn from_extension(extension: &str) -> Option<Self> {
         EXTENSIONS
             .iter()

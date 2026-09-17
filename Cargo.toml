@@ -26,3 +26,7 @@ tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = "0.23.2"
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

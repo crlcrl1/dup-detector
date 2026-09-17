@@ -18,17 +18,50 @@ pub enum TokenKind {
 #[derive(Debug, Clone, Copy)]
 pub struct Token {
     pub kind: TokenKind,
+    pub flags: u8,
     pub start: u32,
     pub end: u32,
     pub line: u32,
     pub end_line: u32,
-    pub column: u32,
-    pub unit_start: bool,
-    pub unit_end: bool,
     pub unit_end_of_start: u32,
     pub unit_start_of_end: u32,
-    pub container_start: bool,
     pub container_end_of_start: u32,
+}
+
+pub const FLAG_UNIT_START: u8 = 1;
+pub const FLAG_UNIT_END: u8 = 2;
+pub const FLAG_CONTAINER_START: u8 = 4;
+
+impl Token {
+    #[inline]
+    pub fn unit_start(&self) -> bool {
+        self.flags & FLAG_UNIT_START != 0
+    }
+
+    #[inline]
+    pub fn unit_end(&self) -> bool {
+        self.flags & FLAG_UNIT_END != 0
+    }
+
+    #[inline]
+    pub fn container_start(&self) -> bool {
+        self.flags & FLAG_CONTAINER_START != 0
+    }
+
+    #[inline]
+    pub fn set_unit_start(&mut self) {
+        self.flags |= FLAG_UNIT_START;
+    }
+
+    #[inline]
+    pub fn set_unit_end(&mut self) {
+        self.flags |= FLAG_UNIT_END;
+    }
+
+    #[inline]
+    pub fn set_container_start(&mut self) {
+        self.flags |= FLAG_CONTAINER_START;
+    }
 }
 
 pub struct SourceFile {

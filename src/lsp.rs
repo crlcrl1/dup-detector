@@ -173,10 +173,10 @@ impl Backend {
         let Ok(path) = uri.to_file_path() else {
             return;
         };
-        let mut documents = match state.documents.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut documents = state
+            .documents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(existing) = documents.get(&path).cloned() else {
             return;
         };
@@ -209,10 +209,10 @@ impl Backend {
         );
         drop(documents);
         if !regions.is_empty() {
-            let mut pending = match state.pending.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let mut pending = state
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             for (start, end) in regions {
                 pending.mark_bytes(path.clone(), start, end);
             }
@@ -288,16 +288,16 @@ impl LanguageServer for Backend {
             path: path.clone(),
             file,
         });
-        let mut documents = match state.documents.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut documents = state
+            .documents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         documents.insert(path.clone(), document);
         drop(documents);
-        let mut pending = match state.pending.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut pending = state
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         pending.mark_whole(path);
         drop(pending);
         state.bump();
@@ -317,16 +317,16 @@ impl LanguageServer for Backend {
         let state = self.state();
         let uri = params.text_document.uri;
         if let Ok(path) = uri.to_file_path() {
-            let mut documents = match state.documents.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let mut documents = state
+                .documents
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             documents.remove(&path);
             drop(documents);
-            let mut pending = match state.pending.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let mut pending = state
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             pending.mark_whole(path);
         }
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
@@ -537,10 +537,10 @@ fn analyze(state: &State) -> anyhow::Result<Option<Analysis>> {
 
     let open: HashSet<PathBuf> = documents.iter().map(|doc| doc.path.clone()).collect();
     let external = {
-        let mut guard = match state.index.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut guard = state
+            .index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match guard.as_mut() {
             Some(index) => index
                 .refresh()
@@ -555,10 +555,10 @@ fn analyze(state: &State) -> anyhow::Result<Option<Analysis>> {
     };
 
     let pending = {
-        let mut live = match state.pending.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut live = state
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for path in external {
             live.mark_whole(path);
         }
@@ -568,10 +568,10 @@ fn analyze(state: &State) -> anyhow::Result<Option<Analysis>> {
         return Ok(None);
     }
 
-    let index_guard = match state.index.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let index_guard = state
+        .index
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(index) = index_guard.as_ref() else {
         return Ok(None);
     };
