@@ -20,6 +20,7 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::config::Config;
 use crate::detect;
+use crate::encode::FastSet;
 use crate::index::SourceIndex;
 use crate::language::LanguageId;
 use crate::model::{CloneType, Occurrence, SourceFile};
@@ -73,6 +74,7 @@ struct State {
     root: PathBuf,
     config: Config,
     documents: Mutex<HashMap<PathBuf, Arc<Document>>>,
+    update_lock: Mutex<()>,
     index: Mutex<Option<SourceIndex>>,
     snapshot: Mutex<Arc<Snapshot>>,
     pending: Mutex<PendingChanges>,
@@ -86,6 +88,7 @@ impl State {
             root,
             config,
             documents: Mutex::new(HashMap::new()),
+            update_lock: Mutex::new(()),
             index: Mutex::new(None),
             snapshot: Mutex::new(Arc::new(Snapshot::default())),
             pending: Mutex::new(PendingChanges::default()),
@@ -111,7 +114,7 @@ impl std::fmt::Debug for State {
 #[derive(Default)]
 struct Snapshot {
     groups: Vec<NavGroup>,
-    signatures: HashSet<u64>,
+    signatures: FastSet<u64>,
 }
 
 struct NavGroup {
@@ -173,21 +176,31 @@ impl Backend {
         let Ok(path) = uri.to_file_path() else {
             return;
         };
-        let mut documents = state
-            .documents
+        let Some(language) = LanguageId::from_path(&path) else {
+            return;
+        };
+        // Serialize change application against other updates for the same file;
+        // the documents map lock is only held briefly around lookup and insert
+        // so the parse below never blocks readers.
+        let _serialized = state
+            .update_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(existing) = documents.get(&path).cloned() else {
+        let existing = {
+            let documents = state
+                .documents
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            documents.get(&path).cloned()
+        };
+        let Some(existing) = existing else {
             return;
         };
         let mut text = existing.file.text.clone();
         let mut regions: Vec<(usize, usize)> = Vec::new();
-        for change in changes {
-            apply_change(&mut text, &change, &mut regions);
+        for change in &changes {
+            apply_change(&mut text, change, &mut regions);
         }
-        let Some(language) = LanguageId::from_path(&path) else {
-            return;
-        };
         let Ok(tokens) = tokenize::tokenize(&text, language) else {
             return;
         };
@@ -199,15 +212,26 @@ impl Backend {
             None,
             0,
         ));
-        documents.insert(
-            path.clone(),
-            Arc::new(Document {
-                uri,
-                path: path.clone(),
-                file,
-            }),
-        );
-        drop(documents);
+        {
+            let mut documents = state
+                .documents
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let still_current = documents
+                .get(&path)
+                .is_some_and(|current| Arc::ptr_eq(current, &existing));
+            if !still_current {
+                return;
+            }
+            documents.insert(
+                path.clone(),
+                Arc::new(Document {
+                    uri,
+                    path: path.clone(),
+                    file,
+                }),
+            );
+        }
         if !regions.is_empty() {
             let mut pending = state
                 .pending
@@ -596,7 +620,7 @@ fn analyze(state: &State) -> anyhow::Result<Option<Analysis>> {
     // last time (so unchanged matches are reproduced) and the windows touched by the
     // edits since then. Running the normal detection over just these seeds yields the
     // exact same groups as a full project scan while touching far fewer candidates.
-    let mut allowed: HashSet<u64> = previous.signatures.clone();
+    let mut allowed: FastSet<u64> = previous.signatures.clone();
     for (path, region) in &pending.changed {
         let file = overlay
             .get(path)
@@ -634,7 +658,7 @@ fn analyze(state: &State) -> anyhow::Result<Option<Analysis>> {
     let mut lines: HashMap<PathBuf, Vec<usize>> = HashMap::new();
     let mut per_file: HashMap<PathBuf, Vec<Diagnostic>> = HashMap::new();
     let mut nav_groups: Vec<NavGroup> = Vec::new();
-    let mut signatures: HashSet<u64> = HashSet::new();
+    let mut signatures: FastSet<u64> = FastSet::default();
 
     for group in groups {
         let occurrences: Vec<NavOccurrence> = group

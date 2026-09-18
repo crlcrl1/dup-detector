@@ -1,11 +1,12 @@
+use std::collections::BTreeSet;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashSet};
+use std::sync::Arc;
 
 use rayon::prelude::*;
 
 use crate::config::Config;
-use crate::encode::{self, FastMap};
-use crate::model::{CloneGroup, CloneType, Occurrence, SourceFile, Token, TokenKind};
+use crate::encode::{self, FastMap, FastSet};
+use crate::model::{CloneGroup, CloneType, Occurrence, SourceFile, SpanMeta, Token, TokenKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Candidate {
@@ -22,7 +23,7 @@ pub fn detect(files: &[&SourceFile], config: &Config) -> Vec<CloneGroup> {
 pub fn detect_filtered(
     files: &[&SourceFile],
     config: &Config,
-    allowed: Option<&HashSet<u64>>,
+    allowed: Option<&FastSet<u64>>,
 ) -> Vec<CloneGroup> {
     let started = std::time::Instant::now();
     let window = config.seed_window;
@@ -121,9 +122,9 @@ pub fn span_window_signatures(
     start: usize,
     end: usize,
     config: &Config,
-) -> HashSet<u64> {
+) -> FastSet<u64> {
     let window = config.seed_window;
-    let mut allowed = HashSet::new();
+    let mut allowed = FastSet::default();
     let total = file.tokens.len();
     if window == 0 || total < window || start >= end || end > total {
         return allowed;
@@ -498,7 +499,7 @@ fn cluster(
     let mut occurrences: Vec<Occurrence> = Vec::new();
     let mut id_of: FastMap<Occurrence, usize> = FastMap::default();
     let mut dsu = Dsu::new(matches.len() * 2);
-    let mut metas: FastMap<u32, SpanMeta> = FastMap::default();
+    let mut metas: FastMap<u32, Arc<SpanMeta>> = FastMap::default();
     for (a, b) in &matches {
         let ia = *id_of.entry(*a).or_insert_with(|| {
             let id = occurrences.len();
@@ -512,9 +513,10 @@ fn cluster(
         });
         dsu.union(ia, ib);
         for occ in [a, b] {
-            metas
-                .entry(occ.file)
-                .or_insert_with(|| span_meta(files[occ.file as usize]));
+            metas.entry(occ.file).or_insert_with(|| {
+                let file = files[occ.file as usize];
+                file.cached_span_meta(|| compute_span_meta(file)).clone()
+            });
         }
     }
 
@@ -626,7 +628,7 @@ fn drop_contained(occs: Vec<Occurrence>) -> Vec<Occurrence> {
 
 fn refine_groups(
     files: &[&SourceFile],
-    metas: &FastMap<u32, SpanMeta>,
+    metas: &FastMap<u32, Arc<SpanMeta>>,
     occurrences: &[Occurrence],
     representative: Occurrence,
     config: &Config,
@@ -779,13 +781,7 @@ fn is_single_unit_span(file: &SourceFile, start: usize, end: usize) -> bool {
         || (token.container_start() && token.container_end_of_start as usize == end)
 }
 
-struct SpanMeta {
-    pairs: Vec<u32>,
-    balance: Vec<i32>,
-    next_lower: Vec<u32>,
-}
-
-fn span_meta(file: &SourceFile) -> SpanMeta {
+fn compute_span_meta(file: &SourceFile) -> SpanMeta {
     let total = file.tokens.len();
     let mut pairs = vec![u32::MAX; total];
     let mut balance = Vec::with_capacity(total + 1);

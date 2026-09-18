@@ -121,6 +121,7 @@ cargo run -- scan <path> --json --min-lines 7 --min-occurrences 2 --parameterize
 cargo test                        # unit/integration tests
 cargo fmt                         # formatting (required before commit)
 cargo clippy --all-targets -- -D warnings   # lint (required before commit)
+cargo bench                        # criterion micro-benchmarks (`-- --save-baseline <name>` keeps a comparison baseline)
 ```
 
 Note: the `rmcp` and LSP servers must not write to stdout; all logs go to stderr (set `tracing_subscriber`'s writer to stderr), otherwise the stdio protocol breaks.

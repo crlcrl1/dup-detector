@@ -95,6 +95,7 @@ impl Hasher for FastHasher {
 }
 
 pub(crate) type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
+pub(crate) type FastSet<T> = std::collections::HashSet<T, BuildHasherDefault<FastHasher>>;
 
 const TAG_MASK: u64 = 0b11 << 62;
 const FIXED_TAG: u64 = 0b00 << 62;
@@ -302,6 +303,78 @@ mod tests {
     fn signature(source: &str, start: usize, window: usize) -> u64 {
         let (tokens, hashes) = hashes(source);
         window_signatures(&tokens, &hashes, window, false)[start]
+    }
+
+    fn window_signatures_naive(
+        tokens: &[Token],
+        hashes: &[u64],
+        window: usize,
+        parameterize_literals: bool,
+    ) -> Vec<u64> {
+        let total = tokens.len();
+        let base: Vec<u64> = tokens
+            .iter()
+            .zip(hashes)
+            .map(|(token, &hash)| match token.kind {
+                TokenKind::Fixed => (hash & !TAG_MASK) | FIXED_TAG,
+                TokenKind::Literal if !parameterize_literals => (hash & !TAG_MASK) | LITERAL_TAG,
+                _ => PARAM_TAG,
+            })
+            .collect();
+        let mut last_position: FastMap<(u64, TokenKind), u32> = FastMap::default();
+        let mut previous = vec![u32::MAX; total];
+        for (index, token) in tokens.iter().enumerate() {
+            let key = (hashes[index], token.kind);
+            if let Some(&position) = last_position.get(&key) {
+                previous[index] = position;
+            }
+            last_position.insert(key, index as u32);
+        }
+        let mut bytes = vec![0u8; window * 8];
+        let mut signatures = Vec::new();
+        for start in 0..=total - window {
+            for i in 0..window {
+                let index = start + i;
+                let value = if base[index] != PARAM_TAG {
+                    base[index]
+                } else {
+                    let tag = match tokens[index].kind {
+                        TokenKind::Literal => LITERAL_TAG,
+                        _ => IDENTIFIER_TAG,
+                    };
+                    parameterized(previous[index], start, index, tag)
+                };
+                bytes[i * 8..i * 8 + 8].copy_from_slice(&value.to_le_bytes());
+            }
+            signatures.push(xxh3_64(&bytes));
+        }
+        signatures
+    }
+
+    #[test]
+    fn sliding_window_matches_naive() {
+        let sources = [
+            "let alpha = beta + gamma; x",
+            "fn f(a: u64) -> u64 { a.wrapping_add(1) }",
+            "let x = 1; let y = 1; let z = x + y; z",
+            "let a = b; let c = b; let d = b; d",
+            "fn main() { let s = \"txt\"; println!(\"{s}\"); }",
+        ];
+        for source in sources {
+            let (tokens, hashes) = hashes(source);
+            if tokens.len() < 2 {
+                continue;
+            }
+            for window in 2..=tokens.len().min(8) {
+                for parameterize_literals in [false, true] {
+                    assert_eq!(
+                        window_signatures(&tokens, &hashes, window, parameterize_literals),
+                        window_signatures_naive(&tokens, &hashes, window, parameterize_literals),
+                        "source: {source}, window: {window}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

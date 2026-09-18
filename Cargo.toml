@@ -30,3 +30,11 @@ xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "hot_paths"
+harness = false
+

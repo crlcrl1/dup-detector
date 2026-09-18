@@ -48,7 +48,11 @@ impl CloneServer {
                 .lock()
                 .map_err(|_| "index lock poisoned".to_string())?;
             let index = match indexes.entry(root) {
-                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    let index = entry.into_mut();
+                    index.refresh();
+                    index
+                }
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let key = entry.key().clone();
                     let config = Config::load(&key)
@@ -60,7 +64,6 @@ impl CloneServer {
                     )
                 }
             };
-            index.refresh();
             let config = index.config().clone();
             Ok(f(index, &config))
         })
@@ -279,17 +282,21 @@ impl CloneServer {
                         params.min_occurrences,
                         params.max_groups,
                     );
-                    let groups: Vec<CloneGroup> = index
-                        .find_clones(&cfg)
-                        .into_iter()
-                        .filter(|g| {
-                            g.occurrences.iter().any(|o| o.file as usize == file_index)
-                                && params
-                                    .types
-                                    .as_ref()
-                                    .is_none_or(|types| types.contains(&g.clone_type))
-                        })
-                        .collect();
+                    let file = &index.files()[file_index];
+                    let allowed =
+                        crate::detect::span_window_signatures(file, 0, file.tokens.len(), &cfg);
+                    let files: Vec<&SourceFile> = index.files().iter().collect();
+                    let groups: Vec<CloneGroup> =
+                        crate::detect::detect_filtered(&files, &cfg, Some(&allowed))
+                            .into_iter()
+                            .filter(|g| {
+                                g.occurrences.iter().any(|o| o.file as usize == file_index)
+                                    && params
+                                        .types
+                                        .as_ref()
+                                        .is_none_or(|types| types.contains(&g.clone_type))
+                            })
+                            .collect();
                     Ok(ScanResponse::from_groups(index, groups))
                 },
             )

@@ -128,6 +128,18 @@ impl SourceIndex {
                 return Vec::new();
             }
         };
+        if paths.len() == self.files.len()
+            && paths.par_iter().all(|(path, _)| {
+                self.by_path.get(path).is_some_and(|&slot| {
+                    let file = &self.files[slot];
+                    fs::metadata(path).is_ok_and(|meta| {
+                        file.modified == meta.modified().ok() && file.size == meta.len()
+                    })
+                })
+            })
+        {
+            return Vec::new();
+        }
         let old: HashMap<PathBuf, SourceFile> = std::mem::take(&mut self.files)
             .into_iter()
             .map(|f| (f.path.clone(), f))
@@ -278,52 +290,33 @@ fn file_from_cache(
 }
 
 fn discover(root: &Path, config: &Config) -> Result<Vec<(PathBuf, LanguageId)>, IndexError> {
-    use std::sync::Mutex;
-
-    use ignore::WalkState;
-
-    let paths: Mutex<Vec<(PathBuf, LanguageId)>> = Mutex::new(Vec::new());
-    let failure: Mutex<Option<ignore::Error>> = Mutex::new(None);
-    WalkBuilder::new(root)
+    let mut paths = Vec::new();
+    let mut failure = None;
+    for entry in WalkBuilder::new(root)
         .filter_entry(|entry| entry.file_name() != cache::CACHE_DIR)
-        .build_parallel()
-        .run(|| {
-            Box::new(|entry| match entry {
-                Ok(entry) => {
-                    if entry.file_type().is_some_and(|ft| ft.is_file())
-                        && let Some(language) = LanguageId::from_path(entry.path())
-                        && config.language_enabled(language)
-                    {
-                        paths
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .push((entry.path().to_path_buf(), language));
-                    }
-                    WalkState::Continue
-                }
-                Err(error) => {
-                    let mut guard = failure
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if guard.is_none() {
-                        *guard = Some(error);
-                    }
-                    WalkState::Quit
-                }
-            })
-        });
-    if let Some(source) = failure
-        .into_inner()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .build()
     {
+        match entry {
+            Ok(entry) => {
+                if entry.file_type().is_some_and(|ft| ft.is_file())
+                    && let Some(language) = LanguageId::from_path(entry.path())
+                    && config.language_enabled(language)
+                {
+                    paths.push((entry.path().to_path_buf(), language));
+                }
+            }
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        }
+    }
+    if let Some(source) = failure {
         return Err(IndexError::Walk {
             root: root.to_path_buf(),
             source,
         });
     }
-    let mut paths = paths
-        .into_inner()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     paths.sort();
     Ok(paths)
 }

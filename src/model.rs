@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -64,6 +64,12 @@ impl Token {
     }
 }
 
+pub struct SpanMeta {
+    pub(crate) pairs: Vec<u32>,
+    pub(crate) balance: Vec<i32>,
+    pub(crate) next_lower: Vec<u32>,
+}
+
 pub struct SourceFile {
     pub path: PathBuf,
     pub language: LanguageId,
@@ -71,6 +77,7 @@ pub struct SourceFile {
     pub tokens: Vec<Token>,
     pub hashes: Vec<u64>,
     seeds: Mutex<Option<SeedCache>>,
+    span_meta: OnceLock<Arc<SpanMeta>>,
     pub modified: Option<SystemTime>,
     pub size: u64,
 }
@@ -110,6 +117,7 @@ impl SourceFile {
             tokens,
             hashes,
             seeds: Mutex::new(None),
+            span_meta: OnceLock::new(),
             modified,
             size,
         }
@@ -147,6 +155,10 @@ impl SourceFile {
                 signatures,
             });
         }
+    }
+
+    pub(crate) fn cached_span_meta(&self, compute: impl FnOnce() -> SpanMeta) -> &Arc<SpanMeta> {
+        self.span_meta.get_or_init(|| Arc::new(compute()))
     }
 }
 
