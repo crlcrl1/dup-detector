@@ -88,10 +88,13 @@ pub fn detect_filtered(
         .collect();
     let processed: Vec<Vec<(Occurrence, Occurrence)>> = groups
         .par_iter()
-        .map_init(Bijection::new, |bijection, candidates| {
-            let matches = process_group(files, candidates, window, config, bijection);
-            finalize_pair(files, matches, config)
-        })
+        .map_init(
+            || (Bijection::new(), CoverIndex::default()),
+            |(bijection, cover), candidates| {
+                let matches = process_group(files, candidates, window, config, bijection, cover);
+                finalize_pair(files, matches, config)
+            },
+        )
         .collect();
     drop(groups);
     drop(candidates);
@@ -141,26 +144,80 @@ pub fn span_window_signatures(
     allowed
 }
 
+const COVER_NONE: u32 = u32::MAX;
+const COVER_INDEX_MIN_CANDIDATES: usize = 4096;
+
+#[derive(Default)]
+struct CoverIndex {
+    heads: Vec<u32>,
+    entries: Vec<(u32, u32)>,
+}
+
+impl CoverIndex {
+    fn reset(&mut self, tokens: usize) {
+        if self.heads.len() < tokens {
+            self.heads.resize(tokens, COVER_NONE);
+        }
+        self.heads[..tokens].fill(COVER_NONE);
+        self.entries.clear();
+    }
+
+    fn insert(&mut self, start: u32, end: u32, match_index: u32) {
+        for position in start..end {
+            let next = self.heads[position as usize];
+            self.entries.push((next, match_index));
+            self.heads[position as usize] = (self.entries.len() - 1) as u32;
+        }
+    }
+
+    fn covers(&self, recorded: &[(Occurrence, Occurrence)], start_a: u32, start_b: u32) -> bool {
+        let mut entry = self.heads[start_a as usize];
+        while entry != COVER_NONE {
+            let (next, match_index) = self.entries[entry as usize];
+            let b = &recorded[match_index as usize].1;
+            if b.start <= start_b && start_b < b.end {
+                return true;
+            }
+            entry = next;
+        }
+        false
+    }
+}
+
 fn process_group(
     files: &[&SourceFile],
     candidates: &[Candidate],
     window: usize,
     config: &Config,
     bijection: &mut Bijection,
+    cover: &mut CoverIndex,
 ) -> Vec<(Occurrence, Occurrence)> {
     let mut recorded: Vec<(Occurrence, Occurrence)> = Vec::new();
+    let indexed = candidates.len() >= COVER_INDEX_MIN_CANDIDATES;
+    if indexed {
+        let tokens_a = files[candidates[0].file_a as usize].tokens.len();
+        cover.reset(tokens_a);
+    }
     for candidate in candidates {
-        if recorded.iter().any(|(a, b)| {
-            a.start <= candidate.start_a
-                && candidate.start_a < a.end
-                && b.start <= candidate.start_b
-                && candidate.start_b < b.end
-        }) {
+        let covered = if indexed {
+            cover.covers(&recorded, candidate.start_a, candidate.start_b)
+        } else {
+            recorded.iter().any(|(a, b)| {
+                a.start <= candidate.start_a
+                    && candidate.start_a < a.end
+                    && b.start <= candidate.start_b
+                    && candidate.start_b < b.end
+            })
+        };
+        if covered {
             continue;
         }
         let Some(pair) = extend_match(files, candidate, window, config, bijection) else {
             continue;
         };
+        if indexed {
+            cover.insert(pair.0.start, pair.0.end, recorded.len() as u32);
+        }
         recorded.push(pair);
     }
     recorded
@@ -1356,6 +1413,35 @@ fn parameterized2(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
 
     fn occ(file: u32, start: u32, end: u32) -> Occurrence {
         Occurrence { file, start, end }
+    }
+
+    #[test]
+    fn cover_index_matches_linear_scan_and_resets() {
+        let recorded = vec![
+            (occ(0, 10, 20), occ(0, 100, 110)),
+            (occ(0, 15, 30), occ(0, 200, 210)),
+        ];
+        let mut cover = CoverIndex::default();
+        cover.reset(64);
+        cover.insert(10, 20, 0);
+        cover.insert(15, 30, 1);
+        for start_a in 0..64u32 {
+            for start_b in 0..256u32 {
+                let expected = recorded.iter().any(|(a, b)| {
+                    a.start <= start_a && start_a < a.end && b.start <= start_b && start_b < b.end
+                });
+                assert_eq!(cover.covers(&recorded, start_a, start_b), expected);
+            }
+        }
+        cover.reset(8);
+        assert!(!cover.covers(&recorded, 7, 100));
+        cover.insert(2, 4, 0);
+        assert!(cover.covers(&recorded, 2, 100));
+        assert!(cover.covers(&recorded, 3, 105));
+        assert!(!cover.covers(&recorded, 4, 100));
+        cover.reset(64);
+        assert!(!cover.covers(&recorded, 2, 100));
+        assert!(!cover.covers(&recorded, 19, 105));
     }
 
     #[test]
