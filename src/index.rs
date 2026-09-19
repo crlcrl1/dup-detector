@@ -293,6 +293,7 @@ fn discover(root: &Path, config: &Config) -> Result<Vec<(PathBuf, LanguageId)>, 
     let mut paths = Vec::new();
     let mut failure = None;
     for entry in WalkBuilder::new(root)
+        .require_git(false)
         .filter_entry(|entry| entry.file_name() != cache::CACHE_DIR)
         .build()
     {
@@ -382,6 +383,20 @@ mod tests {
             ..Config::default()
         };
         let index = SourceIndex::build_with_cache(&dir, &config, None).unwrap();
+        assert_eq!(index.files().len(), 1);
+        assert_eq!(index.files()[0].path.file_name().unwrap(), "a.rs");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn respects_gitignore_without_git_repo() {
+        let dir = temp_dir("gitignore-no-git");
+        fs::write(dir.join(".gitignore"), "vendor/\n").unwrap();
+        fs::write(dir.join("a.rs"), "fn a() {}").unwrap();
+        let vendor = dir.join("vendor");
+        fs::create_dir_all(&vendor).unwrap();
+        fs::write(vendor.join("b.rs"), "fn b() {}").unwrap();
+        let index = SourceIndex::build_with_cache(&dir, &Config::default(), None).unwrap();
         assert_eq!(index.files().len(), 1);
         assert_eq!(index.files()[0].path.file_name().unwrap(), "a.rs");
         fs::remove_dir_all(&dir).ok();
