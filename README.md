@@ -6,6 +6,8 @@ A tool that finds **duplicated code** in a codebase, providing LSP, MCP and CLI,
 
 Unlike text/regex based tools, `dup-detector` works on the **token stream produced by tree-sitter** and uses a **parameterized (rename-invariant) encoding**, so it recognizes code that is structurally identical even when variables or literals have been renamed.
 
+![Duplicate code diagnostics in an editor, reported by the dup-detector LSP server](screen-shot/screen-shot.png)
+
 ## Clone types
 
 | Type   | Meaning                                                    | Supported         |

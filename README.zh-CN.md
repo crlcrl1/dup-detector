@@ -6,6 +6,8 @@
 
 与基于文本/正则的方案不同，`dup-detector` 基于 **tree-sitter 生成的 token 流**，并使用**参数化（重命名不变）编码**，因此即使变量或字面量被重命名，只要结构相同也能识别出来。
 
+![编辑器中的重复代码诊断，由 dup-detector LSP 服务器报告](screen-shot/screen-shot.png)
+
 ## 重复类型
 
 | 类型   | 含义                                     | 支持情况         |
