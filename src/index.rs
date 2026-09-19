@@ -292,11 +292,18 @@ fn file_from_cache(
 fn discover(root: &Path, config: &Config) -> Result<Vec<(PathBuf, LanguageId)>, IndexError> {
     let mut paths = Vec::new();
     let mut failure = None;
-    for entry in WalkBuilder::new(root)
+    let mut builder = WalkBuilder::new(root);
+    builder
         .require_git(false)
-        .filter_entry(|entry| entry.file_name() != cache::CACHE_DIR)
-        .build()
-    {
+        .filter_entry(|entry| entry.file_name() != cache::CACHE_DIR);
+    if config.no_ignore {
+        builder
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .ignore(false);
+    }
+    for entry in builder.build() {
         match entry {
             Ok(entry) => {
                 if entry.file_type().is_some_and(|ft| ft.is_file())
@@ -399,6 +406,23 @@ mod tests {
         let index = SourceIndex::build_with_cache(&dir, &Config::default(), None).unwrap();
         assert_eq!(index.files().len(), 1);
         assert_eq!(index.files()[0].path.file_name().unwrap(), "a.rs");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_ignore_walks_gitignored_files() {
+        let dir = temp_dir("no-ignore");
+        fs::write(dir.join(".gitignore"), "vendor/\n").unwrap();
+        fs::write(dir.join("a.rs"), "fn a() {}").unwrap();
+        let vendor = dir.join("vendor");
+        fs::create_dir_all(&vendor).unwrap();
+        fs::write(vendor.join("b.rs"), "fn b() {}").unwrap();
+        let config = Config {
+            no_ignore: true,
+            ..Config::default()
+        };
+        let index = SourceIndex::build_with_cache(&dir, &config, None).unwrap();
+        assert_eq!(index.files().len(), 2);
         fs::remove_dir_all(&dir).ok();
     }
 

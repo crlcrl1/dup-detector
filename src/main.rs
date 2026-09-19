@@ -46,6 +46,9 @@ enum Command {
         /// Restrict scanning to these languages (e.g. --lang rust --lang cpp)
         #[arg(long = "lang", value_name = "LANG")]
         languages: Vec<String>,
+        /// Also scan files excluded by .gitignore and .ignore rules
+        #[arg(long)]
+        no_ignore: bool,
         /// Print results as JSON
         #[arg(long)]
         json: bool,
@@ -70,6 +73,7 @@ fn main() -> anyhow::Result<()> {
             max_groups,
             parameterize_literals,
             languages,
+            no_ignore,
             json,
         } => run_scan(
             &path,
@@ -78,6 +82,7 @@ fn main() -> anyhow::Result<()> {
             max_groups,
             parameterize_literals,
             &languages,
+            no_ignore,
             json,
         ),
     }
@@ -113,6 +118,7 @@ fn run_scan(
     max_groups: Option<usize>,
     parameterize_literals: bool,
     languages: &[String],
+    no_ignore: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     let mut config = Config::load_or_default(path)
@@ -120,6 +126,9 @@ fn run_scan(
         .with_limits(min_lines, min_occurrences, max_groups);
     if parameterize_literals {
         config.parameterize_literals = true;
+    }
+    if no_ignore {
+        config.no_ignore = true;
     }
     if !languages.is_empty() {
         let ids: Vec<LanguageId> = languages

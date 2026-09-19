@@ -16,6 +16,7 @@ pub struct Config {
     pub max_groups: Option<usize>,
     pub parameterize_literals: bool,
     pub languages: Vec<LanguageId>,
+    pub no_ignore: bool,
 }
 
 impl Default for Config {
@@ -28,6 +29,7 @@ impl Default for Config {
             max_groups: None,
             parameterize_literals: false,
             languages: LanguageId::ALL.to_vec(),
+            no_ignore: false,
         }
     }
 }
@@ -187,6 +189,7 @@ mod tests {
                 max_groups: Some(25),
                 parameterize_literals: true,
                 languages: vec![LanguageId::Rust, LanguageId::Python],
+                no_ignore: false,
             }
         );
     }

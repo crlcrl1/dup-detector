@@ -47,6 +47,9 @@ dup-detector scan <path> --json
 
 # allow consistent literal renames to match
 dup-detector scan <path> --parameterize-literals
+
+# also scan files excluded by .gitignore
+dup-detector scan <path> --no-ignore
 ```
 
 Scan options:
@@ -58,6 +61,7 @@ Scan options:
 | `--max-groups <N>`        | none    | Maximum number of groups to report           |
 | `--parameterize-literals` | off     | Treat consistently renamed literals as equal |
 | `--lang <LANG>`           | all     | Restrict to a language (repeatable)          |
+| `--no-ignore`             | off     | Also scan files excluded by `.gitignore`/`.ignore` |
 | `--json`                  | off     | Print results as JSON                        |
 
 See [MCP server](mcp.md) for the `mcp` subcommand and [Editor integration](lsp.md)

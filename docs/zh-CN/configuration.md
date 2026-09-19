@@ -44,17 +44,21 @@ dup-detector scan <path> --json
 
 # 允许一致重命名的字面量参与匹配
 dup-detector scan <path> --parameterize-literals
+
+# 同时扫描被 .gitignore 排除的文件
+dup-detector scan <path> --no-ignore
 ```
 
 扫描参数：
 
-| 参数                      | 默认值 | 说明                         |
-| ------------------------- | ------ | ---------------------------- |
-| `--min-lines <N>`         | `7`    | 克隆组的最小行数             |
-| `--min-occurrences <N>`   | `2`    | 每个克隆组的最小出现次数     |
-| `--max-groups <N>`        | 无限制 | 最多返回的克隆组数量         |
-| `--parameterize-literals` | 关闭   | 将一致重命名的字面量视为相同 |
-| `--lang <LANG>`           | 全部   | 限定语言（可重复）           |
-| `--json`                  | 关闭   | 以 JSON 输出结果             |
+| 参数                      | 默认值 | 说明                             |
+| ------------------------- | ------ | -------------------------------- |
+| `--min-lines <N>`         | `7`    | 克隆组的最小行数                 |
+| `--min-occurrences <N>`   | `2`    | 每个克隆组的最小出现次数         |
+| `--max-groups <N>`        | 无限制 | 最多返回的克隆组数量             |
+| `--parameterize-literals` | 关闭   | 将一致重命名的字面量视为相同     |
+| `--lang <LANG>`           | 全部   | 限定语言（可重复）               |
+| `--no-ignore`             | 关闭   | 同时扫描被 `.gitignore`/`.ignore` 排除的文件 |
+| `--json`                  | 关闭   | 以 JSON 输出结果                 |
 
 `mcp` 子命令见 [MCP 服务器](mcp.md)，`lsp` 子命令见[编辑器集成](lsp.md)。
