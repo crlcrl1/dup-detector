@@ -196,7 +196,7 @@ impl Backend {
         let Some(existing) = existing else {
             return;
         };
-        let mut text = existing.file.text.clone();
+        let mut text = existing.file.text.as_str().to_string();
         let mut regions: Vec<(usize, usize)> = Vec::new();
         for change in &changes {
             apply_change(&mut text, change, &mut regions);

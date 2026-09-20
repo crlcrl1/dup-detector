@@ -34,6 +34,7 @@ Already written into `Cargo.toml`; no need to pick versions again:
 - Traversal: `ignore` (respects .gitignore), `rayon` (parallel parsing)
 - Serialization: `serde` / `serde_json` / `schemars` (MCP tool schemas), `toml` (config file)
 - Errors: `anyhow` (application layer) / `thiserror` (library layer)
+- Allocator: `tikv-jemallocator` on unix (`#[global_allocator]` in `main.rs`)
 - CLI: `clap` (derive)
 - Logging: `tracing` / `tracing-subscriber` (env-filter)
 - Hashing: `xxhash-rust` (xxh3)
@@ -53,7 +54,7 @@ src/
   encode.rs      Token stream -> parameterized encoding (rename-invariant)
   detect.rs      seed-and-extend detection + bijection check + clone clustering
   index.rs       Project-level index (file discovery, parallel parsing, incremental invalidation)
-  cache.rs       On-disk token cache (`.dup-detector/`, one entry per source file named by a hash of its root-relative path, mtime/size/text-hash validated)
+  cache.rs       On-disk token cache (`.dup-detector/`, one entry per source file named by a hash of its root-relative path, mtime/size/text-hash validated; entries are flat little-endian POD arrays (`Token`/hash) mapped zero-copy via `memmap2` on big-endian fallback decoded)
   server.rs      rmcp ServerHandler + #[tool] tool definitions
   lsp.rs         tower-lsp LanguageServer (diagnostics, definition, references, hover)
 editors/

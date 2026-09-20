@@ -113,9 +113,7 @@ fn group_lines(index: &SourceIndex, group: &CloneGroup) -> usize {
         .iter()
         .map(|o| {
             let file = &index.files()[o.file as usize];
-            let first = file.tokens[o.start as usize].line as usize;
-            let last = file.tokens[o.end as usize - 1].end_line as usize;
-            last - first + 1
+            file.line_span(o)
         })
         .min()
         .unwrap_or(0)

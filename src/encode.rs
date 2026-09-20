@@ -98,15 +98,29 @@ pub(crate) type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
 pub(crate) type FastSet<T> = std::collections::HashSet<T, BuildHasherDefault<FastHasher>>;
 
 const TAG_MASK: u64 = 0b11 << 62;
-const FIXED_TAG: u64 = 0b00 << 62;
-const IDENTIFIER_TAG: u64 = 0b01 << 62;
+pub(crate) const FIXED_TAG: u64 = 0b00 << 62;
+pub(crate) const IDENTIFIER_TAG: u64 = 0b01 << 62;
 const LITERAL_TAG: u64 = 0b10 << 62;
 const PARAM_TAG: u64 = 0b11 << 62;
+pub(crate) const FIXED_BITS: u64 = 0b00;
+pub(crate) const IDENTIFIER_BITS: u64 = 0b01;
+pub(crate) const LITERAL_BITS: u64 = 0b10;
+
+fn kind_tag(kind: u8) -> u64 {
+    match TokenKind::from_u8(kind) {
+        Some(TokenKind::Identifier) => IDENTIFIER_TAG,
+        Some(TokenKind::Literal) => LITERAL_TAG,
+        _ => FIXED_TAG,
+    }
+}
 
 pub fn token_hashes(text: &str, tokens: &[Token]) -> Vec<u64> {
     tokens
         .iter()
-        .map(|token| xxh3_64(&text.as_bytes()[token.start as usize..token.end as usize]))
+        .map(|token| {
+            let raw = xxh3_64(&text.as_bytes()[token.start as usize..token.end as usize]);
+            (raw & !TAG_MASK) | kind_tag(token.kind)
+        })
         .collect()
 }
 
@@ -119,20 +133,21 @@ pub fn window_signatures(
     if window == 0 || tokens.len() < window {
         return Vec::new();
     }
-    let total = tokens.len();
-    let base: Vec<u64> = tokens
+    let total = hashes.len();
+    let base: Vec<u64> = hashes
         .iter()
-        .zip(hashes)
-        .map(|(token, &hash)| match token.kind {
-            TokenKind::Fixed => (hash & !TAG_MASK) | FIXED_TAG,
-            TokenKind::Literal if !parameterize_literals => (hash & !TAG_MASK) | LITERAL_TAG,
-            _ => PARAM_TAG,
+        .map(|&hash| {
+            let tag = hash >> 62;
+            if tag == IDENTIFIER_BITS || (tag == LITERAL_BITS && parameterize_literals) {
+                PARAM_TAG
+            } else {
+                hash
+            }
         })
         .collect();
-    let mut last_position: FastMap<(u64, TokenKind), u32> = FastMap::default();
+    let mut last_position: FastMap<u64, u32> = FastMap::default();
     let mut previous = vec![u32::MAX; total];
-    for (index, token) in tokens.iter().enumerate() {
-        let key = (hashes[index], token.kind);
+    for (index, &key) in hashes.iter().enumerate() {
         if let Some(&position) = last_position.get(&key) {
             previous[index] = position;
         }
@@ -146,11 +161,7 @@ pub fn window_signatures(
             let value = if base[index] != PARAM_TAG {
                 base[index]
             } else {
-                let tag = match tokens[index].kind {
-                    TokenKind::Literal => LITERAL_TAG,
-                    _ => IDENTIFIER_TAG,
-                };
-                parameterized(previous[index], start, index, tag)
+                parameterized(previous[index], start, index, hashes[index] & TAG_MASK)
             };
             bytes[i * 8..i * 8 + 8].copy_from_slice(&value.to_le_bytes());
         }
@@ -168,13 +179,10 @@ fn parameterized(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
     (distance & !TAG_MASK) | tag
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn spans_equal(
     scratch: &mut SpanScratch,
-    tokens_a: &[Token],
     hashes_a: &[u64],
     start_a: usize,
-    tokens_b: &[Token],
     hashes_b: &[u64],
     start_b: usize,
     len: usize,
@@ -185,39 +193,24 @@ pub fn spans_equal(
     previous_a.clear();
     previous_b.clear();
     for i in 0..len {
-        let index_a = start_a + i;
-        let index_b = start_b + i;
-        let token_a = &tokens_a[index_a];
-        if token_a.kind != tokens_b[index_b].kind {
+        let hash_a = hashes_a[start_a + i];
+        let hash_b = hashes_b[start_b + i];
+        let tag = hash_a >> 62;
+        if tag != hash_b >> 62 {
             return false;
         }
-        match token_a.kind {
-            TokenKind::Fixed => {
-                if hashes_a[index_a] != hashes_b[index_b] {
-                    return false;
-                }
+        if tag == FIXED_BITS {
+            if hash_a != hash_b {
+                return false;
             }
-            TokenKind::Identifier => {
-                let distance_a = previous_a.insert(identity(token_a.kind, hashes_a[index_a]), i);
-                let distance_b =
-                    previous_b.insert(identity(tokens_b[index_b].kind, hashes_b[index_b]), i);
-                if previous_distance(distance_a, i) != previous_distance(distance_b, i) {
-                    return false;
-                }
+        } else if tag == IDENTIFIER_BITS || parameterize_literals {
+            let distance_a = previous_a.insert(hash_a, i);
+            let distance_b = previous_b.insert(hash_b, i);
+            if previous_distance(distance_a, i) != previous_distance(distance_b, i) {
+                return false;
             }
-            TokenKind::Literal => {
-                if parameterize_literals {
-                    let distance_a =
-                        previous_a.insert(identity(token_a.kind, hashes_a[index_a]), i);
-                    let distance_b =
-                        previous_b.insert(identity(tokens_b[index_b].kind, hashes_b[index_b]), i);
-                    if previous_distance(distance_a, i) != previous_distance(distance_b, i) {
-                        return false;
-                    }
-                } else if hashes_a[index_a] != hashes_b[index_b] {
-                    return false;
-                }
-            }
+        } else if hash_a != hash_b {
+            return false;
         }
     }
     true
@@ -238,7 +231,6 @@ impl SpanScratch {
 
 pub fn span_fingerprint(
     scratch: &mut SpanScratch,
-    tokens: &[Token],
     hashes: &[u64],
     start: usize,
     len: usize,
@@ -247,17 +239,14 @@ pub fn span_fingerprint(
     scratch.positions.clear();
     let mut fingerprint = 0u64;
     for i in 0..len {
-        let index = start + i;
-        let kind = tokens[index].kind;
-        let value = match kind {
-            TokenKind::Fixed => (hashes[index] & !TAG_MASK) | FIXED_TAG,
-            TokenKind::Identifier => {
-                fingerprint_value(scratch, identity(kind, hashes[index]), i, IDENTIFIER_TAG)
-            }
-            TokenKind::Literal if parameterize_literals => {
-                fingerprint_value(scratch, identity(kind, hashes[index]), i, LITERAL_TAG)
-            }
-            TokenKind::Literal => (hashes[index] & !TAG_MASK) | LITERAL_TAG,
+        let hash = hashes[start + i];
+        let tag = hash >> 62;
+        let value = if tag == IDENTIFIER_BITS {
+            fingerprint_value(scratch, hash, i, IDENTIFIER_TAG)
+        } else if tag == LITERAL_BITS && parameterize_literals {
+            fingerprint_value(scratch, hash, i, LITERAL_TAG)
+        } else {
+            hash
         };
         fingerprint = fingerprint
             .rotate_left(11)
@@ -273,14 +262,6 @@ fn fingerprint_value(scratch: &mut SpanScratch, key: u64, index: usize, tag: u64
         None => 0,
     };
     (distance & !TAG_MASK) | tag
-}
-
-fn identity(kind: TokenKind, hash: u64) -> u64 {
-    match kind {
-        TokenKind::Fixed => (hash & !TAG_MASK) | FIXED_TAG,
-        TokenKind::Identifier => (hash & !TAG_MASK) | IDENTIFIER_TAG,
-        TokenKind::Literal => (hash & !TAG_MASK) | LITERAL_TAG,
-    }
 }
 
 fn previous_distance(previous: Option<usize>, index: usize) -> Option<usize> {
@@ -306,25 +287,25 @@ mod tests {
     }
 
     fn window_signatures_naive(
-        tokens: &[Token],
         hashes: &[u64],
         window: usize,
         parameterize_literals: bool,
     ) -> Vec<u64> {
-        let total = tokens.len();
-        let base: Vec<u64> = tokens
+        let total = hashes.len();
+        let base: Vec<u64> = hashes
             .iter()
-            .zip(hashes)
-            .map(|(token, &hash)| match token.kind {
-                TokenKind::Fixed => (hash & !TAG_MASK) | FIXED_TAG,
-                TokenKind::Literal if !parameterize_literals => (hash & !TAG_MASK) | LITERAL_TAG,
-                _ => PARAM_TAG,
+            .map(|&hash| {
+                let tag = hash >> 62;
+                if tag == IDENTIFIER_BITS || (tag == LITERAL_BITS && parameterize_literals) {
+                    PARAM_TAG
+                } else {
+                    hash
+                }
             })
             .collect();
-        let mut last_position: FastMap<(u64, TokenKind), u32> = FastMap::default();
+        let mut last_position: FastMap<u64, u32> = FastMap::default();
         let mut previous = vec![u32::MAX; total];
-        for (index, token) in tokens.iter().enumerate() {
-            let key = (hashes[index], token.kind);
+        for (index, &key) in hashes.iter().enumerate() {
             if let Some(&position) = last_position.get(&key) {
                 previous[index] = position;
             }
@@ -338,11 +319,7 @@ mod tests {
                 let value = if base[index] != PARAM_TAG {
                     base[index]
                 } else {
-                    let tag = match tokens[index].kind {
-                        TokenKind::Literal => LITERAL_TAG,
-                        _ => IDENTIFIER_TAG,
-                    };
-                    parameterized(previous[index], start, index, tag)
+                    parameterized(previous[index], start, index, hashes[index] & TAG_MASK)
                 };
                 bytes[i * 8..i * 8 + 8].copy_from_slice(&value.to_le_bytes());
             }
@@ -369,7 +346,7 @@ mod tests {
                 for parameterize_literals in [false, true] {
                     assert_eq!(
                         window_signatures(&tokens, &hashes, window, parameterize_literals),
-                        window_signatures_naive(&tokens, &hashes, window, parameterize_literals),
+                        window_signatures_naive(&hashes, window, parameterize_literals),
                         "source: {source}, window: {window}"
                     );
                 }
@@ -416,15 +393,13 @@ mod tests {
         let (tokens_b, hashes_b) = hashes("let gamma = delta + 1;");
         let (tokens_c, hashes_c) = hashes("let gamma = delta + 2;");
         let mut scratch = SpanScratch::new();
-        let a = span_fingerprint(&mut scratch, &tokens_a, &hashes_a, 0, tokens_a.len(), false);
-        let b = span_fingerprint(&mut scratch, &tokens_b, &hashes_b, 0, tokens_b.len(), false);
-        let c = span_fingerprint(&mut scratch, &tokens_c, &hashes_c, 0, tokens_c.len(), false);
+        let a = span_fingerprint(&mut scratch, &hashes_a, 0, tokens_a.len(), false);
+        let b = span_fingerprint(&mut scratch, &hashes_b, 0, tokens_b.len(), false);
+        let c = span_fingerprint(&mut scratch, &hashes_c, 0, tokens_c.len(), false);
         assert_eq!(a, b);
         assert_ne!(a, c);
-        let a_parameterized =
-            span_fingerprint(&mut scratch, &tokens_a, &hashes_a, 0, tokens_a.len(), true);
-        let c_parameterized =
-            span_fingerprint(&mut scratch, &tokens_c, &hashes_c, 0, tokens_c.len(), true);
+        let a_parameterized = span_fingerprint(&mut scratch, &hashes_a, 0, tokens_a.len(), true);
+        let c_parameterized = span_fingerprint(&mut scratch, &hashes_c, 0, tokens_c.len(), true);
         assert_eq!(a_parameterized, c_parameterized);
     }
 
@@ -438,23 +413,19 @@ mod tests {
         let mut scratch = SpanScratch::new();
         assert!(spans_equal(
             &mut scratch,
-            &tokens_a,
             &hashes_a,
             0,
-            &tokens_b,
             &hashes_b,
             0,
             len,
             false
         ));
         let c = "let gamma = delta + 2;";
-        let (tokens_c, hashes_c) = hashes(c);
+        let (_tokens_c, hashes_c) = hashes(c);
         assert!(!spans_equal(
             &mut scratch,
-            &tokens_a,
             &hashes_a,
             0,
-            &tokens_c,
             &hashes_c,
             0,
             len,
@@ -462,10 +433,8 @@ mod tests {
         ));
         assert!(spans_equal(
             &mut scratch,
-            &tokens_a,
             &hashes_a,
             0,
-            &tokens_c,
             &hashes_c,
             0,
             len,

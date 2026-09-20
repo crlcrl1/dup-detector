@@ -49,7 +49,7 @@ src/
   encode.rs     token stream -> parameterized encoding
   detect.rs     seed-and-extend, bijection, clustering
   index.rs      file discovery, parallel parsing, incremental refresh
-  cache.rs      on-disk token cache (mtime/size/text-hash validated)
+  cache.rs      on-disk token cache (mtime/size/text-hash validated, mmap'd zero-copy)
   server.rs     rmcp server + MCP tool definitions
   lsp.rs        LSP server (diagnostics, go-to-definition, references, hover)
 editors/

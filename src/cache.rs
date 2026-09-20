@@ -1,15 +1,16 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use memmap2::Mmap;
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::model::{SourceFile, Token, TokenKind};
+use crate::model::{Slice, SourceFile, Token, TokenKind};
 
-const MAGIC: &[u8; 8] = b"DUPCDT05";
-const HEADER_BYTES: usize = 12;
-const TOKEN_BYTES: usize = 30;
+const MAGIC: &[u8; 8] = b"DUPCDT10";
+const HEADER_BYTES: usize = 44;
 
 pub const CACHE_DIR: &str = ".dup-detector";
 
@@ -18,8 +19,22 @@ pub struct CacheEntry {
     pub modified: SystemTime,
     pub size: u64,
     pub text_hash: u64,
-    pub tokens: Vec<Token>,
-    pub hashes: Vec<u64>,
+    pub tokens: Slice<Token>,
+    pub hashes: Slice<u64>,
+}
+
+struct Header {
+    path: PathBuf,
+    modified: SystemTime,
+    size: u64,
+    text_hash: u64,
+    token_count: usize,
+    hashes_offset: usize,
+    tokens_offset: usize,
+}
+
+fn align8(value: usize) -> usize {
+    (value + 7) & !7
 }
 
 pub fn dir_in(root: &Path) -> PathBuf {
@@ -33,23 +48,64 @@ pub fn entry_path(dir: &Path, root: &Path, path: &Path) -> Option<PathBuf> {
 }
 
 pub fn text_hash(text: &str) -> u64 {
-    xxh3_64(text.as_bytes())
+    text_hash_bytes(text.as_bytes())
+}
+
+pub fn text_hash_bytes(bytes: &[u8]) -> u64 {
+    xxh3_64(bytes)
 }
 
 pub fn load_entry(path: &Path) -> Option<CacheEntry> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
         Err(error) => {
             tracing::debug!(path = %path.display(), error = %error, "cannot read cache entry");
             return None;
         }
     };
-    let entry = decode_entry(&bytes);
+    let entry = match mmap_entry(&file) {
+        Some(entry) => Some(entry),
+        None => match fs::read(path) {
+            Ok(bytes) => decode_entry(&bytes),
+            Err(error) => {
+                tracing::debug!(path = %path.display(), error = %error, "cannot read cache entry");
+                None
+            }
+        },
+    };
     if entry.is_none() {
         tracing::debug!(path = %path.display(), "ignoring unusable cache entry");
     }
     entry
+}
+
+#[cfg(target_endian = "little")]
+fn mmap_entry(file: &fs::File) -> Option<CacheEntry> {
+    // SAFETY: cache entries are written atomically (temp file + rename) and
+    // never modified in place while they can be mapped.
+    let map = Arc::new(unsafe { Mmap::map(file) }.ok()?);
+    let header = parse_header(&map)?;
+    let (tokens, hashes) = if header.token_count == 0 {
+        (Slice::owned(Vec::new()), Slice::owned(Vec::new()))
+    } else {
+        let hashes = Slice::mapped(map.clone(), header.hashes_offset, header.token_count)?;
+        let tokens = Slice::mapped(map, header.tokens_offset, header.token_count)?;
+        (tokens, hashes)
+    };
+    Some(CacheEntry {
+        path: header.path,
+        modified: header.modified,
+        size: header.size,
+        text_hash: header.text_hash,
+        tokens,
+        hashes,
+    })
+}
+
+#[cfg(not(target_endian = "little"))]
+fn mmap_entry(_file: &fs::File) -> Option<CacheEntry> {
+    None
 }
 
 pub fn store_entry(dir: &Path, root: &Path, file: &SourceFile) -> io::Result<()> {
@@ -90,33 +146,52 @@ fn encode_entry(root: &Path, file: &SourceFile) -> Option<Vec<u8>> {
     if file.hashes.len() != file.tokens.len() {
         return None;
     }
-    let mut out = Vec::with_capacity(
-        HEADER_BYTES + path_bytes.len() + 28 + file.tokens.len() * (TOKEN_BYTES + size_of::<u64>()),
-    );
+    let hashes_offset = align8(HEADER_BYTES + path_bytes.len());
+    let tokens_offset = hashes_offset + file.hashes.len() * size_of::<u64>();
+    let total = tokens_offset + file.tokens.len() * size_of::<Token>();
+    let mut out = Vec::with_capacity(total);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&u32::try_from(path_bytes.len()).ok()?.to_le_bytes());
-    out.extend_from_slice(path_bytes);
+    out.extend_from_slice(&token_count.to_le_bytes());
     out.extend_from_slice(&secs.to_le_bytes());
     out.extend_from_slice(&nanos.to_le_bytes());
     out.extend_from_slice(&file.size.to_le_bytes());
-    out.extend_from_slice(&text_hash(&file.text).to_le_bytes());
-    out.extend_from_slice(&token_count.to_le_bytes());
-    encode_tokens(&mut out, &file.tokens);
-    for hash in &file.hashes {
+    out.extend_from_slice(&text_hash_bytes(file.text.as_bytes()).to_le_bytes());
+    out.extend_from_slice(path_bytes);
+    out.resize(hashes_offset, 0);
+    for hash in file.hashes.as_slice() {
         out.extend_from_slice(&hash.to_le_bytes());
     }
+    append_tokens(&mut out, file.tokens.as_slice());
     Some(out)
 }
 
-fn decode_entry(bytes: &[u8]) -> Option<CacheEntry> {
+#[cfg(target_endian = "little")]
+fn append_tokens(out: &mut Vec<u8>, tokens: &[Token]) {
+    out.extend_from_slice(bytemuck::cast_slice(tokens));
+}
+
+#[cfg(not(target_endian = "little"))]
+fn append_tokens(out: &mut Vec<u8>, tokens: &[Token]) {
+    for token in tokens {
+        out.extend_from_slice(&token.start.to_le_bytes());
+        out.extend_from_slice(&token.end.to_le_bytes());
+        out.extend_from_slice(&token.unit_end_of_start.to_le_bytes());
+        out.extend_from_slice(&token.unit_start_of_end.to_le_bytes());
+        out.extend_from_slice(&token.container_end_of_start.to_le_bytes());
+        out.push(token.kind);
+        out.push(token.flags);
+        out.extend_from_slice(&token._pad);
+    }
+}
+
+fn parse_header(bytes: &[u8]) -> Option<Header> {
     if bytes.len() < HEADER_BYTES || &bytes[0..8] != MAGIC {
         return None;
     }
     let mut cursor = 8;
     let path_len = read_u32(bytes, &mut cursor)? as usize;
-    let path_end = cursor.checked_add(path_len)?;
-    let path = PathBuf::from(std::str::from_utf8(bytes.get(cursor..path_end)?).ok()?);
-    cursor = path_end;
+    let token_count = read_u32(bytes, &mut cursor)? as usize;
     let secs = read_u64(bytes, &mut cursor)?;
     let nanos = read_u32(bytes, &mut cursor)?;
     if nanos >= 1_000_000_000 {
@@ -124,24 +199,61 @@ fn decode_entry(bytes: &[u8]) -> Option<CacheEntry> {
     }
     let size = read_u64(bytes, &mut cursor)?;
     let text_hash = read_u64(bytes, &mut cursor)?;
-    let token_count = read_u32(bytes, &mut cursor)? as usize;
-    let tokens_end = cursor.checked_add(token_count.checked_mul(TOKEN_BYTES)?)?;
-    let tokens = decode_tokens(bytes.get(cursor..tokens_end)?, token_count)?;
-    let hashes_end = tokens_end.checked_add(token_count.checked_mul(8)?)?;
-    let hashes = bytes
-        .get(tokens_end..hashes_end)?
+    let path_end = HEADER_BYTES.checked_add(path_len)?;
+    let path = PathBuf::from(std::str::from_utf8(bytes.get(HEADER_BYTES..path_end)?).ok()?);
+    let hashes_offset = align8(path_end);
+    let tokens_offset = hashes_offset.checked_add(token_count.checked_mul(size_of::<u64>())?)?;
+    let end = tokens_offset.checked_add(token_count.checked_mul(size_of::<Token>())?)?;
+    if end > bytes.len() || tokens_offset % align_of::<Token>() != 0 {
+        return None;
+    }
+    Some(Header {
+        path,
+        modified: UNIX_EPOCH + Duration::new(secs, nanos),
+        size,
+        text_hash,
+        token_count,
+        hashes_offset,
+        tokens_offset,
+    })
+}
+
+fn decode_entry(bytes: &[u8]) -> Option<CacheEntry> {
+    let header = parse_header(bytes)?;
+    let count = header.token_count;
+    let hash_bytes = bytes.get(header.hashes_offset..header.hashes_offset + count * 8)?;
+    let hashes = hash_bytes
         .as_chunks::<8>()
         .0
         .iter()
         .map(|chunk| u64::from_le_bytes(*chunk))
         .collect();
+    let raw = bytes.get(header.tokens_offset..header.tokens_offset + count * size_of::<Token>())?;
+    let mut tokens = Vec::with_capacity(count);
+    for chunk in raw.as_chunks::<{ size_of::<Token>() }>().0 {
+        tokens.push(decode_token(chunk)?);
+    }
     Some(CacheEntry {
-        path,
-        modified: UNIX_EPOCH + Duration::new(secs, nanos),
-        size,
-        text_hash,
-        tokens,
-        hashes,
+        path: header.path,
+        modified: header.modified,
+        size: header.size,
+        text_hash: header.text_hash,
+        tokens: Slice::owned(tokens),
+        hashes: Slice::owned(hashes),
+    })
+}
+
+fn decode_token(raw: &[u8]) -> Option<Token> {
+    let kind = TokenKind::from_u8(*raw.get(20)?)?;
+    Some(Token {
+        start: read_u32_from(raw, 0)?,
+        end: read_u32_from(raw, 4)?,
+        unit_end_of_start: read_u32_from(raw, 8)?,
+        unit_start_of_end: read_u32_from(raw, 12)?,
+        container_end_of_start: read_u32_from(raw, 16)?,
+        kind: kind.as_u8(),
+        flags: *raw.get(21)?,
+        _pad: [0; 2],
     })
 }
 
@@ -149,51 +261,6 @@ fn mtime_parts(time: SystemTime) -> Option<(u64, u32)> {
     time.duration_since(UNIX_EPOCH)
         .ok()
         .map(|duration| (duration.as_secs(), duration.subsec_nanos()))
-}
-
-fn encode_tokens(out: &mut Vec<u8>, tokens: &[Token]) {
-    for token in tokens {
-        out.push(match token.kind {
-            TokenKind::Identifier => 0,
-            TokenKind::Literal => 1,
-            TokenKind::Fixed => 2,
-        });
-        out.push(token.flags);
-        out.extend_from_slice(&token.start.to_le_bytes());
-        out.extend_from_slice(&token.end.to_le_bytes());
-        out.extend_from_slice(&token.line.to_le_bytes());
-        out.extend_from_slice(&token.end_line.to_le_bytes());
-        out.extend_from_slice(&token.unit_end_of_start.to_le_bytes());
-        out.extend_from_slice(&token.unit_start_of_end.to_le_bytes());
-        out.extend_from_slice(&token.container_end_of_start.to_le_bytes());
-    }
-}
-
-fn decode_tokens(raw: &[u8], count: usize) -> Option<Vec<Token>> {
-    if raw.len() != count.checked_mul(TOKEN_BYTES)? {
-        return None;
-    }
-    let mut tokens = Vec::with_capacity(count);
-    for chunk in raw.as_chunks::<TOKEN_BYTES>().0 {
-        let kind = match chunk[0] {
-            0 => TokenKind::Identifier,
-            1 => TokenKind::Literal,
-            2 => TokenKind::Fixed,
-            _ => return None,
-        };
-        tokens.push(Token {
-            kind,
-            flags: chunk[1],
-            start: read_u32_from(chunk, 2)?,
-            end: read_u32_from(chunk, 6)?,
-            line: read_u32_from(chunk, 10)?,
-            end_line: read_u32_from(chunk, 14)?,
-            unit_end_of_start: read_u32_from(chunk, 18)?,
-            unit_start_of_end: read_u32_from(chunk, 22)?,
-            container_end_of_start: read_u32_from(chunk, 26)?,
-        });
-    }
-    Some(tokens)
 }
 
 fn read_u32_from(raw: &[u8], offset: usize) -> Option<u32> {
@@ -246,15 +313,14 @@ mod tests {
             LanguageId::Rust,
             text.to_string(),
             vec![Token {
-                kind: TokenKind::Identifier,
-                flags: FLAG_UNIT_START | FLAG_UNIT_END,
                 start: 0,
                 end: 3,
-                line: 1,
-                end_line: 1,
                 unit_end_of_start: 1,
                 unit_start_of_end: 0,
                 container_end_of_start: 0,
+                kind: TokenKind::Identifier.as_u8(),
+                flags: FLAG_UNIT_START | FLAG_UNIT_END,
+                _pad: [0; 2],
             }],
             Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
             text.len() as u64,
@@ -280,11 +346,16 @@ mod tests {
         let loaded = load_entry(&entry).expect("entry round-trips");
         assert_eq!(loaded.path, relative);
         assert_eq!(loaded.size, file.size);
-        assert_eq!(loaded.text_hash, text_hash(&file.text));
+        assert_eq!(loaded.text_hash, text_hash(file.text.as_str()));
         assert_eq!(loaded.tokens.len(), 1);
-        assert_eq!(loaded.tokens[0].kind, TokenKind::Identifier);
+        assert_eq!(loaded.tokens[0].kind, TokenKind::Identifier.as_u8());
         assert!(loaded.tokens[0].unit_start());
-        assert_eq!(loaded.hashes, file.hashes);
+        assert_eq!(loaded.hashes.as_slice(), file.hashes.as_slice());
+        #[cfg(target_endian = "little")]
+        {
+            assert!(loaded.tokens.is_mapped());
+            assert!(loaded.hashes.is_mapped());
+        }
         clear(&dir).unwrap();
     }
 
@@ -308,7 +379,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(&path, b"not a cache").unwrap();
         assert!(load_entry(&path).is_none());
-        fs::write(&path, b"DUPCDT04\x01\x00\x00\x00garbage").unwrap();
+        fs::write(&path, b"DUPCDT05\x01\x00\x00\x00garbage").unwrap();
         assert!(load_entry(&path).is_none());
         clear(&dir).unwrap();
     }

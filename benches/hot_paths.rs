@@ -130,7 +130,7 @@ fn bench_index(c: &mut Criterion) {
     for (i, file) in self_src_files().iter().enumerate() {
         for copy in 0..8 {
             let name = format!("module{}_v{}.rs", i, copy);
-            fs::write(fixture_src.join(name), &file.text).unwrap();
+            fs::write(fixture_src.join(name), file.text.as_str()).unwrap();
         }
     }
     let fixture_cache = fixture.join("cache");

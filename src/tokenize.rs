@@ -5,7 +5,7 @@ use thiserror::Error;
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::language::LanguageId;
-use crate::model::{Token, TokenKind};
+use crate::model::{FLAG_BRACKET_CLOSE, FLAG_BRACKET_OPEN, Token, TokenKind};
 
 #[derive(Debug, Error)]
 pub enum TokenizeError {
@@ -138,20 +138,20 @@ pub fn tokenize(source: &str, language: LanguageId) -> Result<Vec<Token>, Tokeni
         let tree = parser
             .parse(source, None)
             .ok_or(TokenizeError::ParseFailed)?;
-        let mut tokens = Vec::new();
-        collect(&tree, &KIND_TABLES[language.index()], &mut tokens);
+        let mut tokens = Vec::with_capacity(source.len() / 5 + 16);
+        collect(&tree, &KIND_TABLES[language.index()], source, &mut tokens);
         Ok(tokens)
     })
 }
 
-fn collect(tree: &Tree, tables: &KindTables, tokens: &mut Vec<Token>) {
+fn collect(tree: &Tree, tables: &KindTables, source: &str, tokens: &mut Vec<Token>) {
     let mut cursor = tree.walk();
     let mut stack: Vec<(u32, u16)> = Vec::new();
     'walk: loop {
         let node = cursor.node();
         if !(node.is_extra() || node.is_missing() || node.is_error()) {
             if node.child_count() == 0 {
-                push_token(&node, tables, tokens);
+                push_token(&node, tables, source, tokens);
             } else {
                 stack.push((tokens.len() as u32, node.kind_id()));
                 cursor.goto_first_child();
@@ -173,24 +173,43 @@ fn collect(tree: &Tree, tables: &KindTables, tokens: &mut Vec<Token>) {
     }
 }
 
-fn push_token(node: &Node<'_>, tables: &KindTables, tokens: &mut Vec<Token>) {
+fn named_single_byte<'a>(node: &Node<'_>, source: &'a str) -> Option<&'a str> {
+    (node.is_named() && node.end_byte() - node.start_byte() == 1)
+        .then(|| &source[node.start_byte()..node.end_byte()])
+}
+
+fn token_flags(kind: &str, named_single_byte: Option<&str>) -> u8 {
+    let flags = match kind {
+        "(" | "[" | "{" => FLAG_BRACKET_OPEN,
+        ")" | "]" | "}" => FLAG_BRACKET_CLOSE,
+        _ => 0,
+    };
+    if flags != 0 {
+        return flags;
+    }
+    match named_single_byte {
+        Some("(" | "[" | "{") => FLAG_BRACKET_OPEN,
+        Some(")" | "]" | "}") => FLAG_BRACKET_CLOSE,
+        _ => 0,
+    }
+}
+
+fn push_token(node: &Node<'_>, tables: &KindTables, source: &str, tokens: &mut Vec<Token>) {
     let kind_id = node.kind_id() as usize;
+    let kind_name = node.kind();
     let kind = match tables.classify.get(kind_id) {
         Some(&kind) => kind,
-        None => classify(node.kind()),
+        None => classify(kind_name),
     };
-    let start = node.start_position();
-    let end = node.end_position();
     tokens.push(Token {
-        kind,
-        flags: 0,
         start: node.start_byte() as u32,
         end: node.end_byte() as u32,
-        line: start.row as u32 + 1,
-        end_line: end.row as u32 + 1,
         unit_end_of_start: 0,
         unit_start_of_end: u32::MAX,
         container_end_of_start: 0,
+        kind: kind.as_u8(),
+        flags: token_flags(kind_name, named_single_byte(node, source)),
+        _pad: [0; 2],
     });
 }
 
@@ -275,27 +294,39 @@ mod tests {
         let source = "let count = 42; let name = \"x\";";
         let tokens = tokenize(source, LanguageId::Rust).unwrap();
         let texts = texts(source, &tokens);
-        let by_text: HashMap<&str, TokenKind> = texts
+        let by_text: HashMap<&str, u8> = texts
             .iter()
             .zip(tokens.iter())
             .map(|(t, tok)| (*t, tok.kind))
             .collect();
-        assert_eq!(by_text["count"], TokenKind::Identifier);
-        assert_eq!(by_text["42"], TokenKind::Literal);
-        assert_eq!(by_text["x"], TokenKind::Literal);
-        assert_eq!(by_text["let"], TokenKind::Fixed);
-        assert_eq!(by_text["="], TokenKind::Fixed);
+        assert_eq!(by_text["count"], TokenKind::Identifier.as_u8());
+        assert_eq!(by_text["42"], TokenKind::Literal.as_u8());
+        assert_eq!(by_text["x"], TokenKind::Literal.as_u8());
+        assert_eq!(by_text["let"], TokenKind::Fixed.as_u8());
+        assert_eq!(by_text["="], TokenKind::Fixed.as_u8());
     }
 
     #[test]
     fn records_line_numbers() {
         let source = "fn a() {\n  let x = 1;\n}\n";
         let tokens = tokenize(source, LanguageId::Rust).unwrap();
-        let x = tokens
+        let file = crate::model::SourceFile::new(
+            std::path::PathBuf::from("a.rs"),
+            LanguageId::Rust,
+            source.to_string(),
+            tokens,
+            None,
+            0,
+        );
+        assert_eq!(file.line_at(0), 1);
+        assert_eq!(file.line_at(9), 2);
+        let index = file
+            .tokens
             .iter()
-            .find(|t| &source[t.start as usize..t.end as usize] == "x")
+            .position(|t| &source[t.start as usize..t.end as usize] == "x")
             .unwrap();
-        assert_eq!(x.line, 2);
+        assert_eq!(file.token_line(index), 2);
+        assert_eq!(file.token_end_line(index), 2);
     }
 
     #[test]
@@ -308,30 +339,28 @@ mod tests {
         assert!(texts.contains(&"main"));
     }
 
-    fn reference_collect(node: Node<'_>, tokens: &mut Vec<Token>) {
+    fn reference_collect(node: Node<'_>, source: &str, tokens: &mut Vec<Token>) {
         if node.is_extra() || node.is_missing() || node.is_error() {
             return;
         }
         if node.child_count() == 0 {
-            let start = node.start_position();
-            let end = node.end_position();
+            let kind_name = node.kind();
             tokens.push(Token {
-                kind: classify(node.kind()),
-                flags: 0,
                 start: node.start_byte() as u32,
                 end: node.end_byte() as u32,
-                line: start.row as u32 + 1,
-                end_line: end.row as u32 + 1,
                 unit_end_of_start: 0,
                 unit_start_of_end: u32::MAX,
                 container_end_of_start: 0,
+                kind: classify(kind_name).as_u8(),
+                flags: token_flags(kind_name, named_single_byte(&node, source)),
+                _pad: [0; 2],
             });
             return;
         }
         let first = tokens.len();
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            reference_collect(child, tokens);
+            reference_collect(child, source, tokens);
         }
         if tokens.len() > first && is_unit_kind(node.kind()) {
             let last = tokens.len() - 1;
@@ -355,18 +384,16 @@ mod tests {
         parser.set_language(&language.grammar()).unwrap();
         let tree = parser.parse(source, None).unwrap();
         let mut tokens = Vec::new();
-        reference_collect(tree.root_node(), &mut tokens);
+        reference_collect(tree.root_node(), source, &mut tokens);
         tokens
     }
 
-    fn fields(token: &Token) -> (TokenKind, u8, u32, u32, u32, u32, u32, u32, u32) {
+    fn fields(token: &Token) -> (u8, u8, u32, u32, u32, u32, u32) {
         (
             token.kind,
             token.flags,
             token.start,
             token.end,
-            token.line,
-            token.end_line,
             token.unit_end_of_start,
             token.unit_start_of_end,
             token.container_end_of_start,
@@ -383,8 +410,8 @@ mod tests {
     }
 
     #[test]
-    fn token_is_32_bytes() {
-        assert_eq!(std::mem::size_of::<Token>(), 32);
+    fn token_is_24_bytes() {
+        assert_eq!(std::mem::size_of::<Token>(), 24);
     }
 
     #[test]

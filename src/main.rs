@@ -9,6 +9,10 @@ use dup_detector::model::CloneGroup;
 use dup_detector::server::{CloneServer, ScanResponse};
 use tracing_subscriber::EnvFilter;
 
+#[cfg(unix)]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[derive(Parser)]
 #[command(
     name = "dup-detector",
@@ -169,8 +173,8 @@ fn print_group(n: usize, group: &CloneGroup, index: &SourceIndex) {
     );
     for occ in &group.occurrences {
         let file = &files[occ.file as usize];
-        let start_line = file.tokens[occ.start as usize].line;
-        let end_line = file.tokens[(occ.end - 1) as usize].end_line;
+        let start_line = file.token_line(occ.start as usize);
+        let end_line = file.token_end_line((occ.end - 1) as usize);
         println!("  {}:{start_line}:{end_line}", file.path.display());
     }
 }

@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, WalkState};
 use rayon::prelude::*;
 use thiserror::Error;
 
@@ -274,11 +275,14 @@ fn file_from_cache(
     if meta.len() != entry.size || meta.modified().ok() != Some(entry.modified) {
         return None;
     }
-    let text = fs::read_to_string(path).ok()?;
-    if cache::text_hash(&text) != entry.text_hash {
+    let text = match mapped_text(path, entry.size) {
+        Some(text) => text,
+        None => crate::model::Text::owned(fs::read_to_string(path).ok()?),
+    };
+    if cache::text_hash_bytes(text.as_bytes()) != entry.text_hash {
         return None;
     }
-    Some(SourceFile::with_hashes(
+    let file = SourceFile::from_storage(
         path.to_path_buf(),
         language,
         text,
@@ -286,12 +290,29 @@ fn file_from_cache(
         entry.hashes,
         Some(entry.modified),
         entry.size,
-    ))
+    );
+    file.text.release_pages();
+    Some(file)
+}
+
+#[cfg(unix)]
+fn mapped_text(path: &Path, expected_size: u64) -> Option<crate::model::Text> {
+    let file = fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() != expected_size {
+        return None;
+    }
+    // SAFETY: the mapping is read-only; the source file is replaced (not
+    // truncated) by editors and build tools, so existing mappings stay valid.
+    let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+    crate::model::Text::mapped(Arc::new(map))
+}
+
+#[cfg(not(unix))]
+fn mapped_text(_path: &Path, _expected_size: u64) -> Option<crate::model::Text> {
+    None
 }
 
 fn discover(root: &Path, config: &Config) -> Result<Vec<(PathBuf, LanguageId)>, IndexError> {
-    let mut paths = Vec::new();
-    let mut failure = None;
     let mut builder = WalkBuilder::new(root);
     builder
         .require_git(false)
@@ -303,28 +324,40 @@ fn discover(root: &Path, config: &Config) -> Result<Vec<(PathBuf, LanguageId)>, 
             .git_exclude(false)
             .ignore(false);
     }
-    for entry in builder.build() {
-        match entry {
-            Ok(entry) => {
-                if entry.file_type().is_some_and(|ft| ft.is_file())
-                    && let Some(language) = LanguageId::from_path(entry.path())
-                    && config.language_enabled(language)
-                {
-                    paths.push((entry.path().to_path_buf(), language));
+    let paths = Mutex::new(Vec::new());
+    let failure = Mutex::new(None);
+    builder.build_parallel().run(|| {
+        Box::new(|entry| {
+            if failure.lock().is_ok_and(|failure| failure.is_some()) {
+                return WalkState::Quit;
+            }
+            match entry {
+                Ok(entry) => {
+                    if entry.file_type().is_some_and(|ft| ft.is_file())
+                        && let Some(language) = LanguageId::from_path(entry.path())
+                        && config.language_enabled(language)
+                        && let Ok(mut paths) = paths.lock()
+                    {
+                        paths.push((entry.into_path(), language));
+                    }
+                    WalkState::Continue
+                }
+                Err(error) => {
+                    if let Ok(mut failure) = failure.lock() {
+                        *failure = Some(error);
+                    }
+                    WalkState::Quit
                 }
             }
-            Err(error) => {
-                failure = Some(error);
-                break;
-            }
-        }
-    }
-    if let Some(source) = failure {
+        })
+    });
+    if let Some(source) = failure.into_inner().unwrap_or_default() {
         return Err(IndexError::Walk {
             root: root.to_path_buf(),
             source,
         });
     }
+    let mut paths = paths.into_inner().unwrap_or_default();
     paths.sort();
     Ok(paths)
 }
@@ -337,28 +370,33 @@ pub(crate) fn parse_file(path: &Path, language: LanguageId) -> Option<SourceFile
             return None;
         }
     };
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "cannot read file");
-            return None;
-        }
+    let text = match mapped_text(path, meta.len()) {
+        Some(text) => text,
+        None => match fs::read_to_string(path) {
+            Ok(text) => crate::model::Text::owned(text),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "cannot read file");
+                return None;
+            }
+        },
     };
-    let tokens = match tokenize::tokenize(&text, language) {
+    let tokens = match tokenize::tokenize(text.as_str(), language) {
         Ok(tokens) => tokens,
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "cannot tokenize");
             return None;
         }
     };
-    Some(SourceFile::new(
+    let file = SourceFile::new_with_text(
         path.to_path_buf(),
         language,
         text,
         tokens,
         meta.modified().ok(),
         meta.len(),
-    ))
+    );
+    file.text.release_pages();
+    Some(file)
 }
 
 #[cfg(test)]
@@ -470,7 +508,7 @@ mod tests {
         let before: Vec<_> = first.files()[0]
             .tokens
             .iter()
-            .map(|t| (t.kind, t.start, t.end, t.line))
+            .map(|t| (t.kind, t.start, t.end))
             .collect();
         drop(first);
 
@@ -481,7 +519,7 @@ mod tests {
         let after: Vec<_> = second.files()[0]
             .tokens
             .iter()
-            .map(|t| (t.kind, t.start, t.end, t.line))
+            .map(|t| (t.kind, t.start, t.end))
             .collect();
         assert_eq!(before, after);
         fs::remove_dir_all(&dir).ok();

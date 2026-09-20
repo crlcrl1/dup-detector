@@ -170,8 +170,8 @@ fn to_dto(files: &[&SourceFile], group: &CloneGroup) -> CloneGroupDto {
         .iter()
         .map(|occ| {
             let file = files[occ.file as usize];
-            let start_line = file.tokens[occ.start as usize].line;
-            let end_line = file.tokens[(occ.end - 1) as usize].end_line;
+            let start_line = file.token_line(occ.start as usize);
+            let end_line = file.token_end_line((occ.end - 1) as usize);
             OccurrenceDto {
                 path: file.path.display().to_string(),
                 start_line,
@@ -202,14 +202,20 @@ fn token_span_for_lines(
     end_line: u32,
 ) -> Option<(usize, usize)> {
     let tokens = &file.tokens;
-    let start = tokens.partition_point(|t| t.line < start_line);
-    let end = tokens.partition_point(|t| t.line <= end_line);
+    let first = file.line_offset(start_line);
+    let limit = if end_line == u32::MAX {
+        usize::MAX
+    } else {
+        file.line_offset(end_line + 1)
+    };
+    let start = tokens.partition_point(|t| (t.start as usize) < first);
+    let end = tokens.partition_point(|t| (t.start as usize) < limit);
     (start < end).then_some((start, end))
 }
 
 fn line_span(file: &SourceFile, start: usize, end: usize) -> usize {
-    let first = file.tokens[start].line as usize;
-    let last = file.tokens[end - 1].end_line as usize;
+    let first = file.token_line(start) as usize;
+    let last = file.token_end_line(end - 1) as usize;
     last.saturating_sub(first) + 1
 }
 
