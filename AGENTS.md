@@ -34,7 +34,6 @@ Already written into `Cargo.toml`; no need to pick versions again:
 - Traversal: `ignore` (respects .gitignore), `rayon` (parallel parsing)
 - Serialization: `serde` / `serde_json` / `schemars` (MCP tool schemas), `toml` (config file)
 - Errors: `anyhow` (application layer) / `thiserror` (library layer)
-- Allocator: `tikv-jemallocator` on unix (`#[global_allocator]` in `main.rs`)
 - CLI: `clap` (derive)
 - Logging: `tracing` / `tracing-subscriber` (env-filter)
 - Hashing: `xxhash-rust` (xxh3)
@@ -51,6 +50,7 @@ src/
   language.rs    Extension -> LanguageId -> tree-sitter Language
   model.rs       Token / SourceFile / Occurrence / CloneGroup / CloneType
   tokenize.rs    Source file -> CST -> leaf token stream
+  fast_hash.rs   FastHasher (xxh3-based) + FastMap / FastSet aliases
   encode.rs      Token stream -> parameterized encoding (rename-invariant)
   detect.rs      seed-and-extend detection + bijection check + clone clustering
   index.rs       Project-level index (file discovery, parallel parsing, incremental invalidation)
@@ -75,7 +75,7 @@ File discovery (ignore) -> tree-sitter parse -> token stream -> parameterized en
 
 ### Configuration file
 
-Per project, one `dup-detector.toml` at the project root (constant `config::CONFIG_FILE_NAME`). It is read at startup by searching upwards from the starting path to the filesystem root: `scan` starts at the scanned path, `mcp` starts at the server's working directory, and the server also reads each scope/index root and falls back to the startup config when a root has none. All keys are optional; a missing file yields `Config::default()`. Unknown keys and unknown language names are errors (`ConfigError`). CLI flags and MCP tool params override the file via `with_limits`/direct field assignment. Schema: `min_lines`, `min_occurrences`, `max_bucket`, `seed_window`, `max_groups`, `parameterize_literals`, `languages` (array of language names accepted by `LanguageId::from_name`).
+Per project, one `dup-detector.toml` at the project root (constant `config::CONFIG_FILE_NAME`). It is read at startup by searching upwards from the starting path to the filesystem root: `scan` starts at the scanned path, `mcp` starts at the server's working directory, and the server also reads each scope/index root and falls back to the startup config when a root has none. All keys are optional; a missing file yields `Config::default()`. Unknown keys and unknown language names are errors (`ConfigError`). CLI flags and MCP tool params override the file via `with_limits`/direct field assignment. Schema: `min_lines`, `min_occurrences`, `max_bucket`, `seed_window`, `max_groups`, `parameterize_literals`, `languages` (array of language names accepted by `LanguageId::from_name`), `max_file_bytes` (default 2 MiB; larger files are skipped by the index and by LSP overlays to bound parse memory).
 
 ### LSP server
 

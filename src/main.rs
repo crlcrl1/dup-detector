@@ -9,10 +9,6 @@ use dup_detector::model::CloneGroup;
 use dup_detector::server::{CloneServer, ScanResponse};
 use tracing_subscriber::EnvFilter;
 
-#[cfg(unix)]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
 #[derive(Parser)]
 #[command(
     name = "dup-detector",
@@ -53,6 +49,9 @@ enum Command {
         /// Also scan files excluded by .gitignore and .ignore rules
         #[arg(long)]
         no_ignore: bool,
+        /// Skip files larger than this many bytes (default 2 MiB)
+        #[arg(long)]
+        max_file_bytes: Option<u64>,
         /// Print results as JSON
         #[arg(long)]
         json: bool,
@@ -78,6 +77,7 @@ fn main() -> anyhow::Result<()> {
             parameterize_literals,
             languages,
             no_ignore,
+            max_file_bytes,
             json,
         } => run_scan(
             &path,
@@ -87,6 +87,7 @@ fn main() -> anyhow::Result<()> {
             parameterize_literals,
             &languages,
             no_ignore,
+            max_file_bytes,
             json,
         ),
     }
@@ -123,6 +124,7 @@ fn run_scan(
     parameterize_literals: bool,
     languages: &[String],
     no_ignore: bool,
+    max_file_bytes: Option<u64>,
     json: bool,
 ) -> anyhow::Result<()> {
     let mut config = Config::load_or_default(path)
@@ -133,6 +135,9 @@ fn run_scan(
     }
     if no_ignore {
         config.no_ignore = true;
+    }
+    if let Some(value) = max_file_bytes {
+        config.max_file_bytes = value;
     }
     if !languages.is_empty() {
         let ids: Vec<LanguageId> = languages

@@ -46,6 +46,7 @@ src/
   language.rs   extension -> LanguageId -> tree-sitter grammar
   model.rs      Token / SourceFile / Occurrence / CloneGroup / CloneType
   tokenize.rs   source -> CST -> leaf token stream
+  fast_hash.rs  fast hasher + map/set aliases
   encode.rs     token stream -> parameterized encoding
   detect.rs     seed-and-extend, bijection, clustering
   index.rs      file discovery, parallel parsing, incremental refresh

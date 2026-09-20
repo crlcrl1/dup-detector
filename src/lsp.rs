@@ -20,7 +20,7 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::config::Config;
 use crate::detect;
-use crate::encode::FastSet;
+use crate::fast_hash::FastSet;
 use crate::index::SourceIndex;
 use crate::language::LanguageId;
 use crate::model::{CloneType, Occurrence, SourceFile};
@@ -176,6 +176,7 @@ impl Backend {
         let Ok(path) = uri.to_file_path() else {
             return;
         };
+        let path = canonical_path(path);
         let Some(language) = LanguageId::from_path(&path) else {
             return;
         };
@@ -201,6 +202,34 @@ impl Backend {
         for change in &changes {
             apply_change(&mut text, change, &mut regions);
         }
+        if text.len() as u64 > state.config.max_file_bytes {
+            tracing::debug!(path = %path.display(), size = text.len(), "skipping large file");
+            trace(&format!(
+                "did_change drop large {} bytes={}",
+                path.display(),
+                text.len()
+            ));
+            let mut documents = state
+                .documents
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            documents.remove(&path);
+            drop(documents);
+            let mut pending = state
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending.mark_whole(path);
+            drop(pending);
+            state.bump();
+            return;
+        }
+        trace(&format!(
+            "did_change {} changes={} bytes={}",
+            path.display(),
+            changes.len(),
+            text.len()
+        ));
         let Ok(tokens) = tokenize::tokenize(&text, language) else {
             return;
         };
@@ -293,9 +322,28 @@ impl LanguageServer for Backend {
         let Ok(path) = item.uri.to_file_path() else {
             return;
         };
+        let path = canonical_path(path);
         let Some(language) = LanguageId::from_path(&path) else {
             return;
         };
+        if !path.starts_with(&state.root) {
+            tracing::debug!(uri = %item.uri, "ignoring file outside the workspace root");
+            return;
+        }
+        if item.text.len() as u64 > state.config.max_file_bytes {
+            tracing::debug!(uri = %item.uri, size = item.text.len(), "skipping large file");
+            trace(&format!(
+                "did_open skip large {} bytes={}",
+                path.display(),
+                item.text.len()
+            ));
+            return;
+        }
+        trace(&format!(
+            "did_open {} bytes={}",
+            path.display(),
+            item.text.len()
+        ));
         let Ok(tokens) = tokenize::tokenize(&item.text, language) else {
             return;
         };
@@ -341,6 +389,7 @@ impl LanguageServer for Backend {
         let state = self.state();
         let uri = params.text_document.uri;
         if let Ok(path) = uri.to_file_path() {
+            let path = canonical_path(path);
             let mut documents = state
                 .documents
                 .lock()
@@ -480,6 +529,35 @@ impl LanguageServer for Backend {
     }
 }
 
+fn canonical_path(path: PathBuf) -> PathBuf {
+    path.canonicalize().unwrap_or(path)
+}
+
+fn trace(message: &str) {
+    let Ok(path) = std::env::var("DUP_DETECTOR_LSP_TRACE") else {
+        return;
+    };
+    let rss = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status.lines().find_map(|line| {
+                line.strip_prefix("VmRSS:")
+                    .and_then(|value| value.split_whitespace().next())
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+        })
+        .map(|kb| kb / 1024)
+        .unwrap_or(0);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "[rss={rss}MB] {message}");
+    }
+}
+
 fn root_from_params(params: &InitializeParams) -> Option<PathBuf> {
     if let Some(uri) = &params.root_uri
         && let Ok(path) = uri.to_file_path()
@@ -572,7 +650,23 @@ fn analyze(state: &State) -> anyhow::Result<Option<Analysis>> {
                 .filter(|path| !open.contains(path))
                 .collect::<Vec<_>>(),
             None => {
-                *guard = Some(SourceIndex::build(&state.root, config)?);
+                let built = SourceIndex::build(&state.root, config)?;
+                trace(&format!(
+                    "index built root={} files={} tokens={} bytes={}",
+                    state.root.display(),
+                    built.files().len(),
+                    built
+                        .files()
+                        .iter()
+                        .map(|file| file.tokens.len())
+                        .sum::<usize>(),
+                    built
+                        .files()
+                        .iter()
+                        .map(|file| file.text.as_bytes().len())
+                        .sum::<usize>()
+                ));
+                *guard = Some(built);
                 Vec::new()
             }
         }
@@ -648,6 +742,16 @@ fn analyze(state: &State) -> anyhow::Result<Option<Analysis>> {
     }
 
     let groups = detect::detect_filtered(&files, config, Some(&allowed));
+    trace(&format!(
+        "analyze root={} files={} documents={} allowed={} previous={} changed={} groups={}",
+        state.root.display(),
+        files.len(),
+        documents.len(),
+        allowed.len(),
+        previous.signatures.len(),
+        pending.changed.len(),
+        groups.len()
+    ));
     tracing::debug!(
         allowed = allowed.len(),
         previous = previous.signatures.len(),
@@ -887,6 +991,14 @@ pub fn run(config: Config, root: PathBuf) -> anyhow::Result<()> {
         .enable_all()
         .build()?;
     runtime.block_on(async move {
+        if std::env::var("DUP_DETECTOR_LSP_TRACE").is_ok() {
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    trace("tick");
+                }
+            });
+        }
         let stdin = tokio::io::stdin();
         let stdout = tokio::io::stdout();
         let (service, socket) =

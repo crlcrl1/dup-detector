@@ -18,6 +18,7 @@ seed_window = 8          # seed window length in tokens
 max_groups = 100         # omit / comment out for no limit
 parameterize_literals = false
 languages = ["rust", "python", "javascript", "typescript", "tsx", "cpp"]
+max_file_bytes = 2097152   # skip files larger than 2 MiB
 ```
 
 | Key                     | Default | Meaning                                                            |
@@ -29,6 +30,7 @@ languages = ["rust", "python", "javascript", "typescript", "tsx", "cpp"]
 | `max_groups`            | none    | Maximum number of groups to report                                 |
 | `parameterize_literals` | `false` | Treat consistently renamed literals as equal                       |
 | `languages`             | all     | Languages to scan (`LanguageId::from_name` names)                  |
+| `max_file_bytes`        | `2097152` | Files larger than this are skipped (bounds parse memory)         |
 
 Unknown keys and unknown language names are reported as errors. A missing
 `dup-detector.toml` is fine and simply uses the defaults.
@@ -50,6 +52,9 @@ dup-detector scan <path> --parameterize-literals
 
 # also scan files excluded by .gitignore
 dup-detector scan <path> --no-ignore
+
+# raise the size limit for very large generated files
+dup-detector scan <path> --max-file-bytes 8388608
 ```
 
 Scan options:
@@ -62,6 +67,7 @@ Scan options:
 | `--parameterize-literals` | off     | Treat consistently renamed literals as equal |
 | `--lang <LANG>`           | all     | Restrict to a language (repeatable)          |
 | `--no-ignore`             | off     | Also scan files excluded by `.gitignore`/`.ignore` |
+| `--max-file-bytes <N>`    | `2097152` | Skip files larger than `N` bytes                 |
 | `--json`                  | off     | Print results as JSON                        |
 
 See [MCP server](mcp.md) for the `mcp` subcommand and [Editor integration](lsp.md)

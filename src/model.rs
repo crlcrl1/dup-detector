@@ -47,49 +47,36 @@ pub struct Token {
 }
 
 #[derive(Clone)]
-pub enum TextRepr {
+pub enum Text {
     Owned(String),
     Mapped(Arc<Mmap>),
 }
 
-#[derive(Clone)]
-pub struct Text {
-    repr: TextRepr,
-}
-
 impl Text {
-    pub fn owned(text: String) -> Self {
-        Self {
-            repr: TextRepr::Owned(text),
-        }
-    }
-
     #[cfg(unix)]
     pub fn mapped(map: Arc<Mmap>) -> Option<Self> {
         std::str::from_utf8(&map).ok()?;
-        Some(Self {
-            repr: TextRepr::Mapped(map),
-        })
+        Some(Self::Mapped(map))
     }
 
     pub fn as_str(&self) -> &str {
-        match &self.repr {
-            TextRepr::Owned(text) => text,
+        match self {
+            Text::Owned(text) => text,
             // SAFETY: `mapped` validated the whole mapping as UTF-8.
-            TextRepr::Mapped(map) => unsafe { std::str::from_utf8_unchecked(map) },
+            Text::Mapped(map) => unsafe { std::str::from_utf8_unchecked(map) },
         }
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        match &self.repr {
-            TextRepr::Owned(text) => text.as_bytes(),
-            TextRepr::Mapped(map) => map,
+        match self {
+            Text::Owned(text) => text.as_bytes(),
+            Text::Mapped(map) => map,
         }
     }
 
     pub fn release_pages(&self) {
         #[cfg(unix)]
-        if let TextRepr::Mapped(map) = &self.repr {
+        if let Text::Mapped(map) = self {
             // SAFETY: the mapping is read-only, so dropping its resident pages
             // only forces later accesses to be served from the backing file.
             let _ = unsafe { map.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
@@ -279,7 +266,7 @@ impl SourceFile {
         Self::from_storage(
             path,
             language,
-            Text::owned(text),
+            Text::Owned(text),
             Slice::owned(tokens),
             Slice::owned(hashes),
             modified,

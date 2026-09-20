@@ -2,6 +2,7 @@ pub mod cache;
 pub mod config;
 pub mod detect;
 pub mod encode;
+pub(crate) mod fast_hash;
 pub mod index;
 pub mod language;
 pub mod lsp;

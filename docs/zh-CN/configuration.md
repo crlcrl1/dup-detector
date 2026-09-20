@@ -16,6 +16,7 @@ seed_window = 8          # 种子窗口的 token 长度
 max_groups = 100         # 省略或注释掉表示不限制
 parameterize_literals = false
 languages = ["rust", "python", "javascript", "typescript", "tsx", "cpp"]
+max_file_bytes = 2097152   # 超过 2 MiB 的文件跳过
 ```
 
 | 键                      | 默认值  | 说明                                       |
@@ -27,6 +28,7 @@ languages = ["rust", "python", "javascript", "typescript", "tsx", "cpp"]
 | `max_groups`            | 无限制  | 最多返回的克隆组数量                       |
 | `parameterize_literals` | `false` | 将一致重命名的字面量视为相同               |
 | `languages`             | 全部    | 参与扫描的语言（`LanguageId::from_name` 名称） |
+| `max_file_bytes`        | `2097152` | 超过该大小的文件跳过（限制解析内存）          |
 
 未知的键和未知的语言名会报错。缺少 `dup-detector.toml` 时直接使用默认值。
 
@@ -47,6 +49,9 @@ dup-detector scan <path> --parameterize-literals
 
 # 同时扫描被 .gitignore 排除的文件
 dup-detector scan <path> --no-ignore
+
+# 提高上限以包含超大生成文件
+dup-detector scan <path> --max-file-bytes 8388608
 ```
 
 扫描参数：
@@ -59,6 +64,7 @@ dup-detector scan <path> --no-ignore
 | `--parameterize-literals` | 关闭   | 将一致重命名的字面量视为相同     |
 | `--lang <LANG>`           | 全部   | 限定语言（可重复）               |
 | `--no-ignore`             | 关闭   | 同时扫描被 `.gitignore`/`.ignore` 排除的文件 |
+| `--max-file-bytes <N>`    | `2097152` | 跳过大于 `N` 字节的文件                     |
 | `--json`                  | 关闭   | 以 JSON 输出结果                 |
 
 `mcp` 子命令见 [MCP 服务器](mcp.md)，`lsp` 子命令见[编辑器集成](lsp.md)。

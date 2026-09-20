@@ -5,7 +5,8 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use crate::config::Config;
-use crate::encode::{self, FastMap, FastSet};
+use crate::encode;
+use crate::fast_hash::{FastMap, FastSet};
 use crate::model::{CloneGroup, CloneType, Occurrence, SourceFile, SpanMeta};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

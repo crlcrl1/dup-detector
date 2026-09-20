@@ -17,6 +17,7 @@ pub struct Config {
     pub parameterize_literals: bool,
     pub languages: Vec<LanguageId>,
     pub no_ignore: bool,
+    pub max_file_bytes: u64,
 }
 
 impl Default for Config {
@@ -30,6 +31,7 @@ impl Default for Config {
             parameterize_literals: false,
             languages: LanguageId::ALL.to_vec(),
             no_ignore: false,
+            max_file_bytes: 2 * 1024 * 1024,
         }
     }
 }
@@ -60,6 +62,7 @@ struct FileConfig {
     max_groups: Option<usize>,
     parameterize_literals: Option<bool>,
     languages: Option<Vec<String>>,
+    max_file_bytes: Option<u64>,
 }
 
 fn find_config_file(root: &Path) -> Option<PathBuf> {
@@ -123,6 +126,9 @@ impl Config {
         if let Some(value) = file.parameterize_literals {
             config.parameterize_literals = value;
         }
+        if let Some(value) = file.max_file_bytes {
+            config.max_file_bytes = value;
+        }
         if let Some(names) = file.languages {
             let mut languages = Vec::with_capacity(names.len());
             for name in names {
@@ -177,6 +183,7 @@ mod tests {
             max_groups = 25
             parameterize_literals = true
             languages = ["rust", "python"]
+            max_file_bytes = 1048576
         "#;
         let config = Config::from_toml(text, Path::new(CONFIG_FILE_NAME)).unwrap();
         assert_eq!(
@@ -190,6 +197,7 @@ mod tests {
                 parameterize_literals: true,
                 languages: vec![LanguageId::Rust, LanguageId::Python],
                 no_ignore: false,
+                max_file_bytes: 1048576,
             }
         );
     }

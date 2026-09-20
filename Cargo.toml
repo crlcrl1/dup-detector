@@ -33,9 +33,6 @@ xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 lto = "thin"
 codegen-units = 1
 
-[target.'cfg(unix)'.dependencies]
-tikv-jemallocator = "0.7.0"
-
 [dev-dependencies]
 criterion = "0.8.2"
 

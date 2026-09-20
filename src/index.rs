@@ -65,12 +65,13 @@ impl SourceIndex {
         cache_dir: Option<PathBuf>,
     ) -> Result<Self, IndexError> {
         let paths = discover(&root, config)?;
+        let max_file_bytes = config.max_file_bytes;
         let mut slots: Vec<Option<SourceFile>> = paths
             .par_iter()
             .map(|(path, language)| {
                 cache_dir
                     .as_deref()
-                    .and_then(|dir| file_from_cache(dir, &root, path, *language))
+                    .and_then(|dir| file_from_cache(dir, &root, path, *language, max_file_bytes))
             })
             .collect();
         let mut misses: Vec<usize> = Vec::new();
@@ -84,14 +85,16 @@ impl SourceIndex {
         let parsed: Vec<Option<SourceFile>> = misses
             .par_iter()
             .map(|&index| {
-                let file = parse_file(&paths[index].0, paths[index].1);
-                if let Some(file) = &file
-                    && let Some(dir) = &cache_dir
-                    && let Err(error) = cache::store_entry(dir, &root, file)
-                {
+                let (path, language) = (&paths[index].0, paths[index].1);
+                let parsed = parse_file(path, language, max_file_bytes)?;
+                let Some(dir) = &cache_dir else {
+                    return Some(parsed);
+                };
+                if let Err(error) = cache::store_entry(dir, &root, &parsed) {
                     tracing::debug!(error = %error, "cannot write cache entry");
+                    return Some(parsed);
                 }
-                file
+                file_from_cache(dir, &root, path, language, max_file_bytes).or(Some(parsed))
             })
             .collect();
         for (slot, file) in misses.into_iter().zip(parsed) {
@@ -170,17 +173,22 @@ impl SourceIndex {
             slots.push(None);
         }
         let parsed_count = misses.len();
+        let root = &self.root;
+        let cache_dir = &self.cache_dir;
+        let max_file_bytes = self.config.max_file_bytes;
         let parsed: Vec<Option<SourceFile>> = misses
             .par_iter()
             .map(|&index| {
-                let file = parse_file(&paths[index].0, paths[index].1);
-                if let Some(file) = &file
-                    && let Some(dir) = &self.cache_dir
-                    && let Err(error) = cache::store_entry(dir, &self.root, file)
-                {
+                let (path, language) = (&paths[index].0, paths[index].1);
+                let parsed = parse_file(path, language, max_file_bytes)?;
+                let Some(dir) = cache_dir else {
+                    return Some(parsed);
+                };
+                if let Err(error) = cache::store_entry(dir, root, &parsed) {
                     tracing::debug!(error = %error, "cannot write cache entry");
+                    return Some(parsed);
                 }
-                file
+                file_from_cache(dir, root, path, language, max_file_bytes).or(Some(parsed))
             })
             .collect();
         for (slot, file) in misses.into_iter().zip(parsed) {
@@ -266,9 +274,13 @@ fn file_from_cache(
     root: &Path,
     path: &Path,
     language: LanguageId,
+    max_file_bytes: u64,
 ) -> Option<SourceFile> {
     let entry = cache::load_entry(&cache::entry_path(dir, root, path)?)?;
     if entry.path != path.strip_prefix(root).ok()? {
+        return None;
+    }
+    if entry.size > max_file_bytes {
         return None;
     }
     let meta = fs::metadata(path).ok()?;
@@ -277,7 +289,7 @@ fn file_from_cache(
     }
     let text = match mapped_text(path, entry.size) {
         Some(text) => text,
-        None => crate::model::Text::owned(fs::read_to_string(path).ok()?),
+        None => crate::model::Text::Owned(fs::read_to_string(path).ok()?),
     };
     if cache::text_hash_bytes(text.as_bytes()) != entry.text_hash {
         return None;
@@ -362,7 +374,11 @@ fn discover(root: &Path, config: &Config) -> Result<Vec<(PathBuf, LanguageId)>, 
     Ok(paths)
 }
 
-pub(crate) fn parse_file(path: &Path, language: LanguageId) -> Option<SourceFile> {
+pub(crate) fn parse_file(
+    path: &Path,
+    language: LanguageId,
+    max_file_bytes: u64,
+) -> Option<SourceFile> {
     let meta = match fs::metadata(path) {
         Ok(meta) => meta,
         Err(e) => {
@@ -370,10 +386,14 @@ pub(crate) fn parse_file(path: &Path, language: LanguageId) -> Option<SourceFile
             return None;
         }
     };
+    if meta.len() > max_file_bytes {
+        tracing::debug!(path = %path.display(), size = meta.len(), "skipping large file");
+        return None;
+    }
     let text = match mapped_text(path, meta.len()) {
         Some(text) => text,
         None => match fs::read_to_string(path) {
-            Ok(text) => crate::model::Text::owned(text),
+            Ok(text) => crate::model::Text::Owned(text),
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "cannot read file");
                 return None;
@@ -444,6 +464,25 @@ mod tests {
         let index = SourceIndex::build_with_cache(&dir, &Config::default(), None).unwrap();
         assert_eq!(index.files().len(), 1);
         assert_eq!(index.files()[0].path.file_name().unwrap(), "a.rs");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn skips_files_above_max_file_bytes() {
+        let dir = temp_dir("max-file-bytes");
+        fs::write(dir.join("small.rs"), "fn small() {}").unwrap();
+        fs::write(
+            dir.join("large.rs"),
+            format!("fn large() {{ let x = \"{}\"; }}", "x".repeat(4096)),
+        )
+        .unwrap();
+        let config = Config {
+            max_file_bytes: 1024,
+            ..Config::default()
+        };
+        let index = SourceIndex::build_with_cache(&dir, &config, None).unwrap();
+        assert_eq!(index.files().len(), 1);
+        assert_eq!(index.files()[0].path.file_name().unwrap(), "small.rs");
         fs::remove_dir_all(&dir).ok();
     }
 

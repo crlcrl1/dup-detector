@@ -337,7 +337,7 @@ impl CloneServer {
                     } else {
                         let language = LanguageId::from_path(&resolved)
                             .ok_or_else(|| format!("unsupported file type: `{}`", params.file))?;
-                        parsed = parse_file(&resolved, language)
+                        parsed = parse_file(&resolved, language, config.max_file_bytes)
                             .ok_or_else(|| format!("cannot read or parse `{}`", params.file))?;
                         files = index
                             .files()
