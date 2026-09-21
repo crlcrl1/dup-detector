@@ -41,8 +41,9 @@ stderr so the stdio protocol stays clean.
 
 - `scope` defaults to the current working directory.
 - `types` accepts `"type-1"`, `"type-2"`.
-- `find_clones_for_region` defaults `min_lines` to the line span of the queried
-  region and parses the file on the fly if it is not indexed yet.
+- `find_clones_for_region` defaults `min_lines` to `min(config.min_lines, line span of the queried
+  region)` and parses the file on the fly if it is not indexed yet. `file` must resolve to a path
+  inside `scope`; paths escaping it (e.g. via `..`) are rejected.
 
 ## Response shape
 

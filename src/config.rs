@@ -17,6 +17,7 @@ pub struct Config {
     pub parameterize_literals: bool,
     pub languages: Vec<LanguageId>,
     pub no_ignore: bool,
+    pub include_hidden: bool,
     pub max_file_bytes: u64,
 }
 
@@ -31,6 +32,7 @@ impl Default for Config {
             parameterize_literals: false,
             languages: LanguageId::ALL.to_vec(),
             no_ignore: false,
+            include_hidden: false,
             max_file_bytes: 2 * 1024 * 1024,
         }
     }
@@ -50,6 +52,12 @@ pub enum ConfigError {
     },
     #[error("unknown language `{name}` in config file {path}")]
     UnknownLanguage { path: PathBuf, name: String },
+    #[error("invalid value for `{key}` in config file {path}: {message}")]
+    InvalidValue {
+        path: PathBuf,
+        key: &'static str,
+        message: String,
+    },
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -62,12 +70,26 @@ struct FileConfig {
     max_groups: Option<usize>,
     parameterize_literals: Option<bool>,
     languages: Option<Vec<String>>,
+    include_hidden: Option<bool>,
     max_file_bytes: Option<u64>,
 }
 
 fn find_config_file(root: &Path) -> Option<PathBuf> {
+    // Ancestor search only walks real directory components, so relative inputs
+    // like `.` or `src` must be absolutized first (canonicalize also resolves
+    // `..` and symlinks).
+    let root = match root.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(_) => {
+            if root.is_absolute() {
+                root.to_path_buf()
+            } else {
+                std::env::current_dir().ok()?.join(root)
+            }
+        }
+    };
     let start = if root.is_dir() {
-        root.to_path_buf()
+        root
     } else {
         root.parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -129,6 +151,9 @@ impl Config {
         if let Some(value) = file.max_file_bytes {
             config.max_file_bytes = value;
         }
+        if let Some(value) = file.include_hidden {
+            config.include_hidden = value;
+        }
         if let Some(names) = file.languages {
             let mut languages = Vec::with_capacity(names.len());
             for name in names {
@@ -140,6 +165,32 @@ impl Config {
                 languages.push(language);
             }
             config.languages = languages;
+        }
+        let invalid = |key: &'static str, message: &str| ConfigError::InvalidValue {
+            path: path.to_path_buf(),
+            key,
+            message: message.to_string(),
+        };
+        if config.min_lines == 0 {
+            return Err(invalid("min_lines", "must be at least 1"));
+        }
+        if config.min_occurrences == 0 {
+            return Err(invalid("min_occurrences", "must be at least 1"));
+        }
+        if config.max_bucket == 0 {
+            return Err(invalid("max_bucket", "must be at least 1"));
+        }
+        if config.seed_window == 0 {
+            return Err(invalid("seed_window", "must be at least 1"));
+        }
+        if config.max_file_bytes == 0 {
+            return Err(invalid("max_file_bytes", "must be at least 1"));
+        }
+        if config.max_file_bytes > u32::MAX as u64 {
+            return Err(invalid(
+                "max_file_bytes",
+                "exceeds the 4 GiB token-offset limit",
+            ));
         }
         Ok(config)
     }
@@ -183,6 +234,7 @@ mod tests {
             max_groups = 25
             parameterize_literals = true
             languages = ["rust", "python"]
+            include_hidden = true
             max_file_bytes = 1048576
         "#;
         let config = Config::from_toml(text, Path::new(CONFIG_FILE_NAME)).unwrap();
@@ -197,9 +249,28 @@ mod tests {
                 parameterize_literals: true,
                 languages: vec![LanguageId::Rust, LanguageId::Python],
                 no_ignore: false,
+                include_hidden: true,
                 max_file_bytes: 1048576,
             }
         );
+    }
+
+    #[test]
+    fn rejects_degenerate_values() {
+        for text in [
+            "min_lines = 0",
+            "min_occurrences = 0",
+            "max_bucket = 0",
+            "seed_window = 0",
+            "max_file_bytes = 0",
+            "max_file_bytes = 4294967296",
+        ] {
+            let error = Config::from_toml(text, Path::new(CONFIG_FILE_NAME));
+            assert!(
+                matches!(error, Err(ConfigError::InvalidValue { .. })),
+                "{text} should be rejected"
+            );
+        }
     }
 
     #[test]

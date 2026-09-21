@@ -53,6 +53,14 @@ pub enum Text {
 }
 
 impl Text {
+    /// Maps file contents, validating UTF-8 up front.
+    ///
+    /// The unchecked UTF-8 access in [`Text::as_str`] stays sound only while
+    /// the backing file is never modified in place: the file must be replaced
+    /// (write-temp-then-rename) or unmapped before any in-place write. The
+    /// index re-stats files on refresh and remaps changed ones, which covers
+    /// truncation; an in-place rewrite preserving both size and mtime would
+    /// still silently break this invariant.
     #[cfg(unix)]
     pub fn mapped(map: Arc<Mmap>) -> Option<Self> {
         std::str::from_utf8(&map).ok()?;
@@ -62,7 +70,9 @@ impl Text {
     pub fn as_str(&self) -> &str {
         match self {
             Text::Owned(text) => text,
-            // SAFETY: `mapped` validated the whole mapping as UTF-8.
+            // SAFETY: `mapped` validated the whole mapping as UTF-8, and the
+            // backing file must not be mutated in place while alive (see the
+            // contract on `mapped`).
             Text::Mapped(map) => unsafe { std::str::from_utf8_unchecked(map) },
         }
     }

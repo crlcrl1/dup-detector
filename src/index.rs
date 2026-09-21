@@ -172,31 +172,49 @@ impl SourceIndex {
             changed.push(path.clone());
             slots.push(None);
         }
-        let parsed_count = misses.len();
         let root = &self.root;
         let cache_dir = &self.cache_dir;
         let max_file_bytes = self.config.max_file_bytes;
-        let parsed: Vec<Option<SourceFile>> = misses
+        let parsed: Vec<(Option<SourceFile>, bool)> = misses
             .par_iter()
             .map(|&index| {
                 let (path, language) = (&paths[index].0, paths[index].1);
-                let parsed = parse_file(path, language, max_file_bytes)?;
-                let Some(dir) = cache_dir else {
-                    return Some(parsed);
-                };
-                if let Err(error) = cache::store_entry(dir, root, &parsed) {
-                    tracing::debug!(error = %error, "cannot write cache entry");
-                    return Some(parsed);
+                // The disk entry still covers files that changed since the last
+                // refresh but not since their entry was written.
+                if let Some(dir) = cache_dir
+                    && let Some(file) = file_from_cache(dir, root, path, language, max_file_bytes)
+                {
+                    return (Some(file), true);
                 }
-                file_from_cache(dir, root, path, language, max_file_bytes).or(Some(parsed))
+                let Some(parsed) = parse_file(path, language, max_file_bytes) else {
+                    return (None, false);
+                };
+                if let Some(dir) = cache_dir
+                    && let Err(error) = cache::store_entry(dir, root, &parsed)
+                {
+                    tracing::debug!(error = %error, "cannot write cache entry");
+                }
+                (Some(parsed), false)
             })
             .collect();
-        for (slot, file) in misses.into_iter().zip(parsed) {
+        let cache_hits = parsed.iter().filter(|(_, hit)| *hit).count();
+        let parsed_count = parsed
+            .iter()
+            .filter(|(file, hit)| file.is_some() && !*hit)
+            .count();
+        let mut failed = Vec::new();
+        for (slot, (file, _)) in misses.into_iter().zip(parsed) {
+            if file.is_none() {
+                failed.push(paths[slot].0.clone());
+            }
             slots[slot] = file;
         }
         if let Some(dir) = &self.cache_dir {
             for removed in old.values() {
                 cache::remove_entry(dir, &self.root, &removed.path);
+            }
+            for path in &failed {
+                cache::remove_entry(dir, &self.root, path);
             }
         }
         changed.extend(old.into_keys());
@@ -208,7 +226,7 @@ impl SourceIndex {
             .map(|(i, f)| (f.path.clone(), i))
             .collect();
         self.stats = BuildStats {
-            cache_hits: 0,
+            cache_hits,
             parsed_files: parsed_count,
         };
         changed
@@ -336,38 +354,41 @@ fn discover(root: &Path, config: &Config) -> Result<Vec<(PathBuf, LanguageId)>, 
             .git_exclude(false)
             .ignore(false);
     }
+    // Hidden entries (dot-directories like `.github`) are skipped by default,
+    // matching ripgrep; `include_hidden` opts back in.
+    builder.hidden(!config.include_hidden);
     let paths = Mutex::new(Vec::new());
-    let failure = Mutex::new(None);
+    let failures = Mutex::new(0usize);
     builder.build_parallel().run(|| {
-        Box::new(|entry| {
-            if failure.lock().is_ok_and(|failure| failure.is_some()) {
-                return WalkState::Quit;
+        Box::new(|entry| match entry {
+            Ok(entry) => {
+                if entry.file_type().is_some_and(|ft| ft.is_file())
+                    && let Some(language) = LanguageId::from_path(entry.path())
+                    && config.language_enabled(language)
+                    && let Ok(mut paths) = paths.lock()
+                {
+                    paths.push((entry.into_path(), language));
+                }
+                WalkState::Continue
             }
-            match entry {
-                Ok(entry) => {
-                    if entry.file_type().is_some_and(|ft| ft.is_file())
-                        && let Some(language) = LanguageId::from_path(entry.path())
-                        && config.language_enabled(language)
-                        && let Ok(mut paths) = paths.lock()
-                    {
-                        paths.push((entry.into_path(), language));
-                    }
-                    WalkState::Continue
+            Err(error) => {
+                // A single unreadable entry (permissions, deletion races during
+                // a parallel build) must not abort the whole scan.
+                if let Ok(mut failures) = failures.lock() {
+                    *failures += 1;
                 }
-                Err(error) => {
-                    if let Ok(mut failure) = failure.lock() {
-                        *failure = Some(error);
-                    }
-                    WalkState::Quit
-                }
+                tracing::debug!(error = %error, "skipping unreadable entry");
+                WalkState::Continue
             }
         })
     });
-    if let Some(source) = failure.into_inner().unwrap_or_default() {
-        return Err(IndexError::Walk {
-            root: root.to_path_buf(),
-            source,
-        });
+    let failures = failures.into_inner().unwrap_or_default();
+    if failures > 0 {
+        tracing::warn!(
+            failures,
+            root = %root.display(),
+            "skipped unreadable entries while walking"
+        );
     }
     let mut paths = paths.into_inner().unwrap_or_default();
     paths.sort();
@@ -496,6 +517,24 @@ mod tests {
         fs::write(vendor.join("b.rs"), "fn b() {}").unwrap();
         let config = Config {
             no_ignore: true,
+            ..Config::default()
+        };
+        let index = SourceIndex::build_with_cache(&dir, &config, None).unwrap();
+        assert_eq!(index.files().len(), 2);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hidden_directories_are_skipped_unless_include_hidden() {
+        let dir = temp_dir("hidden");
+        fs::write(dir.join("a.rs"), "fn a() {}").unwrap();
+        let hidden = dir.join(".config");
+        fs::create_dir_all(&hidden).unwrap();
+        fs::write(hidden.join("b.rs"), "fn b() {}").unwrap();
+        let index = SourceIndex::build_with_cache(&dir, &Config::default(), None).unwrap();
+        assert_eq!(index.files().len(), 1);
+        let config = Config {
+            include_hidden: true,
             ..Config::default()
         };
         let index = SourceIndex::build_with_cache(&dir, &config, None).unwrap();

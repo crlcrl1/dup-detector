@@ -172,14 +172,18 @@ impl Backend {
         *guard = Arc::new(State::new(root, config));
     }
 
-    fn update(&self, state: &Arc<State>, uri: Url, changes: Vec<TextDocumentContentChangeEvent>) {
-        let Ok(path) = uri.to_file_path() else {
-            return;
-        };
+    /// Applies content changes to a tracked document. Returns `Some(uri)` when
+    /// the document grew past `max_file_bytes` and was dropped, in which case
+    /// the caller must clear the diagnostics previously published for it.
+    fn update(
+        &self,
+        state: &Arc<State>,
+        uri: Url,
+        changes: Vec<TextDocumentContentChangeEvent>,
+    ) -> Option<Url> {
+        let path = uri.to_file_path().ok()?;
         let path = canonical_path(path);
-        let Some(language) = LanguageId::from_path(&path) else {
-            return;
-        };
+        let language = LanguageId::from_path(&path)?;
         // Serialize change application against other updates for the same file;
         // the documents map lock is only held briefly around lookup and insert
         // so the parse below never blocks readers.
@@ -195,7 +199,13 @@ impl Backend {
             documents.get(&path).cloned()
         };
         let Some(existing) = existing else {
-            return;
+            // Not tracked (e.g. dropped earlier for exceeding max_file_bytes):
+            // only a full-document change carries the text needed to reopen it.
+            let text = changes
+                .iter()
+                .rev()
+                .find_map(|change| change.range.is_none().then(|| change.text.clone()))?;
+            return Self::open_document(state, uri, path, language, text);
         };
         let mut text = existing.file.text.as_str().to_string();
         let mut regions: Vec<(usize, usize)> = Vec::new();
@@ -222,7 +232,7 @@ impl Backend {
             pending.mark_whole(path);
             drop(pending);
             state.bump();
-            return;
+            return Some(uri);
         }
         trace(&format!(
             "did_change {} changes={} bytes={}",
@@ -231,7 +241,7 @@ impl Backend {
             text.len()
         ));
         let Ok(tokens) = tokenize::tokenize(&text, language) else {
-            return;
+            return None;
         };
         let file = Arc::new(SourceFile::new(
             path.clone(),
@@ -250,7 +260,7 @@ impl Backend {
                 .get(&path)
                 .is_some_and(|current| Arc::ptr_eq(current, &existing));
             if !still_current {
-                return;
+                return None;
             }
             documents.insert(
                 path.clone(),
@@ -271,6 +281,62 @@ impl Backend {
             }
         }
         state.bump();
+        None
+    }
+
+    /// Tracks a document opened in the editor. Returns `Some(uri)` when the
+    /// document is rejected for exceeding `max_file_bytes`, in which case the
+    /// caller should clear any stale diagnostics published for that URI.
+    fn open_document(
+        state: &State,
+        uri: Url,
+        path: PathBuf,
+        language: LanguageId,
+        text: String,
+    ) -> Option<Url> {
+        if !path.starts_with(&state.root) {
+            tracing::debug!(uri = %uri, "ignoring file outside the workspace root");
+            return None;
+        }
+        if text.len() as u64 > state.config.max_file_bytes {
+            tracing::debug!(uri = %uri, size = text.len(), "skipping large file");
+            trace(&format!(
+                "open skip large {} bytes={}",
+                path.display(),
+                text.len()
+            ));
+            return Some(uri);
+        }
+        let Ok(tokens) = tokenize::tokenize(&text, language) else {
+            return None;
+        };
+        let file = Arc::new(SourceFile::new(
+            path.clone(),
+            language,
+            text,
+            tokens,
+            None,
+            0,
+        ));
+        let document = Arc::new(Document {
+            uri,
+            path: path.clone(),
+            file,
+        });
+        let mut documents = state
+            .documents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        documents.insert(path.clone(), document);
+        drop(documents);
+        let mut pending = state
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.mark_whole(path);
+        drop(pending);
+        state.bump();
+        None
     }
 }
 
@@ -326,58 +392,21 @@ impl LanguageServer for Backend {
         let Some(language) = LanguageId::from_path(&path) else {
             return;
         };
-        if !path.starts_with(&state.root) {
-            tracing::debug!(uri = %item.uri, "ignoring file outside the workspace root");
-            return;
-        }
-        if item.text.len() as u64 > state.config.max_file_bytes {
-            tracing::debug!(uri = %item.uri, size = item.text.len(), "skipping large file");
-            trace(&format!(
-                "did_open skip large {} bytes={}",
-                path.display(),
-                item.text.len()
-            ));
-            return;
-        }
         trace(&format!(
             "did_open {} bytes={}",
             path.display(),
             item.text.len()
         ));
-        let Ok(tokens) = tokenize::tokenize(&item.text, language) else {
-            return;
-        };
-        let file = Arc::new(SourceFile::new(
-            path.clone(),
-            language,
-            item.text,
-            tokens,
-            None,
-            0,
-        ));
-        let document = Arc::new(Document {
-            uri: item.uri,
-            path: path.clone(),
-            file,
-        });
-        let mut documents = state
-            .documents
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        documents.insert(path.clone(), document);
-        drop(documents);
-        let mut pending = state
-            .pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        pending.mark_whole(path);
-        drop(pending);
-        state.bump();
+        if let Some(uri) = Self::open_document(&state, item.uri, path, language, item.text) {
+            self.client.publish_diagnostics(uri, Vec::new(), None).await;
+        }
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let state = self.state();
-        self.update(&state, params.text_document.uri, params.content_changes);
+        if let Some(uri) = self.update(&state, params.text_document.uri, params.content_changes) {
+            self.client.publish_diagnostics(uri, Vec::new(), None).await;
+        }
     }
 
     async fn did_save(&self, _: DidSaveTextDocumentParams) {
@@ -971,6 +1000,15 @@ fn apply_change(
             if start <= end && end <= text.len() {
                 text.replace_range(start..end, &change.text);
                 regions.push((start, start + change.text.len()));
+            } else {
+                // Skipping a change silently desyncs server text from the
+                // client forever; make it loud.
+                tracing::warn!(
+                    start,
+                    end,
+                    len = text.len(),
+                    "ignoring change with out-of-bounds range"
+                );
             }
         }
         None => {
@@ -1150,5 +1188,181 @@ mod tests {
                 character: 3
             }
         ));
+    }
+
+    /// Groups as (path, start line, end line) triples, 0-based lines, sorted so
+    /// they can be compared across incremental and full runs.
+    fn group_keys(groups: &[NavGroup]) -> Vec<Vec<(PathBuf, u32, u32)>> {
+        let mut keys: Vec<Vec<(PathBuf, u32, u32)>> = groups
+            .iter()
+            .map(|group| {
+                let mut occs: Vec<(PathBuf, u32, u32)> = group
+                    .occurrences
+                    .iter()
+                    .map(|occ| (occ.path.clone(), occ.range.start.line, occ.range.end.line))
+                    .collect();
+                occs.sort();
+                occs
+            })
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    fn nav_keys(analysis: &Analysis) -> Vec<Vec<(PathBuf, u32, u32)>> {
+        group_keys(&analysis.snapshot.groups)
+    }
+
+    /// Full `detect_filtered` over the same merged file set `analyze` uses,
+    /// restricted to groups touching open documents — the reference the
+    /// incremental snapshot must equal.
+    fn full_keys(state: &State) -> Vec<Vec<(PathBuf, u32, u32)>> {
+        let documents: Vec<Arc<Document>> =
+            state.documents.lock().unwrap().values().cloned().collect();
+        let open: HashSet<PathBuf> = documents.iter().map(|doc| doc.path.clone()).collect();
+        let index_guard = state.index.lock().unwrap();
+        let index = index_guard.as_ref().unwrap();
+        let mut files: Vec<&SourceFile> = index
+            .files()
+            .iter()
+            .filter(|file| !open.contains(&file.path))
+            .collect();
+        for doc in &documents {
+            files.push(&doc.file);
+        }
+        let groups = detect::detect_filtered(&files, &state.config, None);
+        let mut keys: Vec<Vec<(PathBuf, u32, u32)>> = groups
+            .iter()
+            .filter(|group| {
+                group
+                    .occurrences
+                    .iter()
+                    .any(|occ| open.contains(&files[occ.file as usize].path))
+            })
+            .map(|group| {
+                let mut occs: Vec<(PathBuf, u32, u32)> = group
+                    .occurrences
+                    .iter()
+                    .map(|occ| {
+                        let file = files[occ.file as usize];
+                        (
+                            file.path.clone(),
+                            file.token_line(occ.start as usize) - 1,
+                            file.token_end_line(occ.end as usize - 1) - 1,
+                        )
+                    })
+                    .collect();
+                occs.sort();
+                occs
+            })
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    fn insert_document(state: &State, path: &Path, text: &str) {
+        let tokens = tokenize::tokenize(text, LanguageId::Rust).unwrap();
+        let file = Arc::new(SourceFile::new(
+            path.to_path_buf(),
+            LanguageId::Rust,
+            text.to_string(),
+            tokens,
+            None,
+            0,
+        ));
+        let document = Arc::new(Document {
+            uri: Url::from_file_path(path).unwrap(),
+            path: path.to_path_buf(),
+            file,
+        });
+        state
+            .documents
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), document);
+        state.pending.lock().unwrap().mark_whole(path.to_path_buf());
+    }
+
+    fn apply_edit(state: &State, path: &Path, text: &str, region: Option<(usize, usize)>) {
+        let tokens = tokenize::tokenize(text, LanguageId::Rust).unwrap();
+        let file = Arc::new(SourceFile::new(
+            path.to_path_buf(),
+            LanguageId::Rust,
+            text.to_string(),
+            tokens,
+            None,
+            0,
+        ));
+        let mut documents = state.documents.lock().unwrap();
+        let uri = documents.get(path).unwrap().uri.clone();
+        documents.insert(
+            path.to_path_buf(),
+            Arc::new(Document {
+                uri,
+                path: path.to_path_buf(),
+                file,
+            }),
+        );
+        drop(documents);
+        let mut pending = state.pending.lock().unwrap();
+        match region {
+            Some((start, end)) => pending.mark_bytes(path.to_path_buf(), start, end),
+            None => pending.mark_whole(path.to_path_buf()),
+        }
+    }
+
+    #[test]
+    fn incremental_analysis_matches_full_detection_after_edits() {
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!(
+            "dup-detector-lsp-differential-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let fn_a = "fn alpha(items: &[i32]) -> i32 {\n    let mut total = 0;\n    for item in items {\n        total += item * item;\n    }\n    total\n}\n";
+        let fn_b = "fn beta(values: &[i32]) -> i32 {\n    let mut sum = 0;\n    for value in values {\n        sum += value * value;\n    }\n    sum\n}\n";
+        let main = "fn main() { println!(\"hi\"); }\n";
+        fs::write(dir.join("a.rs"), fn_a).unwrap();
+        fs::write(dir.join("b.rs"), fn_b).unwrap();
+        fs::write(dir.join("main.rs"), main).unwrap();
+        let root = dir.canonicalize().unwrap();
+        let state = State::new(root.clone(), Config::default());
+        let path_a = root.join("a.rs");
+        insert_document(&state, &path_a, fn_a);
+        insert_document(&state, &root.join("main.rs"), main);
+
+        let first = analyze(&state).unwrap().unwrap();
+        assert!(!first.snapshot.groups.is_empty());
+        assert_eq!(nav_keys(&first), full_keys(&state), "initial analysis");
+
+        // Consistent rename inside the open file: the a/b clone must survive
+        // through the incremental allowed-seed path.
+        let edited = fn_a.replace("total", "acc");
+        let region = (
+            fn_a.find("total").unwrap(),
+            fn_a.rfind("total").unwrap() + "total".len(),
+        );
+        apply_edit(&state, &path_a, &edited, Some(region));
+        let second = analyze(&state).unwrap().unwrap();
+        assert_eq!(
+            nav_keys(&second),
+            full_keys(&state),
+            "after in-buffer rename"
+        );
+
+        // External on-disk change to the clone partner; refresh must
+        // invalidate it and the clone must disappear everywhere.
+        fs::write(
+            root.join("b.rs"),
+            "fn beta(values: &[i32]) -> i32 { values.len() as i32 }\n",
+        )
+        .unwrap();
+        let third = analyze(&state).unwrap().unwrap();
+        assert_eq!(nav_keys(&third), full_keys(&state), "after external change");
+        assert!(third.snapshot.groups.is_empty());
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

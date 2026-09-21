@@ -283,10 +283,20 @@ fn read_u64(raw: &[u8], cursor: &mut usize) -> Option<u64> {
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    // Unique per process and per call: concurrent stores of the same entry
+    // within one process must not share a temp file.
+    let tmp = path.with_extension(format!(
+        "{}.{}.tmp",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     fs::write(&tmp, bytes)?;
     match fs::rename(&tmp, path) {
         Ok(()) => Ok(()),

@@ -16,6 +16,7 @@ seed_window = 8          # 种子窗口的 token 长度
 max_groups = 100         # 省略或注释掉表示不限制
 parameterize_literals = false
 languages = ["rust", "python", "javascript", "typescript", "tsx", "cpp"]
+include_hidden = false    # 同时扫描 .github 等点目录（默认关闭）
 max_file_bytes = 2097152   # 超过 2 MiB 的文件跳过
 ```
 
@@ -28,9 +29,12 @@ max_file_bytes = 2097152   # 超过 2 MiB 的文件跳过
 | `max_groups`            | 无限制  | 最多返回的克隆组数量                       |
 | `parameterize_literals` | `false` | 将一致重命名的字面量视为相同               |
 | `languages`             | 全部    | 参与扫描的语言（`LanguageId::from_name` 名称） |
+| `include_hidden`        | `false` | 同时扫描隐藏（点）目录，如 `.github`       |
 | `max_file_bytes`        | `2097152` | 超过该大小的文件跳过（限制解析内存）          |
 
-未知的键和未知的语言名会报错。缺少 `dup-detector.toml` 时直接使用默认值。
+未知的键和未知的语言名会报错。退化取值（`min_lines`、`min_occurrences`、`max_bucket`、
+`seed_window`、`max_file_bytes` 为 `0`，或 `max_file_bytes` 超过 4 GiB）也会被拒绝。
+默认跳过隐藏目录（与 ripgrep 行为一致）。缺少 `dup-detector.toml` 时直接使用默认值。
 
 ## CLI
 

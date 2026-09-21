@@ -114,7 +114,7 @@ pub struct FindClonesForRegionParams {
     pub end_line: u32,
     /// Subdirectory to scan; defaults to the current working directory.
     pub scope: Option<String>,
-    /// Minimum number of lines for a clone group; defaults to the line span of the region.
+    /// Minimum number of lines for a clone group; defaults to min(config.min_lines, line span of the region).
     pub min_lines: Option<usize>,
     /// Maximum number of groups to return (default: no limit).
     pub max_groups: Option<usize>,
@@ -193,7 +193,10 @@ fn resolve_file(root: &Path, file: &str) -> Option<PathBuf> {
     } else {
         root.join(path)
     };
-    absolute.canonicalize().ok()
+    let absolute = absolute.canonicalize().ok()?;
+    // `root` is canonicalized at index build time; reject paths that escape it
+    // (e.g. via `..`), otherwise tools would read files outside the scope.
+    absolute.starts_with(root).then_some(absolute)
 }
 
 fn token_span_for_lines(

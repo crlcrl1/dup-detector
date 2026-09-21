@@ -37,7 +37,7 @@ dup-detector mcp
 
 - `scope` 默认为当前工作目录。
 - `types` 接受 `"type-1"`、`"type-2"`。
-- `find_clones_for_region` 的 `min_lines` 默认取查询区间的行数；若文件尚未被索引，则即时解析。
+- `find_clones_for_region` 的 `min_lines` 默认为 `min(config.min_lines, 查询区间的行数)`；若文件尚未被索引，则即时解析。`file` 必须解析到 `scope` 内的路径，通过 `..` 等逃逸的路径会被拒绝。
 
 ## 响应结构
 

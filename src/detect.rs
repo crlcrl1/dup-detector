@@ -208,7 +208,10 @@ pub fn detect_filtered(
     let started = std::time::Instant::now();
     let window = config.seed_window;
     let parameterize_literals = config.parameterize_literals;
-    let cache_signatures = allowed.is_some() || total_tokens(files) < SIGNATURE_CACHE_MAX_TOKENS;
+    // The cache bounds memory for long-running servers; `allowed`-filtered runs
+    // (LSP incremental detection) must respect the same cap or a large project
+    // would cache signatures for every file indefinitely.
+    let cache_signatures = total_tokens(files) < SIGNATURE_CACHE_MAX_TOKENS;
     let mut seeds: Vec<(u64, u32, u32)> = (0..files.len())
         .into_par_iter()
         .flat_map_iter(|file_index| {
@@ -789,14 +792,14 @@ fn cluster(
             if occs.len() < config.min_occurrences {
                 return Vec::new();
             }
-            let (representative_index, merged) =
-                representative_class(files, &occs, config, scratch);
-            let representative = occs[representative_index];
-            if merged.len() < config.min_occurrences {
-                return Vec::new();
-            }
-            refine_groups(files, &metas, &merged, representative, config, scratch)
-                .unwrap_or_default()
+            let classes = representative_classes(files, &occs, config, scratch);
+            classes
+                .into_iter()
+                .flat_map(|(representative, merged)| {
+                    refine_groups(files, &metas, &merged, representative, config, scratch)
+                        .unwrap_or_default()
+                })
+                .collect()
         })
         .collect::<Vec<Vec<Vec<Occurrence>>>>()
         .into_iter()
@@ -1289,14 +1292,18 @@ struct CompleteScratch {
     ranges: Vec<(usize, usize)>,
 }
 
-fn representative_class(
+/// Groups the occurrences of one connected component by exact parameterized
+/// fingerprint and keeps every class that meets `min_occurrences`, not just
+/// the largest one: a component mixing a short clone pair with a longer one
+/// would otherwise silently lose a valid clone group.
+fn representative_classes(
     files: &[&SourceFile],
     occs: &[Occurrence],
     config: &Config,
     scratch: &mut ClusterScratch,
-) -> (usize, Vec<Occurrence>) {
+) -> Vec<(Occurrence, Vec<Occurrence>)> {
     if occs.is_empty() {
-        return (0, Vec::new());
+        return Vec::new();
     }
     scratch.class_fingerprints.clear();
     scratch.class_representatives.clear();
@@ -1338,22 +1345,20 @@ fn representative_class(
         scratch.class_sizes[class] += 1;
         scratch.assignments.push(class as u32);
     }
-    let mut best = 0;
-    let mut best_size = 0;
-    for (index, &size) in scratch.class_sizes.iter().enumerate() {
-        if size > best_size {
-            best = index;
-            best_size = size;
+    let mut classes = Vec::new();
+    for class in 0..scratch.class_sizes.len() {
+        if scratch.class_sizes[class] as usize >= config.min_occurrences {
+            let representative = occs[scratch.class_representatives[class] as usize];
+            let merged = occs
+                .iter()
+                .zip(&scratch.assignments)
+                .filter(|(_, assigned)| **assigned as usize == class)
+                .map(|(occ, _)| *occ)
+                .collect();
+            classes.push((representative, merged));
         }
     }
-    let representative = scratch.class_representatives[best] as usize;
-    let merged = occs
-        .iter()
-        .zip(&scratch.assignments)
-        .filter(|(_, class)| **class as usize == best)
-        .map(|(occ, _)| *occ)
-        .collect();
-    (representative, merged)
+    classes
 }
 
 const LOGIC_MARKERS: &[&str] = &[
@@ -1546,6 +1551,62 @@ fn parameterized2(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
     }
 
     #[test]
+    fn keeps_every_qualifying_fingerprint_class() {
+        // Two short clones (a/c) plus two longer clones (b/d) whose prefix
+        // equals the short variant connect all four files into one component
+        // with two fingerprint classes; both classes must be reported.
+        let short = r#"fn a() {
+    let x = 1;
+    let y = 2;
+    let z = x + y;
+    println!("{z}");
+}
+"#;
+        let long = r#"fn b() {
+    let x = 1;
+    let y = 2;
+    let z = x + y;
+    println!("{z}");
+    let w = z * 2;
+    println!("{w}");
+}
+"#;
+        let short_c = r#"fn c() {
+    let p = 1;
+    let q = 2;
+    let r = p + q;
+    println!("{z}");
+}
+"#;
+        let long_d = r#"fn d() {
+    let p = 1;
+    let q = 2;
+    let r = p + q;
+    println!("{z}");
+    let s = r * 2;
+    println!("{w}");
+}
+"#;
+        let a = file("a.rs", short);
+        let b = file("b.rs", long);
+        let c = file("c.rs", short_c);
+        let d = file("d.rs", long_d);
+        let groups = detect(&[&a, &b, &c, &d], &config());
+        let pair_reported = |pair: [u32; 2]| {
+            groups.iter().any(|group| {
+                group.occurrences.len() == 2
+                    && pair.contains(&group.occurrences[0].file)
+                    && pair.contains(&group.occurrences[1].file)
+            })
+        };
+        assert!(
+            pair_reported([0, 2]),
+            "short clone pair missing: {groups:?}"
+        );
+        assert!(pair_reported([1, 3]), "long clone pair missing: {groups:?}");
+    }
+
+    #[test]
     fn min_lines_filters_small_clones() {
         let a = file("a.rs", "fn one() -> i32 { 100 + 200 }");
         let b = file("b.rs", "fn one() -> i32 { 100 + 200 }");
@@ -1667,7 +1728,7 @@ fn parameterized2(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
     }
 
     #[test]
-    fn representative_class_prefers_largest_class() {
+    fn representative_classes_keep_every_qualifying_class() {
         let f = file(
             "a.rs",
             "let alpha = 1; let gamma = 2; let alpha = 1; let gamma = 2;",
@@ -1679,9 +1740,20 @@ fn parameterized2(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
             ..Config::default()
         };
         let mut scratch = ClusterScratch::default();
-        let (representative, merged) = representative_class(&files, &occs, &cfg, &mut scratch);
-        assert_eq!(representative, 0);
-        assert_eq!(merged, vec![occ(0, 0, 5), occ(0, 10, 15)]);
+        let classes = representative_classes(&files, &occs, &cfg, &mut scratch);
+        let representatives: Vec<Occurrence> = classes
+            .iter()
+            .map(|(representative, _)| *representative)
+            .collect();
+        let merged: Vec<Vec<Occurrence>> = classes.into_iter().map(|(_, merged)| merged).collect();
+        assert_eq!(representatives, vec![occ(0, 0, 5), occ(0, 5, 10)]);
+        assert_eq!(
+            merged,
+            vec![
+                vec![occ(0, 0, 5), occ(0, 10, 15)],
+                vec![occ(0, 5, 10), occ(0, 15, 20)],
+            ]
+        );
     }
 
     #[test]
