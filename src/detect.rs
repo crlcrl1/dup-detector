@@ -149,11 +149,7 @@ fn bucket_partition<T: Copy + Send + Sync>(
     boundaries
 }
 
-fn sort_buckets<T: Copy + Send + Sync>(
-    items: &mut [T],
-    boundaries: &[u32],
-    key: &(impl Fn(&T) -> u64 + Sync),
-) {
+fn bucket_slices_mut<'a, T>(items: &'a mut [T], boundaries: &[u32]) -> Vec<&'a mut [T]> {
     let mut slices: Vec<&mut [T]> = Vec::with_capacity(boundaries.len());
     let mut rest = items;
     for window in boundaries.windows(2) {
@@ -166,6 +162,14 @@ fn sort_buckets<T: Copy + Send + Sync>(
         rest = tail;
     }
     slices
+}
+
+fn sort_buckets<T: Copy + Send + Sync>(
+    items: &mut [T],
+    boundaries: &[u32],
+    key: &(impl Fn(&T) -> u64 + Sync),
+) {
+    bucket_slices_mut(items, boundaries)
         .into_par_iter()
         .for_each(|bucket| bucket.sort_by_key(key));
 }
@@ -180,18 +184,7 @@ fn sort_seeds(seeds: &mut Vec<(u64, u32, u32)>, scratch: &mut Vec<(u64, u32, u32
     let key = |seed: &(u64, u32, u32)| {
         ((seed.0 as u128) << 64) | ((seed.1 as u128) << 32) | seed.2 as u128
     };
-    let mut slices: Vec<&mut [(u64, u32, u32)]> = Vec::with_capacity(boundaries.len());
-    let mut rest = seeds.as_mut_slice();
-    for window in boundaries.windows(2) {
-        let len = (window[1] - window[0]) as usize;
-        if len == 0 {
-            continue;
-        }
-        let (bucket, tail) = rest.split_at_mut(len);
-        slices.push(bucket);
-        rest = tail;
-    }
-    slices
+    bucket_slices_mut(seeds, &boundaries)
         .into_par_iter()
         .for_each(|bucket| bucket.sort_unstable_by_key(key));
 }
@@ -1506,6 +1499,20 @@ fn compute_total(items: Vec<i32>) -> i32 {
         )
     }
 
+    fn occurrence_lines(group: &CloneGroup, files: &[&SourceFile]) -> Vec<(u32, u32)> {
+        group
+            .occurrences
+            .iter()
+            .map(|occ| {
+                let file = files[occ.file as usize];
+                (
+                    file.token_line(occ.start as usize),
+                    file.token_end_line(occ.end as usize - 1),
+                )
+            })
+            .collect()
+    }
+
     fn config() -> Config {
         Config {
             min_lines: 5,
@@ -1518,6 +1525,33 @@ fn compute_total(items: Vec<i32>) -> i32 {
             min_lines: 1,
             ..config()
         }
+    }
+
+    #[test]
+    fn bucket_sort_preserves_equal_key_order_and_skips_empty_buckets() {
+        let mut items = [(2, 'a'), (1, 'b'), (2, 'c'), (3, 'd'), (1, 'e'), (3, 'f')];
+        sort_buckets(&mut items, &[0, 0, 3, 3, 6, 6], &|item| item.0);
+        assert_eq!(
+            items,
+            [(1, 'b'), (2, 'a'), (2, 'c'), (1, 'e'), (3, 'd'), (3, 'f')]
+        );
+    }
+
+    #[test]
+    fn seed_bucket_sort_matches_tuple_order() {
+        let mut seeds: Vec<_> = (0..BUCKET_SORT_MIN + 257)
+            .map(|i| {
+                (
+                    ((i * 23 % 37) as u64) << 58,
+                    (i % 11) as u32,
+                    (i * 17 % 101) as u32,
+                )
+            })
+            .collect();
+        let mut expected = seeds.clone();
+        expected.sort_unstable();
+        sort_seeds(&mut seeds, &mut Vec::new());
+        assert_eq!(seeds, expected);
     }
 
     #[test]
@@ -1840,18 +1874,10 @@ fn parameterized2(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
         );
         let groups = detect(&[&a, &b], &fine_config());
         assert_eq!(groups.len(), 1);
-        let lines: Vec<(u32, u32)> = groups[0]
-            .occurrences
-            .iter()
-            .map(|occ| {
-                let f = if occ.file == 0 { &a } else { &b };
-                (
-                    f.token_line(occ.start as usize),
-                    f.token_end_line(occ.end as usize - 1),
-                )
-            })
-            .collect();
-        assert_eq!(lines, vec![(2, 2), (2, 2)]);
+        assert_eq!(
+            occurrence_lines(&groups[0], &[&a, &b]),
+            vec![(2, 2), (2, 2)]
+        );
     }
 
     #[test]
@@ -1885,18 +1911,10 @@ fn parameterized2(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
         let groups = detect(&[&a, &b], &Config::default());
         assert_eq!(groups.len(), 1);
         assert!(groups[0].token_count >= 40);
-        let lines: Vec<(u32, u32)> = groups[0]
-            .occurrences
-            .iter()
-            .map(|occ| {
-                let f = if occ.file == 0 { &a } else { &b };
-                (
-                    f.token_line(occ.start as usize),
-                    f.token_end_line(occ.end as usize - 1),
-                )
-            })
-            .collect();
-        assert_eq!(lines, vec![(2, 8), (2, 8)]);
+        assert_eq!(
+            occurrence_lines(&groups[0], &[&a, &b]),
+            vec![(2, 8), (2, 8)]
+        );
     }
 
     #[test]
@@ -2016,18 +2034,10 @@ fn parameterized2(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
         );
         let groups = detect(&[&a, &b], &config());
         assert_eq!(groups.len(), 1);
-        let lines: Vec<(u32, u32)> = groups[0]
-            .occurrences
-            .iter()
-            .map(|occ| {
-                let f = if occ.file == 0 { &a } else { &b };
-                (
-                    f.token_line(occ.start as usize),
-                    f.token_end_line(occ.end as usize - 1),
-                )
-            })
-            .collect();
-        assert_eq!(lines, vec![(2, 7), (2, 7)]);
+        assert_eq!(
+            occurrence_lines(&groups[0], &[&a, &b]),
+            vec![(2, 7), (2, 7)]
+        );
     }
 
     #[test]
@@ -2062,18 +2072,10 @@ fn parameterized2(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
         );
         let groups = detect(&[&a, &b], &config());
         assert_eq!(groups.len(), 1);
-        let lines: Vec<(u32, u32)> = groups[0]
-            .occurrences
-            .iter()
-            .map(|occ| {
-                let f = if occ.file == 0 { &a } else { &b };
-                (
-                    f.token_line(occ.start as usize),
-                    f.token_end_line(occ.end as usize - 1),
-                )
-            })
-            .collect();
-        assert_eq!(lines, vec![(2, 7), (2, 7)]);
+        assert_eq!(
+            occurrence_lines(&groups[0], &[&a, &b]),
+            vec![(2, 7), (2, 7)]
+        );
     }
 
     #[test]

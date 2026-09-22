@@ -199,6 +199,13 @@ impl State {
             .clone()
     }
 
+    fn snapshot(&self) -> Arc<Snapshot> {
+        self.snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     fn bump(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.notify.notify_one();
@@ -225,6 +232,40 @@ struct Snapshot {
     signatures: FastSet<u64>,
 }
 
+impl Snapshot {
+    fn groups_at<'a>(
+        &'a self,
+        uri: &'a Url,
+        position: Position,
+    ) -> impl Iterator<Item = &'a NavGroup> {
+        self.groups.iter().filter(move |group| {
+            group
+                .occurrences
+                .iter()
+                .any(|occ| occ.contains(uri, position))
+        })
+    }
+
+    fn locations_at(&self, uri: &Url, position: Position, include_current: bool) -> Vec<Location> {
+        let mut locations = Vec::new();
+        for group in self.groups_at(uri, position) {
+            for occ in &group.occurrences {
+                if !include_current && occ.contains(uri, position) {
+                    continue;
+                }
+                let location = Location {
+                    uri: occ.uri.clone(),
+                    range: occ.range,
+                };
+                if !locations.contains(&location) {
+                    locations.push(location);
+                }
+            }
+        }
+        locations
+    }
+}
+
 struct NavGroup {
     token_count: usize,
     clone_type: CloneType,
@@ -235,6 +276,12 @@ struct NavOccurrence {
     path: PathBuf,
     uri: Url,
     range: Range,
+}
+
+impl NavOccurrence {
+    fn contains(&self, uri: &Url, position: Position) -> bool {
+        self.uri == *uri && range_contains(&self.range, position)
+    }
 }
 
 struct Analysis {
@@ -569,35 +616,9 @@ impl LanguageServer for Backend {
     ) -> LspResult<Option<GotoDefinitionResponse>> {
         let state = self.state();
         let position = params.text_document_position_params;
-        let uri = position.text_document.uri.clone();
-        let pos = position.position;
-        let snapshot = state
-            .snapshot
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
-        let mut locations: Vec<Location> = Vec::new();
-        for group in &snapshot.groups {
-            if !group
-                .occurrences
-                .iter()
-                .any(|occ| occ.uri == uri && range_contains(&occ.range, pos))
-            {
-                continue;
-            }
-            for occ in &group.occurrences {
-                if occ.uri == uri && range_contains(&occ.range, pos) {
-                    continue;
-                }
-                let location = Location {
-                    uri: occ.uri.clone(),
-                    range: occ.range,
-                };
-                if !locations.contains(&location) {
-                    locations.push(location);
-                }
-            }
-        }
+        let snapshot = state.snapshot();
+        let locations =
+            snapshot.locations_at(&position.text_document.uri, position.position, false);
         if locations.is_empty() {
             Ok(None)
         } else {
@@ -608,32 +629,8 @@ impl LanguageServer for Backend {
     async fn references(&self, params: ReferenceParams) -> LspResult<Option<Vec<Location>>> {
         let state = self.state();
         let position = params.text_document_position;
-        let uri = position.text_document.uri.clone();
-        let pos = position.position;
-        let snapshot = state
-            .snapshot
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
-        let mut locations: Vec<Location> = Vec::new();
-        for group in &snapshot.groups {
-            if !group
-                .occurrences
-                .iter()
-                .any(|occ| occ.uri == uri && range_contains(&occ.range, pos))
-            {
-                continue;
-            }
-            for occ in &group.occurrences {
-                let location = Location {
-                    uri: occ.uri.clone(),
-                    range: occ.range,
-                };
-                if !locations.contains(&location) {
-                    locations.push(location);
-                }
-            }
-        }
+        let snapshot = state.snapshot();
+        let locations = snapshot.locations_at(&position.text_document.uri, position.position, true);
         if locations.is_empty() {
             Ok(None)
         } else {
@@ -644,45 +641,33 @@ impl LanguageServer for Backend {
     async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
         let state = self.state();
         let position = params.text_document_position_params;
-        let uri = position.text_document.uri.clone();
-        let pos = position.position;
-        let snapshot = state
-            .snapshot
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
-        for group in &snapshot.groups {
-            if !group
-                .occurrences
-                .iter()
-                .any(|occ| occ.uri == uri && range_contains(&occ.range, pos))
-            {
-                continue;
-            }
-            let mut value = format!(
-                "**Duplicated code** — {} tokens, {} occurrences ({})\n\n",
-                group.token_count,
-                group.occurrences.len(),
-                clone_type_label(group.clone_type)
-            );
-            for occ in &group.occurrences {
-                let here = occ.uri == uri;
-                value.push_str(&format!(
-                    "- {}{}:{}\n",
-                    if here { "(here) " } else { "" },
-                    occ.path.display(),
-                    occ.range.start.line + 1
-                ));
-            }
-            return Ok(Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value,
-                }),
-                range: None,
-            }));
+        let uri = &position.text_document.uri;
+        let snapshot = state.snapshot();
+        let Some(group) = snapshot.groups_at(uri, position.position).next() else {
+            return Ok(None);
+        };
+        let mut value = format!(
+            "**Duplicated code** — {} tokens, {} occurrences ({})\n\n",
+            group.token_count,
+            group.occurrences.len(),
+            clone_type_label(group.clone_type)
+        );
+        for occ in &group.occurrences {
+            let here = occ.uri == *uri;
+            value.push_str(&format!(
+                "- {}{}:{}\n",
+                if here { "(here) " } else { "" },
+                occ.path.display(),
+                occ.range.start.line + 1
+            ));
         }
-        Ok(None)
+        Ok(Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value,
+            }),
+            range: None,
+        }))
     }
 }
 
@@ -1224,6 +1209,106 @@ pub fn run(config: Config, root: PathBuf) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn navigation_preserves_locations_and_first_hover_group() {
+        let root = std::env::temp_dir().join("dup-detector-navigation-test");
+        let location = |file: &str, start, end| Location {
+            uri: Url::from_file_path(root.join(file)).unwrap(),
+            range: Range::new(Position::new(start, 0), Position::new(end, 0)),
+        };
+        let here = location("a.rs", 2, 4);
+        let same_file = location("a.rs", 8, 10);
+        let shared = location("b.rs", 2, 4);
+        let other = location("c.rs", 5, 7);
+        let group = |token_count, locations: &[Location]| NavGroup {
+            token_count,
+            clone_type: CloneType::Type2,
+            occurrences: locations
+                .iter()
+                .map(|location| NavOccurrence {
+                    path: location.uri.to_file_path().unwrap(),
+                    uri: location.uri.clone(),
+                    range: location.range,
+                })
+                .collect(),
+        };
+        let (service, _socket) =
+            LspService::new(|client| Backend::new(client, root.clone(), Config::default()));
+        let backend = service.inner();
+        *backend.state().snapshot.lock().unwrap() = Arc::new(Snapshot {
+            groups: vec![
+                group(100, std::slice::from_ref(&shared)),
+                group(60, &[here.clone(), shared.clone(), same_file.clone()]),
+                group(40, &[here.clone(), shared.clone(), other.clone()]),
+            ],
+            signatures: FastSet::default(),
+        });
+
+        for position in [
+            here.range.start,
+            Position::new(3, 0),
+            here.range.end,
+            Position::new(99, 0),
+        ] {
+            let params = serde_json::json!({
+                "textDocument": { "uri": here.uri },
+                "position": position,
+            });
+            let matches = position.line != 99;
+            let definition = backend
+                .goto_definition(serde_json::from_value(params.clone()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                definition,
+                matches.then(|| GotoDefinitionResponse::Array(vec![
+                    shared.clone(),
+                    same_file.clone(),
+                    other.clone(),
+                ]))
+            );
+            for include_declaration in [false, true] {
+                let mut reference_params = params.clone();
+                reference_params["context"] = serde_json::json!({
+                    "includeDeclaration": include_declaration,
+                });
+                let references = backend
+                    .references(serde_json::from_value(reference_params).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    references,
+                    matches.then(|| vec![
+                        here.clone(),
+                        shared.clone(),
+                        same_file.clone(),
+                        other.clone(),
+                    ])
+                );
+            }
+            let hover = backend
+                .hover(serde_json::from_value(params).unwrap())
+                .await
+                .unwrap();
+            if matches {
+                let hover = hover.unwrap();
+                assert_eq!(hover.range, None);
+                let HoverContents::Markup(contents) = hover.contents else {
+                    panic!("expected Markdown hover contents");
+                };
+                assert_eq!(contents.kind, MarkupKind::Markdown);
+                assert!(
+                    contents
+                        .value
+                        .starts_with("**Duplicated code** — 60 tokens, 3 occurrences (type-2)\n\n")
+                );
+                assert!(!contents.value.contains("c.rs"));
+            } else {
+                assert_eq!(hover, None);
+            }
+        }
+    }
 
     #[test]
     fn line_starts_and_positions_round_trip() {
