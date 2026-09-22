@@ -18,6 +18,7 @@ seed_window = 8          # seed window length in tokens
 max_groups = 100         # omit / comment out for no limit
 parameterize_literals = false
 languages = ["rust", "python", "javascript", "typescript", "tsx", "cpp"]
+no_ignore = false         # also scan files excluded by .gitignore/.ignore rules
 include_hidden = false    # also scan dot-directories like .github (off by default)
 max_file_bytes = 2097152   # skip files larger than 2 MiB
 ```
@@ -31,6 +32,7 @@ max_file_bytes = 2097152   # skip files larger than 2 MiB
 | `max_groups`            | none    | Maximum number of groups to report                                 |
 | `parameterize_literals` | `false` | Treat consistently renamed literals as equal                       |
 | `languages`             | all     | Languages to scan (`LanguageId::from_name` names)                  |
+| `no_ignore`             | `false` | Also scan files excluded by `.gitignore`/`.ignore` rules           |
 | `include_hidden`        | `false` | Also scan hidden (dot) directories, e.g. `.github`                 |
 | `max_file_bytes`        | `2097152` | Files larger than this are skipped (bounds parse memory)         |
 

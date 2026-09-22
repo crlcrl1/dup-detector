@@ -33,7 +33,7 @@ dup-detector mcp
 | `find_clones`            | 全项目范围的重复代码           | `scope?`、`min_lines?`、`min_occurrences?`、`max_groups?`、`types?`、`parameterize_literals?` |
 | `find_clones_in_file`    | 涉及指定文件的克隆             | `file`、`scope?`、`min_lines?`、`min_occurrences?`、`max_groups?`、`types?`                   |
 | `find_clones_for_region` | “我正在写的这段代码是否重复？” | `file`、`start_line`、`end_line`、`scope?`、`min_lines?`、`max_groups?`、`types?`             |
-| `reindex`                | 重建内存索引                   | `path?`                                                                                       |
+| `reindex`                | 丢弃内存索引并清空磁盘缓存（下次扫描时重建） | `path?`                                                                                       |
 
 - `scope` 默认为当前工作目录。
 - `types` 接受 `"type-1"`、`"type-2"`。

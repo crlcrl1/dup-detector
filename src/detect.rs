@@ -346,7 +346,10 @@ pub fn span_window_signatures(
     }
     let first = start.saturating_sub(window - 1);
     let last = end - 1;
-    file.for_each_window_signature(window, config.parameterize_literals, true, |signatures| {
+    // Same memory bound as detect_filtered: a long-running server must not
+    // cache signature vectors for arbitrarily large files.
+    let cache = file.tokens.len() < SIGNATURE_CACHE_MAX_TOKENS;
+    file.for_each_window_signature(window, config.parameterize_literals, cache, |signatures| {
         for window_start in first..=last {
             if let Some(&signature) = signatures.get(window_start) {
                 allowed.insert(signature);
@@ -826,9 +829,8 @@ fn cluster(
 
     let mut seen = BTreeSet::new();
     let mut groups: Vec<CloneGroup> = Vec::new();
-    for mut merged in by_unit.into_values() {
-        merged.sort();
-        merged.dedup();
+    for merged in by_unit.into_values() {
+        let merged = drop_self_overlapping(merged);
         if merged.len() < config.min_occurrences || !seen.insert(merged.clone()) {
             continue;
         }
@@ -849,6 +851,13 @@ fn cluster(
             continue;
         }
         let clone_type = classify_type(files, &merged);
+        if config
+            .types
+            .as_ref()
+            .is_some_and(|types| !types.contains(&clone_type))
+        {
+            continue;
+        }
         groups.push(CloneGroup {
             occurrences: merged,
             token_count,
@@ -875,6 +884,25 @@ fn drop_contained(occs: Vec<Occurrence>) -> Vec<Occurrence> {
             && last.file == occ.file
             && last.start <= occ.start
             && occ.end <= last.end
+        {
+            continue;
+        }
+        kept.push(occ);
+    }
+    kept
+}
+
+/// Sorts, dedupes, and drops same-file occurrences that overlap an already
+/// kept one: shifted self-matches in periodic code are not meaningful clone
+/// occurrences (AGENTS.md §4.7).
+fn drop_self_overlapping(mut occs: Vec<Occurrence>) -> Vec<Occurrence> {
+    occs.sort();
+    occs.dedup();
+    let mut kept: Vec<Occurrence> = Vec::with_capacity(occs.len());
+    for occ in occs {
+        if let Some(last) = kept.last()
+            && last.file == occ.file
+            && occ.start < last.end
         {
             continue;
         }
@@ -1276,9 +1304,9 @@ fn complete_ranges(
 #[derive(Default)]
 struct ClusterScratch {
     span: encode::SpanScratch,
-    class_fingerprints: Vec<u64>,
     class_representatives: Vec<u32>,
     class_sizes: Vec<u32>,
+    class_lookup: FastMap<u64, Vec<u32>>,
     assignments: Vec<u32>,
     complete: CompleteScratch,
 }
@@ -1305,9 +1333,9 @@ fn representative_classes(
     if occs.is_empty() {
         return Vec::new();
     }
-    scratch.class_fingerprints.clear();
     scratch.class_representatives.clear();
     scratch.class_sizes.clear();
+    scratch.class_lookup.clear();
     scratch.assignments.clear();
     for (occ_index, occ) in occs.iter().enumerate() {
         let file = files[occ.file as usize];
@@ -1319,27 +1347,32 @@ fn representative_classes(
             config.parameterize_literals,
         );
         let mut class = None;
-        for index in 0..scratch.class_representatives.len() {
-            if scratch.class_fingerprints[index] == fingerprint
-                && occurrences_match(
+        if let Some(candidates) = scratch.class_lookup.get(&fingerprint) {
+            for &index in candidates {
+                if occurrences_match(
                     files,
-                    occs[scratch.class_representatives[index] as usize],
+                    occs[scratch.class_representatives[index as usize] as usize],
                     *occ,
                     config,
                     &mut scratch.span,
-                )
-            {
-                class = Some(index);
-                break;
+                ) {
+                    class = Some(index as usize);
+                    break;
+                }
             }
         }
         let class = match class {
             Some(index) => index,
             None => {
-                scratch.class_fingerprints.push(fingerprint);
+                let index = scratch.class_representatives.len();
                 scratch.class_representatives.push(occ_index as u32);
                 scratch.class_sizes.push(0);
-                scratch.class_sizes.len() - 1
+                scratch
+                    .class_lookup
+                    .entry(fingerprint)
+                    .or_default()
+                    .push(index as u32);
+                index
             }
         };
         scratch.class_sizes[class] += 1;
@@ -2059,6 +2092,32 @@ use anyhow::Result;
             "pub struct Beta { pub left: i32, pub right: i32, pub extra: i32 }",
         );
         assert!(detect(&[&a, &b], &config()).is_empty());
+    }
+
+    #[test]
+    fn self_overlapping_occurrences_are_dropped() {
+        let kept = drop_self_overlapping(vec![occ(0, 10, 30), occ(0, 0, 20), occ(1, 0, 5)]);
+        assert_eq!(kept, vec![occ(0, 0, 20), occ(1, 0, 5)]);
+    }
+
+    #[test]
+    fn types_filter_applies_before_max_groups_truncation() {
+        let a = file("a.rs", FN);
+        let b = file("b.rs", FN);
+        let short = "fn g() -> i32 { let x = 1; let y = 2; let z = x + y; z }\n";
+        let renamed = "fn h() -> i32 { let p = 1; let q = 2; let r = p + q; r }\n";
+        let c = file("c.rs", short);
+        let d = file("d.rs", renamed);
+        let cfg = Config {
+            max_groups: Some(1),
+            types: Some(vec![CloneType::Type2]),
+            ..fine_config()
+        };
+        let groups = detect(&[&a, &b, &c, &d], &cfg);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].clone_type, CloneType::Type2);
+        let files: Vec<u32> = groups[0].occurrences.iter().map(|o| o.file).collect();
+        assert_eq!(files, vec![2, 3]);
     }
 
     #[test]

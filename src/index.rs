@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use ignore::{WalkBuilder, WalkState};
 use rayon::prelude::*;
@@ -34,11 +35,24 @@ pub struct BuildStats {
     pub parsed_files: usize,
 }
 
+/// Metadata recorded when a file was skipped (unreadable, oversized, or
+/// unparseable); `None` means the metadata itself could not be read. Used to
+/// keep the refresh fast path valid and to avoid re-attempting unchanged
+/// skipped files.
+type SkipRecord = Option<(Option<SystemTime>, u64)>;
+
+fn current_skip_record(path: &Path) -> SkipRecord {
+    fs::metadata(path)
+        .ok()
+        .map(|meta| (meta.modified().ok(), meta.len()))
+}
+
 pub struct SourceIndex {
     root: PathBuf,
     config: Config,
     files: Vec<SourceFile>,
     by_path: HashMap<PathBuf, usize>,
+    skipped: HashMap<PathBuf, SkipRecord>,
     cache_dir: Option<PathBuf>,
     stats: BuildStats,
 }
@@ -87,25 +101,29 @@ impl SourceIndex {
             .map(|&index| {
                 let (path, language) = (&paths[index].0, paths[index].1);
                 let parsed = parse_file(path, language, max_file_bytes)?;
-                let Some(dir) = &cache_dir else {
-                    return Some(parsed);
-                };
-                if let Err(error) = cache::store_entry(dir, &root, &parsed) {
+                if let Some(dir) = &cache_dir
+                    && let Err(error) = cache::store_entry(dir, &root, &parsed)
+                {
                     tracing::debug!(error = %error, "cannot write cache entry");
-                    return Some(parsed);
                 }
-                file_from_cache(dir, &root, path, language, max_file_bytes).or(Some(parsed))
+                Some(parsed)
             })
             .collect();
         for (slot, file) in misses.into_iter().zip(parsed) {
             slots[slot] = file;
+        }
+        let mut skipped: HashMap<PathBuf, SkipRecord> = HashMap::new();
+        for (index, slot) in slots.iter().enumerate() {
+            if slot.is_none() {
+                skipped.insert(paths[index].0.clone(), current_skip_record(&paths[index].0));
+            }
         }
         let files: Vec<SourceFile> = slots.into_iter().flatten().collect();
         let stats = BuildStats {
             cache_hits,
             parsed_files,
         };
-        let index = Self::from_parts(root, config.clone(), files, cache_dir, stats);
+        let index = Self::from_parts(root, config.clone(), files, skipped, cache_dir, stats);
         tracing::debug!(
             cache_hits = index.stats.cache_hits,
             parsed_files = index.stats.parsed_files,
@@ -132,14 +150,18 @@ impl SourceIndex {
                 return Vec::new();
             }
         };
-        if paths.len() == self.files.len()
+        if paths.len() == self.files.len() + self.skipped.len()
             && paths.par_iter().all(|(path, _)| {
-                self.by_path.get(path).is_some_and(|&slot| {
+                if let Some(&slot) = self.by_path.get(path) {
                     let file = &self.files[slot];
                     fs::metadata(path).is_ok_and(|meta| {
                         file.modified == meta.modified().ok() && file.size == meta.len()
                     })
-                })
+                } else if let Some(record) = self.skipped.get(path) {
+                    *record == current_skip_record(path)
+                } else {
+                    false
+                }
             })
         {
             return Vec::new();
@@ -162,10 +184,20 @@ impl SourceIndex {
         let mut slots: Vec<Option<SourceFile>> = Vec::with_capacity(paths.len());
         let mut changed = Vec::new();
         let mut misses: Vec<usize> = Vec::new();
+        let mut skipped: HashMap<PathBuf, SkipRecord> = HashMap::new();
         for (index, (path, _)) in paths.iter().enumerate() {
             let existing = old.remove(path);
             if reusable[index] {
                 slots.push(existing);
+                continue;
+            }
+            // A file skipped on a previous pass whose metadata is unchanged is
+            // not re-attempted and not reported as changed.
+            if let Some(record) = self.skipped.get(path)
+                && *record == current_skip_record(path)
+            {
+                skipped.insert(path.clone(), *record);
+                slots.push(None);
                 continue;
             }
             misses.push(index);
@@ -217,6 +249,9 @@ impl SourceIndex {
                 cache::remove_entry(dir, &self.root, path);
             }
         }
+        for path in &failed {
+            skipped.insert(path.clone(), current_skip_record(path));
+        }
         changed.extend(old.into_keys());
         self.files = slots.into_iter().flatten().collect();
         self.by_path = self
@@ -225,6 +260,7 @@ impl SourceIndex {
             .enumerate()
             .map(|(i, f)| (f.path.clone(), i))
             .collect();
+        self.skipped = skipped;
         self.stats = BuildStats {
             cache_hits,
             parsed_files: parsed_count,
@@ -261,6 +297,7 @@ impl SourceIndex {
         root: PathBuf,
         config: Config,
         files: Vec<SourceFile>,
+        skipped: HashMap<PathBuf, SkipRecord>,
         cache_dir: Option<PathBuf>,
         stats: BuildStats,
     ) -> Self {
@@ -274,6 +311,7 @@ impl SourceIndex {
             config,
             files,
             by_path,
+            skipped,
             cache_dir,
             stats,
         }
@@ -343,6 +381,13 @@ fn mapped_text(_path: &Path, _expected_size: u64) -> Option<crate::model::Text> 
 }
 
 fn discover(root: &Path, config: &Config) -> Result<Vec<(PathBuf, LanguageId)>, IndexError> {
+    // An inaccessible root must be an error, not an empty scan.
+    if let Err(source) = fs::metadata(root) {
+        return Err(IndexError::Io {
+            path: root.to_path_buf(),
+            source,
+        });
+    }
     let mut builder = WalkBuilder::new(root);
     builder
         .require_git(false)
@@ -557,6 +602,34 @@ mod tests {
         index.refresh();
         assert_eq!(index.files().len(), 1);
         assert!(index.files()[0].tokens.len() > before);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn refresh_fast_path_tolerates_skipped_files() {
+        let dir = temp_dir("refresh-skipped");
+        fs::write(dir.join("small.rs"), "fn small() {}").unwrap();
+        let large = dir.join("large.rs");
+        fs::write(
+            &large,
+            format!("fn large() {{ let x = \"{}\"; }}", "x".repeat(4096)),
+        )
+        .unwrap();
+        let config = Config {
+            max_file_bytes: 1024,
+            ..Config::default()
+        };
+        let mut index = SourceIndex::build_with_cache(&dir, &config, None).unwrap();
+        assert_eq!(index.files().len(), 1);
+        assert!(
+            index.refresh().is_empty(),
+            "unchanged refresh must be a no-op even with a skipped file"
+        );
+        assert!(index.refresh().is_empty());
+        fs::write(&large, "fn large() {}").unwrap();
+        let changed = index.refresh();
+        assert!(changed.contains(&large));
+        assert_eq!(index.files().len(), 2);
         fs::remove_dir_all(&dir).ok();
     }
 

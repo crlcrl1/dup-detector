@@ -209,7 +209,7 @@ fn parse_header(bytes: &[u8]) -> Option<Header> {
     }
     Some(Header {
         path,
-        modified: UNIX_EPOCH + Duration::new(secs, nanos),
+        modified: UNIX_EPOCH.checked_add(Duration::new(secs, nanos))?,
         size,
         text_hash,
         token_count,
@@ -301,8 +301,13 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     match fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
         Err(_) if path.exists() => {
-            fs::remove_file(path)?;
-            fs::rename(&tmp, path)
+            match fs::remove_file(path).and_then(|()| fs::rename(&tmp, path)) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let _ = fs::remove_file(&tmp);
+                    Err(error)
+                }
+            }
         }
         Err(error) => {
             let _ = fs::remove_file(&tmp);

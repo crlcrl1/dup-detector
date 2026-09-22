@@ -30,16 +30,11 @@ pub fn token_hashes(text: &str, tokens: &[Token]) -> Vec<u64> {
         .collect()
 }
 
-pub fn window_signatures(
-    tokens: &[Token],
-    hashes: &[u64],
-    window: usize,
-    parameterize_literals: bool,
-) -> Vec<u64> {
-    if window == 0 || tokens.len() < window {
+pub fn window_signatures(hashes: &[u64], window: usize, parameterize_literals: bool) -> Vec<u64> {
+    let total = hashes.len();
+    if window == 0 || total < window {
         return Vec::new();
     }
-    let total = hashes.len();
     let base: Vec<u64> = hashes
         .iter()
         .map(|&hash| {
@@ -188,8 +183,8 @@ mod tests {
     }
 
     fn signature(source: &str, start: usize, window: usize) -> u64 {
-        let (tokens, hashes) = hashes(source);
-        window_signatures(&tokens, &hashes, window, false)[start]
+        let (_tokens, hashes) = hashes(source);
+        window_signatures(&hashes, window, false)[start]
     }
 
     fn window_signatures_naive(
@@ -251,7 +246,7 @@ mod tests {
             for window in 2..=tokens.len().min(8) {
                 for parameterize_literals in [false, true] {
                     assert_eq!(
-                        window_signatures(&tokens, &hashes, window, parameterize_literals),
+                        window_signatures(&hashes, window, parameterize_literals),
                         window_signatures_naive(&hashes, window, parameterize_literals),
                         "source: {source}, window: {window}"
                     );
@@ -287,8 +282,8 @@ mod tests {
         let b = "let x = 100 + 300; y";
         assert_ne!(signature(a, 0, 8), signature(b, 0, 8));
         let param = |src: &str| {
-            let (tokens, hashes) = hashes(src);
-            window_signatures(&tokens, &hashes, 8, true)[0]
+            let (_tokens, hashes) = hashes(src);
+            window_signatures(&hashes, 8, true)[0]
         };
         assert_eq!(param(a), param(b));
     }

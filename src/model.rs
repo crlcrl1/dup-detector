@@ -337,7 +337,7 @@ impl SourceFile {
     }
 
     pub fn token_end_line(&self, index: usize) -> u32 {
-        self.line_at(self.tokens[index].end)
+        self.line_at(self.tokens[index].end.saturating_sub(1))
     }
 
     pub fn line_offset(&self, line: u32) -> usize {
@@ -373,12 +373,8 @@ impl SourceFile {
             f(&cached.signatures);
             return;
         }
-        let signatures = crate::encode::window_signatures(
-            self.tokens.as_slice(),
-            self.hashes.as_slice(),
-            window,
-            parameterize_literals,
-        );
+        let signatures =
+            crate::encode::window_signatures(self.hashes.as_slice(), window, parameterize_literals);
         f(&signatures);
         if cache && let Ok(mut cached) = self.seeds.lock() {
             *cached = Some(SeedCache {

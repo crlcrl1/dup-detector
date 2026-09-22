@@ -195,6 +195,9 @@ fn token_flags(kind: &str, named_single_byte: Option<&str>) -> u8 {
 }
 
 fn push_token(node: &Node<'_>, tables: &KindTables, source: &str, tokens: &mut Vec<Token>) {
+    if node.start_byte() == node.end_byte() {
+        return;
+    }
     let kind_id = node.kind_id() as usize;
     let kind_name = node.kind();
     let kind = match tables.classify.get(kind_id) {
@@ -344,6 +347,9 @@ mod tests {
             return;
         }
         if node.child_count() == 0 {
+            if node.start_byte() == node.end_byte() {
+                return;
+            }
             let kind_name = node.kind();
             tokens.push(Token {
                 start: node.start_byte() as u32,

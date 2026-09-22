@@ -129,7 +129,8 @@ fn run_scan(
 ) -> anyhow::Result<()> {
     let mut config = Config::load_or_default(path)
         .with_context(|| format!("failed to load config for {}", path.display()))?
-        .with_limits(min_lines, min_occurrences, max_groups);
+        .with_limits(min_lines, min_occurrences, max_groups)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     if parameterize_literals {
         config.parameterize_literals = true;
     }
@@ -137,7 +138,9 @@ fn run_scan(
         config.no_ignore = true;
     }
     if let Some(value) = max_file_bytes {
-        config.max_file_bytes = value;
+        config = config
+            .with_max_file_bytes(value)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     if !languages.is_empty() {
         let ids: Vec<LanguageId> = languages

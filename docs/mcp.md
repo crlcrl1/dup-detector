@@ -37,7 +37,7 @@ stderr so the stdio protocol stays clean.
 | `find_clones`            | Project-wide duplicated code          | `scope?`, `min_lines?`, `min_occurrences?`, `max_groups?`, `types?`, `parameterize_literals?` |
 | `find_clones_in_file`    | Clones involving a given file         | `file`, `scope?`, `min_lines?`, `min_occurrences?`, `max_groups?`, `types?`                   |
 | `find_clones_for_region` | "Is the code I'm writing duplicated?" | `file`, `start_line`, `end_line`, `scope?`, `min_lines?`, `max_groups?`, `types?`             |
-| `reindex`                | Rebuild the in-memory index           | `path?`                                                                                       |
+| `reindex`                | Drop the in-memory index and clear its on-disk cache (rebuilt on next scan) | `path?`                                                                                       |
 
 - `scope` defaults to the current working directory.
 - `types` accepts `"type-1"`, `"type-2"`.

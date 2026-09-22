@@ -72,10 +72,10 @@ fn bench_encode(c: &mut Criterion) {
         b.iter(|| encode::token_hashes(&text, &tokens));
     });
     group.bench_function("window_signatures", |b| {
-        b.iter(|| encode::window_signatures(&tokens, &hashes, WINDOW, false));
+        b.iter(|| encode::window_signatures(&hashes, WINDOW, false));
     });
     group.bench_function("window_signatures_param_literals", |b| {
-        b.iter(|| encode::window_signatures(&tokens, &hashes, WINDOW, true));
+        b.iter(|| encode::window_signatures(&hashes, WINDOW, true));
     });
     group.finish();
 }

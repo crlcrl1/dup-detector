@@ -4,6 +4,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::language::LanguageId;
+use crate::model::CloneType;
 
 pub const CONFIG_FILE_NAME: &str = "dup-detector.toml";
 
@@ -19,6 +20,10 @@ pub struct Config {
     pub no_ignore: bool,
     pub include_hidden: bool,
     pub max_file_bytes: u64,
+    /// Per-request clone type filter; applied during detection so that
+    /// `max_groups` truncation happens after filtering. Not settable from the
+    /// config file.
+    pub types: Option<Vec<CloneType>>,
 }
 
 impl Default for Config {
@@ -34,6 +39,7 @@ impl Default for Config {
             no_ignore: false,
             include_hidden: false,
             max_file_bytes: 2 * 1024 * 1024,
+            types: None,
         }
     }
 }
@@ -58,6 +64,8 @@ pub enum ConfigError {
         key: &'static str,
         message: String,
     },
+    #[error("invalid value for parameter `{key}`: {message}")]
+    InvalidParameter { key: &'static str, message: String },
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -70,6 +78,7 @@ struct FileConfig {
     max_groups: Option<usize>,
     parameterize_literals: Option<bool>,
     languages: Option<Vec<String>>,
+    no_ignore: Option<bool>,
     include_hidden: Option<bool>,
     max_file_bytes: Option<u64>,
 }
@@ -154,6 +163,9 @@ impl Config {
         if let Some(value) = file.include_hidden {
             config.include_hidden = value;
         }
+        if let Some(value) = file.no_ignore {
+            config.no_ignore = value;
+        }
         if let Some(names) = file.languages {
             let mut languages = Vec::with_capacity(names.len());
             for name in names {
@@ -204,17 +216,44 @@ impl Config {
         min_lines: Option<usize>,
         min_occurrences: Option<usize>,
         max_groups: Option<usize>,
-    ) -> Self {
+    ) -> Result<Self, ConfigError> {
+        let invalid = |key: &'static str, message: &str| ConfigError::InvalidParameter {
+            key,
+            message: message.to_string(),
+        };
         if let Some(v) = min_lines {
+            if v == 0 {
+                return Err(invalid("min_lines", "must be at least 1"));
+            }
             self.min_lines = v;
         }
         if let Some(v) = min_occurrences {
+            if v == 0 {
+                return Err(invalid("min_occurrences", "must be at least 1"));
+            }
             self.min_occurrences = v;
         }
         if let Some(v) = max_groups {
             self.max_groups = Some(v);
         }
-        self
+        Ok(self)
+    }
+
+    pub fn with_max_file_bytes(mut self, max_file_bytes: u64) -> Result<Self, ConfigError> {
+        if max_file_bytes == 0 {
+            return Err(ConfigError::InvalidParameter {
+                key: "max_file_bytes",
+                message: "must be at least 1".to_string(),
+            });
+        }
+        if max_file_bytes > u32::MAX as u64 {
+            return Err(ConfigError::InvalidParameter {
+                key: "max_file_bytes",
+                message: "exceeds the 4 GiB token-offset limit".to_string(),
+            });
+        }
+        self.max_file_bytes = max_file_bytes;
+        Ok(self)
     }
 }
 
@@ -234,6 +273,7 @@ mod tests {
             max_groups = 25
             parameterize_literals = true
             languages = ["rust", "python"]
+            no_ignore = true
             include_hidden = true
             max_file_bytes = 1048576
         "#;
@@ -248,10 +288,60 @@ mod tests {
                 max_groups: Some(25),
                 parameterize_literals: true,
                 languages: vec![LanguageId::Rust, LanguageId::Python],
-                no_ignore: false,
+                no_ignore: true,
                 include_hidden: true,
                 max_file_bytes: 1048576,
+                types: None,
             }
+        );
+    }
+
+    #[test]
+    fn with_limits_rejects_degenerate_overrides() {
+        let config = Config::default();
+        assert!(matches!(
+            config.clone().with_limits(Some(0), None, None),
+            Err(ConfigError::InvalidParameter {
+                key: "min_lines",
+                ..
+            })
+        ));
+        assert!(matches!(
+            config.clone().with_limits(None, Some(0), None),
+            Err(ConfigError::InvalidParameter {
+                key: "min_occurrences",
+                ..
+            })
+        ));
+        assert!(matches!(
+            config.clone().with_max_file_bytes(0),
+            Err(ConfigError::InvalidParameter {
+                key: "max_file_bytes",
+                ..
+            })
+        ));
+        assert!(matches!(
+            config.clone().with_max_file_bytes(u32::MAX as u64 + 1),
+            Err(ConfigError::InvalidParameter {
+                key: "max_file_bytes",
+                ..
+            })
+        ));
+        assert_eq!(
+            config
+                .clone()
+                .with_limits(Some(3), Some(4), Some(5))
+                .unwrap(),
+            Config {
+                min_lines: 3,
+                min_occurrences: 4,
+                max_groups: Some(5),
+                ..config.clone()
+            }
+        );
+        assert_eq!(
+            config.with_max_file_bytes(1024).unwrap().max_file_bytes,
+            1024
         );
     }
 

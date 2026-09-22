@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::schemars::JsonSchema;
@@ -19,7 +19,7 @@ pub struct CloneServer {
 
 struct ServerState {
     default_config: Config,
-    indexes: Mutex<HashMap<PathBuf, SourceIndex>>,
+    indexes: Mutex<HashMap<PathBuf, Arc<RwLock<SourceIndex>>>>,
 }
 
 impl CloneServer {
@@ -43,29 +43,40 @@ impl CloneServer {
             let root = Path::new(&scope)
                 .canonicalize()
                 .map_err(|e| format!("cannot resolve scope `{scope}`: {e}"))?;
-            let mut indexes = state
-                .indexes
-                .lock()
-                .map_err(|_| "index lock poisoned".to_string())?;
-            let index = match indexes.entry(root) {
-                std::collections::hash_map::Entry::Occupied(entry) => {
-                    let index = entry.into_mut();
-                    index.refresh();
-                    index
-                }
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    let key = entry.key().clone();
-                    let config = Config::load(&key)
-                        .map_err(|e| e.to_string())?
-                        .unwrap_or_else(|| state.default_config.clone());
-                    entry.insert(
-                        SourceIndex::build(&key, &config)
-                            .map_err(|e| format!("failed to index: {e}"))?,
-                    )
+            let holder = {
+                let mut indexes = state
+                    .indexes
+                    .lock()
+                    .map_err(|_| "index lock poisoned".to_string())?;
+                match indexes.entry(root) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let key = entry.key().clone();
+                        let config = Config::load(&key)
+                            .map_err(|e| e.to_string())?
+                            .unwrap_or_else(|| state.default_config.clone());
+                        entry
+                            .insert(Arc::new(RwLock::new(
+                                SourceIndex::build(&key, &config)
+                                    .map_err(|e| format!("failed to index: {e}"))?,
+                            )))
+                            .clone()
+                    }
                 }
             };
+            {
+                // Refresh briefly under the write lock; detection below runs
+                // under the read lock so concurrent tool calls parallelize.
+                let mut index = holder
+                    .write()
+                    .map_err(|_| "index lock poisoned".to_string())?;
+                index.refresh();
+            }
+            let index = holder
+                .read()
+                .map_err(|_| "index lock poisoned".to_string())?;
             let config = index.config().clone();
-            Ok(f(index, &config))
+            Ok(f(&index, &config))
         })
         .await
         .map_err(|e| format!("scan task panicked: {e}"))?
@@ -236,24 +247,15 @@ impl CloneServer {
             .with_index(
                 scope.as_deref(),
                 move |index, config| -> Result<ScanResponse, String> {
-                    let mut cfg = config.clone().with_limits(
-                        params.min_lines,
-                        params.min_occurrences,
-                        params.max_groups,
-                    );
+                    let mut cfg = config
+                        .clone()
+                        .with_limits(params.min_lines, params.min_occurrences, params.max_groups)
+                        .map_err(|e| e.to_string())?;
                     if let Some(v) = params.parameterize_literals {
                         cfg.parameterize_literals = v;
                     }
-                    let groups: Vec<CloneGroup> = index
-                        .find_clones(&cfg)
-                        .into_iter()
-                        .filter(|g| {
-                            params
-                                .types
-                                .as_ref()
-                                .is_none_or(|types| types.contains(&g.clone_type))
-                        })
-                        .collect();
+                    cfg.types = params.types;
+                    let groups = index.find_clones(&cfg);
                     Ok(ScanResponse::from_groups(index, groups))
                 },
             )
@@ -286,11 +288,11 @@ impl CloneServer {
                             params.file
                         )
                     })?;
-                    let cfg = config.clone().with_limits(
-                        params.min_lines,
-                        params.min_occurrences,
-                        params.max_groups,
-                    );
+                    let mut cfg = config
+                        .clone()
+                        .with_limits(params.min_lines, params.min_occurrences, params.max_groups)
+                        .map_err(|e| e.to_string())?;
+                    cfg.types = params.types;
                     let file = &index.files()[file_index];
                     let allowed =
                         crate::detect::span_window_signatures(file, 0, file.tokens.len(), &cfg);
@@ -298,13 +300,7 @@ impl CloneServer {
                     let groups: Vec<CloneGroup> =
                         crate::detect::detect_filtered(&files, &cfg, Some(&allowed))
                             .into_iter()
-                            .filter(|g| {
-                                g.occurrences.iter().any(|o| o.file as usize == file_index)
-                                    && params
-                                        .types
-                                        .as_ref()
-                                        .is_none_or(|types| types.contains(&g.clone_type))
-                            })
+                            .filter(|g| g.occurrences.iter().any(|o| o.file as usize == file_index))
                             .collect();
                     Ok(ScanResponse::from_groups(index, groups))
                 },
@@ -325,6 +321,15 @@ impl CloneServer {
             .with_index(
                 scope.as_deref(),
                 move |index, config| -> Result<ScanResponse, String> {
+                    if params.start_line == 0 {
+                        return Err("`start_line` is 1-based and must be at least 1".to_string());
+                    }
+                    if params.end_line < params.start_line {
+                        return Err(format!(
+                            "`end_line` ({}) must be >= `start_line` ({})",
+                            params.end_line, params.start_line
+                        ));
+                    }
                     let resolved = resolve_file(index.root(), &params.file).ok_or_else(|| {
                         format!(
                             "cannot resolve file `{}` under `{}`",
@@ -340,6 +345,11 @@ impl CloneServer {
                     } else {
                         let language = LanguageId::from_path(&resolved)
                             .ok_or_else(|| format!("unsupported file type: `{}`", params.file))?;
+                        if !config.language_enabled(language) {
+                            return Err(format!(
+                                "language `{language}` is disabled by configuration"
+                            ));
+                        }
                         parsed = parse_file(&resolved, language, config.max_file_bytes)
                             .ok_or_else(|| format!("cannot read or parse `{}`", params.file))?;
                         files = index
@@ -362,9 +372,11 @@ impl CloneServer {
                     let min_lines = params
                         .min_lines
                         .unwrap_or(config.min_lines.min(region_lines));
-                    let cfg = config
+                    let mut cfg = config
                         .clone()
-                        .with_limits(Some(min_lines), None, params.max_groups);
+                        .with_limits(Some(min_lines), None, params.max_groups)
+                        .map_err(|e| e.to_string())?;
+                    cfg.types = params.types;
                     let allowed =
                         crate::detect::span_window_signatures(file, span_start, span_end, &cfg);
                     let groups: Vec<CloneGroup> =
@@ -375,10 +387,7 @@ impl CloneServer {
                                     o.file as usize == file_idx
                                         && o.start < span_end as u32
                                         && o.end > span_start as u32
-                                }) && params
-                                    .types
-                                    .as_ref()
-                                    .is_none_or(|types| types.contains(&g.clone_type))
+                                })
                             })
                             .collect();
                     Ok(ScanResponse {

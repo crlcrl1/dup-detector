@@ -44,29 +44,70 @@ enum ChangedRegion {
 
 #[derive(Default, Clone)]
 struct PendingChanges {
-    changed: HashMap<PathBuf, ChangedRegion>,
+    /// Each entry carries a stamp from `version`; consumers remove an entry
+    /// only while its stamp is unchanged, so an edit that lands during an
+    /// analysis run is never discarded unconsumed.
+    changed: HashMap<PathBuf, (ChangedRegion, u64)>,
+    version: u64,
 }
 
 impl PendingChanges {
-    fn mark_whole(&mut self, path: PathBuf) {
-        self.changed.insert(path, ChangedRegion::Whole);
+    fn stamp(&mut self) -> u64 {
+        self.version += 1;
+        self.version
     }
 
-    fn mark_bytes(&mut self, path: PathBuf, start: usize, end: usize) {
+    fn mark_whole(&mut self, path: PathBuf) {
+        let stamp = self.stamp();
+        self.changed.insert(path, (ChangedRegion::Whole, stamp));
+    }
+
+    /// Records a batch of sequential edits, each `(start, old_end, new_end)`
+    /// in the text coordinates at its application time. Previously recorded
+    /// ranges are rebased against every edit so all stored ranges stay valid
+    /// in the final text coordinates.
+    fn mark_edits(&mut self, path: PathBuf, edits: &[(usize, usize, usize)]) {
+        if edits.is_empty() {
+            return;
+        }
+        let stamp = self.stamp();
         match self.changed.entry(path) {
             Entry::Occupied(mut entry) => {
-                if let ChangedRegion::Bytes(ranges) = entry.get_mut() {
-                    ranges.push((start, end));
+                let (region, stored) = entry.get_mut();
+                *stored = stamp;
+                if let ChangedRegion::Bytes(ranges) = region {
+                    rebase_and_record(ranges, edits);
                 }
             }
             Entry::Vacant(entry) => {
-                entry.insert(ChangedRegion::Bytes(vec![(start, end)]));
+                let mut ranges = Vec::new();
+                rebase_and_record(&mut ranges, edits);
+                entry.insert((ChangedRegion::Bytes(ranges), stamp));
             }
         }
     }
 
     fn is_empty(&self) -> bool {
         self.changed.is_empty()
+    }
+}
+
+fn rebase_and_record(ranges: &mut Vec<(usize, usize)>, edits: &[(usize, usize, usize)]) {
+    for &(start, old_end, new_end) in edits {
+        let delta = new_end as i64 - old_end as i64;
+        for (from, to) in ranges.iter_mut() {
+            if *to <= start {
+                continue;
+            }
+            if *from >= old_end {
+                *from = (*from as i64 + delta).max(0) as usize;
+                *to = (*to as i64 + delta).max(0) as usize;
+            } else {
+                *from = (*from).min(start);
+                *to = ((*to).max(old_end) as i64 + delta).max(0) as usize;
+            }
+        }
+        ranges.push((start, new_end));
     }
 }
 
@@ -208,9 +249,12 @@ impl Backend {
             return Self::open_document(state, uri, path, language, text);
         };
         let mut text = existing.file.text.as_str().to_string();
-        let mut regions: Vec<(usize, usize)> = Vec::new();
+        let mut edits: Vec<(usize, usize, usize)> = Vec::new();
+        let mut whole = false;
         for change in &changes {
-            apply_change(&mut text, change, &mut regions);
+            if apply_change(&mut text, change, &mut edits) {
+                whole = true;
+            }
         }
         if text.len() as u64 > state.config.max_file_bytes {
             tracing::debug!(path = %path.display(), size = text.len(), "skipping large file");
@@ -271,13 +315,15 @@ impl Backend {
                 }),
             );
         }
-        if !regions.is_empty() {
+        if whole || !edits.is_empty() {
             let mut pending = state
                 .pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for (start, end) in regions {
-                pending.mark_bytes(path.clone(), start, end);
+            if whole {
+                pending.mark_whole(path.clone());
+            } else {
+                pending.mark_edits(path.clone(), &edits);
             }
         }
         state.bump();
@@ -633,8 +679,8 @@ fn spawn_analysis(client: Client, state: Arc<State>) {
                         *guard = snapshot;
                     }
                     if let Ok(mut live) = state.pending.lock() {
-                        for (path, region) in &consumed.changed {
-                            if live.changed.get(path) == Some(region) {
+                        for (path, (_, stamp)) in &consumed.changed {
+                            if live.changed.get(path).is_some_and(|(_, s)| s == stamp) {
                                 live.changed.remove(path);
                             }
                         }
@@ -744,7 +790,7 @@ fn analyze(state: &State) -> anyhow::Result<Option<Analysis>> {
     // edits since then. Running the normal detection over just these seeds yields the
     // exact same groups as a full project scan while touching far fewer candidates.
     let mut allowed: FastSet<u64> = previous.signatures.clone();
-    for (path, region) in &pending.changed {
+    for (path, (region, _)) in &pending.changed {
         let file = overlay
             .get(path)
             .map(|file| file.as_ref())
@@ -991,15 +1037,15 @@ fn position_to_byte(text: &str, position: Position) -> usize {
 fn apply_change(
     text: &mut String,
     change: &TextDocumentContentChangeEvent,
-    regions: &mut Vec<(usize, usize)>,
-) {
+    edits: &mut Vec<(usize, usize, usize)>,
+) -> bool {
     match &change.range {
         Some(range) => {
             let start = position_to_byte(text, range.start);
             let end = position_to_byte(text, range.end);
             if start <= end && end <= text.len() {
                 text.replace_range(start..end, &change.text);
-                regions.push((start, start + change.text.len()));
+                edits.push((start, end, start + change.text.len()));
             } else {
                 // Skipping a change silently desyncs server text from the
                 // client forever; make it loud.
@@ -1010,11 +1056,12 @@ fn apply_change(
                     "ignoring change with out-of-bounds range"
                 );
             }
+            false
         }
         None => {
             *text = change.text.clone();
-            regions.clear();
-            regions.push((0, text.len()));
+            edits.clear();
+            true
         }
     }
 }
@@ -1095,10 +1142,11 @@ mod tests {
             range_length: None,
             text: " let x = 1;".to_string(),
         };
-        let mut regions = Vec::new();
-        apply_change(&mut text, &change, &mut regions);
+        let mut edits = Vec::new();
+        let whole = apply_change(&mut text, &change, &mut edits);
+        assert!(!whole);
         assert_eq!(text, "fn main() { let x = 1;}\n");
-        assert_eq!(regions, vec![(11, 22)]);
+        assert_eq!(edits, vec![(11, 11, 22)]);
     }
 
     fn source_file(text: &str) -> SourceFile {
@@ -1136,16 +1184,51 @@ mod tests {
         let mut pending = PendingChanges::default();
         assert!(pending.is_empty());
         let path = PathBuf::from("a.rs");
-        pending.mark_bytes(path.clone(), 0, 5);
-        pending.mark_bytes(path.clone(), 10, 12);
+        let region = |pending: &PendingChanges| pending.changed.get(&path).map(|(r, _)| r.clone());
+        pending.mark_edits(path.clone(), &[(0, 0, 5)]);
+        pending.mark_edits(path.clone(), &[(10, 10, 12)]);
         assert_eq!(
-            pending.changed.get(&path),
-            Some(&ChangedRegion::Bytes(vec![(0, 5), (10, 12)]))
+            region(&pending),
+            Some(ChangedRegion::Bytes(vec![(0, 5), (10, 12)]))
         );
         pending.mark_whole(path.clone());
-        assert_eq!(pending.changed.get(&path), Some(&ChangedRegion::Whole));
-        pending.mark_bytes(path.clone(), 20, 25);
-        assert_eq!(pending.changed.get(&path), Some(&ChangedRegion::Whole));
+        assert_eq!(region(&pending), Some(ChangedRegion::Whole));
+        pending.mark_edits(path.clone(), &[(20, 20, 25)]);
+        assert_eq!(region(&pending), Some(ChangedRegion::Whole));
+    }
+
+    #[test]
+    fn pending_regions_rebase_across_edits() {
+        let mut pending = PendingChanges::default();
+        let path = PathBuf::from("a.rs");
+        // Delete two bytes at 10..12, then insert five bytes at the top: the
+        // first region must shift so it still covers the same content.
+        pending.mark_edits(path.clone(), &[(10, 12, 10)]);
+        pending.mark_edits(path.clone(), &[(0, 0, 5)]);
+        assert_eq!(
+            pending.changed.get(&path).map(|(r, _)| r),
+            Some(&ChangedRegion::Bytes(vec![(15, 15), (0, 5)]))
+        );
+        // An edit overlapping a recorded region expands it to the union and
+        // shifts the tail beyond the edit.
+        let mut pending = PendingChanges::default();
+        pending.mark_edits(path.clone(), &[(10, 10, 20)]);
+        pending.mark_edits(path.clone(), &[(12, 15, 16)]);
+        assert_eq!(
+            pending.changed.get(&path).map(|(r, _)| r),
+            Some(&ChangedRegion::Bytes(vec![(10, 21), (12, 16)]))
+        );
+    }
+
+    #[test]
+    fn pending_stamps_distinguish_remarks() {
+        let mut pending = PendingChanges::default();
+        let path = PathBuf::from("a.rs");
+        pending.mark_edits(path.clone(), &[(0, 0, 5)]);
+        let first = pending.changed.get(&path).map(|(_, s)| *s).unwrap();
+        pending.mark_edits(path.clone(), &[(0, 0, 5)]);
+        let second = pending.changed.get(&path).map(|(_, s)| *s).unwrap();
+        assert_ne!(first, second);
     }
 
     #[test]
@@ -1306,7 +1389,7 @@ mod tests {
         drop(documents);
         let mut pending = state.pending.lock().unwrap();
         match region {
-            Some((start, end)) => pending.mark_bytes(path.to_path_buf(), start, end),
+            Some((start, end)) => pending.mark_edits(path.to_path_buf(), &[(start, start, end)]),
             None => pending.mark_whole(path.to_path_buf()),
         }
     }
