@@ -2,7 +2,8 @@
   "name": "dup-detector",
   "displayName": "dup-detector",
   "description": "Show duplicated code as diagnostics and jump between clone occurrences.",
-  "version": "0.1.0",
+  "icon": "icon.png",
+  "version": "0.1.1",
   "publisher": "crlcrl1",
   "license": "Apache-2.0",
   "repository": {

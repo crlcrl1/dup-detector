@@ -29,7 +29,7 @@ Then either:
 
   ```sh
   npm run package
-  code --install-extension dup-detector-0.1.0.vsix
+  code --install-extension dup-detector-0.1.1.vsix
   ```
 
 ## Settings
