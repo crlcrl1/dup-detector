@@ -75,8 +75,8 @@ pub struct SourceIndex {
 impl SourceIndex {
     pub fn build(root: impl AsRef<Path>, config: &Config) -> Result<Self, IndexError> {
         let root = canonicalize_root(root)?;
-        let cache_dir = cache::dir_in(&root);
-        Self::build_at(root, config, Some(cache_dir))
+        let cache_dir = cache::dir_for(&root, config.cache_location);
+        Self::build_at(root, config, cache_dir)
     }
 
     pub fn build_with_cache(
@@ -151,12 +151,25 @@ impl SourceIndex {
         Ok(index)
     }
 
+    /// Clears the on-disk cache for `root` in both possible locations, so a
+    /// `cache_location` change does not leave stale entries behind.
     pub fn clear_cache(root: &Path) {
         let Ok(root) = root.canonicalize() else {
             return;
         };
-        if let Err(error) = cache::clear(&cache::dir_in(&root)) {
-            tracing::debug!(root = %root.display(), error = %error, "cannot clear cache");
+        let mut dirs = vec![cache::dir_in(&root)];
+        if let Some(dir) = cache::user_cache_dir(&root) {
+            dirs.push(dir);
+        }
+        for dir in dirs {
+            if let Err(error) = cache::clear(&dir) {
+                tracing::debug!(
+                    root = %root.display(),
+                    dir = %dir.display(),
+                    error = %error,
+                    "cannot clear cache"
+                );
+            }
         }
     }
 
@@ -526,6 +539,7 @@ pub(crate) fn parse_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CacheLocation;
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir =
@@ -709,6 +723,31 @@ mod tests {
         let second = SourceIndex::build(&dir, &Config::default()).unwrap();
         assert_eq!(second.stats().cache_hits, 1);
         assert_eq!(second.files().len(), 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn user_cache_location_writes_outside_project() {
+        let dir = temp_dir("cache-user-location");
+        fs::write(dir.join("a.rs"), "fn a() { let x = 1; }\n").unwrap();
+        let config = Config {
+            cache_location: CacheLocation::UserCache,
+            ..Config::default()
+        };
+        let first = SourceIndex::build(&dir, &config).unwrap();
+        assert_eq!(first.stats().parsed_files, 1);
+        assert!(!dir.join(cache::CACHE_DIR).exists());
+        let root = dir.canonicalize().unwrap();
+        let Some(cache_dir) = cache::user_cache_dir(&root) else {
+            fs::remove_dir_all(&dir).ok();
+            return;
+        };
+        assert_eq!(entry_count(&cache_dir), 1);
+        drop(first);
+        let second = SourceIndex::build(&dir, &config).unwrap();
+        assert_eq!(second.stats().cache_hits, 1);
+        SourceIndex::clear_cache(&dir);
+        assert!(!cache_dir.exists());
         fs::remove_dir_all(&dir).ok();
     }
 

@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use memmap2::Mmap;
 use xxhash_rust::xxh3::xxh3_64;
 
+use crate::config::{CONFIG_DIR_NAME, CacheLocation};
 use crate::model::{Slice, SourceFile, Token, TokenKind};
 
 const MAGIC: &[u8; 8] = b"DUPCDT10";
@@ -39,6 +40,33 @@ fn align8(value: usize) -> usize {
 
 pub fn dir_in(root: &Path) -> PathBuf {
     root.join(CACHE_DIR)
+}
+
+/// User-level cache root: `~/.cache/dup-detector` on Linux (or
+/// `$XDG_CACHE_HOME/dup-detector`), `~/Library/Caches/dup-detector` on macOS and
+/// `%LOCALAPPDATA%\dup-detector` on Windows.
+pub fn user_cache_root() -> Option<PathBuf> {
+    Some(dirs::cache_dir()?.join(CONFIG_DIR_NAME))
+}
+
+/// Cache directory for one scanned root under the user cache root, keyed by the
+/// canonical root path so several projects sharing the directory stay separate.
+pub fn user_cache_dir(root: &Path) -> Option<PathBuf> {
+    Some(user_cache_dir_in(&user_cache_root()?, root))
+}
+
+fn user_cache_dir_in(base: &Path, root: &Path) -> PathBuf {
+    let key = xxh3_64(root.as_os_str().as_encoded_bytes());
+    base.join(format!("{key:016x}"))
+}
+
+/// Cache directory for `root` according to `location`; `None` when the user
+/// cache root cannot be resolved.
+pub fn dir_for(root: &Path, location: CacheLocation) -> Option<PathBuf> {
+    match location {
+        CacheLocation::Project => Some(dir_in(root)),
+        CacheLocation::UserCache => user_cache_dir(root),
+    }
 }
 
 pub fn entry_path(dir: &Path, root: &Path, path: &Path) -> Option<PathBuf> {
@@ -372,6 +400,32 @@ mod tests {
             assert!(loaded.hashes.is_mapped());
         }
         clear(&dir).unwrap();
+    }
+
+    #[test]
+    fn dir_for_selects_location() {
+        let root = Path::new("/tmp/project");
+        assert_eq!(
+            dir_for(root, CacheLocation::Project),
+            Some(root.join(CACHE_DIR))
+        );
+        assert_eq!(
+            dir_for(root, CacheLocation::UserCache),
+            user_cache_root().map(|base| user_cache_dir_in(&base, root))
+        );
+    }
+
+    #[test]
+    fn user_cache_dirs_are_keyed_by_root() {
+        let base = PathBuf::from("/base");
+        let a = user_cache_dir_in(&base, Path::new("/p/a"));
+        let b = user_cache_dir_in(&base, Path::new("/p/b"));
+        assert_eq!(a, user_cache_dir_in(&base, Path::new("/p/a")));
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), Some(base.as_path()));
+        let name = a.file_name().and_then(|name| name.to_str()).unwrap();
+        assert_eq!(name.len(), 16);
+        assert!(name.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

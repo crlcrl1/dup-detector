@@ -18,7 +18,8 @@ vim.lsp.start({
 })
 ```
 
-项目配置（`dup-detector.toml`）从工作区根目录读取（若不存在则回退到服务器启动目录）。
+工作区的项目配置（`dup-detector.toml`）会与用户级配置合并（若不存在则回退到服务器启动目录），
+详见[配置文件](configuration.md)。
 
 ## 内置编辑器插件
 

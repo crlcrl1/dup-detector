@@ -114,8 +114,7 @@ fn rebase_and_record(ranges: &mut Vec<(usize, usize)>, edits: &[(usize, usize, u
 struct State {
     root: PathBuf,
     config: RwLock<Config>,
-    config_path: Mutex<Option<PathBuf>>,
-    config_mtime: Mutex<Option<SystemTime>>,
+    config_sources: Mutex<Vec<(PathBuf, Option<SystemTime>)>>,
     documents: Mutex<HashMap<PathBuf, Arc<Document>>>,
     update_lock: Mutex<()>,
     index: Mutex<Option<SourceIndex>>,
@@ -127,13 +126,11 @@ struct State {
 
 impl State {
     fn new(root: PathBuf, config: Config) -> Self {
-        let config_path = Config::source_path(&root);
-        let config_mtime = config_path.as_deref().and_then(file_mtime);
+        let config_sources = Config::source_stamps(&root);
         Self {
             root,
             config: RwLock::new(config),
-            config_path: Mutex::new(config_path),
-            config_mtime: Mutex::new(config_mtime),
+            config_sources: Mutex::new(config_sources),
             documents: Mutex::new(HashMap::new()),
             update_lock: Mutex::new(()),
             index: Mutex::new(None),
@@ -144,46 +141,33 @@ impl State {
         }
     }
 
-    /// Re-reads the project config when its file appears, disappears, or
-    /// changes, dropping the index so the next analysis rebuilds it.
+    /// Re-reads the user-level and project-level config files when they appear,
+    /// disappear, or change, dropping the index so the next analysis rebuilds it.
     fn reload_config(&self) -> bool {
-        let source = Config::source_path(&self.root);
-        let mtime = source.as_deref().and_then(file_mtime);
-        let stored_path = self
-            .config_path
+        let sources = Config::source_stamps(&self.root);
+        let stored = self
+            .config_sources
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let stored_mtime = self
-            .config_mtime
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if source == *stored_path && mtime == *stored_mtime {
+        if sources == *stored {
             return false;
         }
-        drop(stored_path);
-        drop(stored_mtime);
-        let config = match &source {
-            Some(path) => match Config::load_from_file(path) {
-                Ok(config) => config,
-                Err(error) => {
-                    tracing::warn!(error = %error, "cannot reload config; keeping the previous one");
-                    return false;
-                }
-            },
-            None => Config::default(),
+        drop(stored);
+        let config = match Config::load_or_default(&self.root) {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(error = %error, "cannot reload config; keeping the previous one");
+                return false;
+            }
         };
         *self
             .config
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = config;
         *self
-            .config_path
+            .config_sources
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = source;
-        *self
-            .config_mtime
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = mtime;
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = sources;
         *self
             .index
             .lock()
@@ -210,12 +194,6 @@ impl State {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.notify.notify_one();
     }
-}
-
-fn file_mtime(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path)
-        .ok()
-        .and_then(|meta| meta.modified().ok())
 }
 
 impl std::fmt::Debug for State {

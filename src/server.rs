@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime};
@@ -24,8 +23,7 @@ const MAX_CACHED_INDEXES: usize = 8;
 
 struct CachedIndex {
     index: Arc<RwLock<SourceIndex>>,
-    config_path: Option<PathBuf>,
-    config_mtime: Option<SystemTime>,
+    config_sources: Vec<(PathBuf, Option<SystemTime>)>,
     last_used: Instant,
 }
 
@@ -34,22 +32,15 @@ struct ServerState {
     indexes: Mutex<HashMap<PathBuf, CachedIndex>>,
 }
 
-fn file_mtime(path: &Path) -> Option<SystemTime> {
-    fs::metadata(path)
-        .ok()
-        .and_then(|meta| meta.modified().ok())
-}
-
-/// Rebuilds the index when the project config file appears, disappears, or
-/// changes, so a long-running server picks up `dup-detector.toml` edits.
+/// Rebuilds the index when a config file (user-level or project-level) appears,
+/// disappears, or changes, so a long-running server picks up config edits.
 fn reload_config(state: &ServerState, root: &Path, cached: &mut CachedIndex) -> Result<(), String> {
-    let source = Config::source_path(root);
-    let mtime = source.as_deref().and_then(file_mtime);
-    if source == cached.config_path && mtime == cached.config_mtime {
+    let sources = Config::source_stamps(root);
+    if sources == cached.config_sources {
         return Ok(());
     }
-    let config = match &source {
-        Some(path) => Config::load_from_file(path).map_err(|error| error.to_string())?,
+    let config = match Config::load(root).map_err(|error| error.to_string())? {
+        Some(config) => config,
         None => state.default_config.clone(),
     };
     let mut index = cached
@@ -58,8 +49,7 @@ fn reload_config(state: &ServerState, root: &Path, cached: &mut CachedIndex) -> 
         .map_err(|_| "index lock poisoned".to_string())?;
     *index = SourceIndex::build(root, &config).map_err(|e| format!("failed to index: {e}"))?;
     drop(index);
-    cached.config_path = source;
-    cached.config_mtime = mtime;
+    cached.config_sources = sources;
     tracing::info!(root = %root.display(), "configuration reloaded");
     Ok(())
 }
@@ -111,19 +101,17 @@ impl CloneServer {
                         cached.index.clone()
                     }
                     Entry::Vacant(entry) => {
-                        let (config, config_path) =
-                            match Config::load_with_source(&root).map_err(|e| e.to_string())? {
-                                Some((config, path)) => (config, Some(path)),
-                                None => (state.default_config.clone(), None),
-                            };
+                        let config = match Config::load(&root).map_err(|e| e.to_string())? {
+                            Some(config) => config,
+                            None => state.default_config.clone(),
+                        };
                         let index = SourceIndex::build(&root, &config)
                             .map_err(|e| format!("failed to index: {e}"))?;
-                        let config_mtime = config_path.as_deref().and_then(file_mtime);
+                        let config_sources = Config::source_stamps(&root);
                         entry
                             .insert(CachedIndex {
                                 index: Arc::new(RwLock::new(index)),
-                                config_path,
-                                config_mtime,
+                                config_sources,
                                 last_used: Instant::now(),
                             })
                             .index
@@ -150,15 +138,33 @@ impl CloneServer {
     }
 }
 
+// schemars tags `usize`/`u32` with non-standard `format` values (`uint`/`uint32`) that
+// strict MCP schema validators reject as unknown. These emit a plain integer schema with
+// no `format`; they only affect the generated JSON schema, not serde (de)serialization.
+fn integer_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "integer"
+    })
+}
+
+fn nullable_integer_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["integer", "null"]
+    })
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindClonesParams {
     /// Subdirectory to scan; defaults to the current working directory.
     pub scope: Option<String>,
     /// Minimum number of lines for a clone group (default 7).
+    #[schemars(schema_with = "nullable_integer_schema")]
     pub min_lines: Option<usize>,
     /// Minimum number of occurrences per group (default 2).
+    #[schemars(schema_with = "nullable_integer_schema")]
     pub min_occurrences: Option<usize>,
     /// Maximum number of groups to return (default: no limit).
+    #[schemars(schema_with = "nullable_integer_schema")]
     pub max_groups: Option<usize>,
     /// Restrict results to these clone types: "type-1", "type-2".
     pub types: Option<Vec<CloneType>>,
@@ -173,10 +179,13 @@ pub struct FindClonesInFileParams {
     /// Subdirectory to scan; defaults to the current working directory.
     pub scope: Option<String>,
     /// Minimum number of lines for a clone group (default 7).
+    #[schemars(schema_with = "nullable_integer_schema")]
     pub min_lines: Option<usize>,
     /// Minimum number of occurrences per group (default 2).
+    #[schemars(schema_with = "nullable_integer_schema")]
     pub min_occurrences: Option<usize>,
     /// Maximum number of groups to return (default: no limit).
+    #[schemars(schema_with = "nullable_integer_schema")]
     pub max_groups: Option<usize>,
     /// Restrict results to these clone types: "type-1", "type-2".
     pub types: Option<Vec<CloneType>>,
@@ -187,14 +196,18 @@ pub struct FindClonesForRegionParams {
     /// Path of the file containing the region, relative to the scope or absolute.
     pub file: String,
     /// First line of the region (1-based, inclusive).
+    #[schemars(schema_with = "integer_schema")]
     pub start_line: u32,
     /// Last line of the region (1-based, inclusive).
+    #[schemars(schema_with = "integer_schema")]
     pub end_line: u32,
     /// Subdirectory to scan; defaults to the current working directory.
     pub scope: Option<String>,
     /// Minimum number of lines for a clone group; defaults to min(config.min_lines, line span of the region).
+    #[schemars(schema_with = "nullable_integer_schema")]
     pub min_lines: Option<usize>,
     /// Maximum number of groups to return (default: no limit).
+    #[schemars(schema_with = "nullable_integer_schema")]
     pub max_groups: Option<usize>,
     /// Restrict results to these clone types: "type-1", "type-2".
     pub types: Option<Vec<CloneType>>,
@@ -208,6 +221,7 @@ pub struct ReindexParams {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ScanResponse {
+    #[schemars(schema_with = "integer_schema")]
     pub files_scanned: usize,
     pub groups: Vec<CloneGroupDto>,
 }
@@ -225,6 +239,7 @@ impl ScanResponse {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CloneGroupDto {
+    #[schemars(schema_with = "integer_schema")]
     pub token_count: usize,
     pub clone_type: CloneType,
     pub occurrences: Vec<OccurrenceDto>,
@@ -233,7 +248,9 @@ pub struct CloneGroupDto {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct OccurrenceDto {
     pub path: String,
+    #[schemars(schema_with = "integer_schema")]
     pub start_line: u32,
+    #[schemars(schema_with = "integer_schema")]
     pub end_line: u32,
 }
 

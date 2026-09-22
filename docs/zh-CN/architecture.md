@@ -36,14 +36,15 @@ token 流上检测 **Type-1** 与 **Type-2** 克隆，使用**参数化（重命
 src/
   main.rs       CLI 入口：`mcp` / `lsp` / `scan`
   lib.rs        库根
-  config.rs     Config + dup-detector.toml 读取
+  config.rs     Config + 用户级/项目级 dup-detector.toml 读取
   language.rs   扩展名 -> LanguageId -> tree-sitter 语法
   model.rs      Token / SourceFile / Occurrence / CloneGroup / CloneType
   tokenize.rs   源码 -> CST -> 叶子 token 流
   encode.rs     token 流 -> 参数化编码
   detect.rs     seed-and-extend、双射校验、聚类
   index.rs      文件发现、并行解析、增量刷新
-  cache.rs      磁盘 token 缓存（mtime/大小/文本哈希校验）
+  cache.rs      磁盘 token 缓存，项目 `.dup-detector/` 或用户缓存目录
+                （mtime/大小/文本哈希校验）
   server.rs     rmcp 服务器 + MCP 工具定义
   lsp.rs        LSP 服务器（诊断、跳转定义、引用、悬停）
 editors/

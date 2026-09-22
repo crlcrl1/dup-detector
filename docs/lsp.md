@@ -20,8 +20,9 @@ vim.lsp.start({
 })
 ```
 
-The project config (`dup-detector.toml`) is loaded from the workspace root (the
-server also falls back to its startup directory).
+The workspace's project config (`dup-detector.toml`) is merged with the
+user-level config (the server also falls back to its startup directory); see
+[Configuration](configuration.md).
 
 ## Bundled editor plugins
 

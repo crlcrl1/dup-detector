@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -7,6 +8,27 @@ use crate::language::LanguageId;
 use crate::model::CloneType;
 
 pub const CONFIG_FILE_NAME: &str = "dup-detector.toml";
+pub const CONFIG_DIR_NAME: &str = "dup-detector";
+
+/// Where per-file token caches are stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheLocation {
+    /// `<project root>/.dup-detector`, the default.
+    #[default]
+    Project,
+    /// A per-root directory under the user's platform cache directory.
+    UserCache,
+}
+
+impl CacheLocation {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "project" => Some(Self::Project),
+            "user-cache" => Some(Self::UserCache),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -23,6 +45,8 @@ pub struct Config {
     /// Drop clone groups whose occurrences look like pure declarations
     /// (imports, struct fields, ...) with no logic markers.
     pub filter_boilerplate: bool,
+    /// Directory for the on-disk token cache.
+    pub cache_location: CacheLocation,
     /// Per-request clone type filter; applied during detection so that
     /// `max_groups` truncation happens after filtering. Not settable from the
     /// config file.
@@ -43,6 +67,7 @@ impl Default for Config {
             include_hidden: false,
             max_file_bytes: 2 * 1024 * 1024,
             filter_boilerplate: true,
+            cache_location: CacheLocation::Project,
             types: None,
         }
     }
@@ -86,6 +111,7 @@ struct FileConfig {
     include_hidden: Option<bool>,
     max_file_bytes: Option<u64>,
     filter_boilerplate: Option<bool>,
+    cache_location: Option<String>,
 }
 
 fn find_config_file(root: &Path) -> Option<PathBuf> {
@@ -116,42 +142,175 @@ fn find_config_file(root: &Path) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// Path of the user-level config file: `~/.config/dup-detector/dup-detector.toml`
+/// on Linux, `~/Library/Application Support/dup-detector/dup-detector.toml` on
+/// macOS and `%APPDATA%\dup-detector\dup-detector.toml` on Windows.
+pub fn user_config_path() -> Option<PathBuf> {
+    Some(
+        dirs::config_dir()?
+            .join(CONFIG_DIR_NAME)
+            .join(CONFIG_FILE_NAME),
+    )
+}
+
+fn source_paths_layered(root: &Path, user: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(path) = user.filter(|path| path.is_file()) {
+        paths.push(path.to_path_buf());
+    }
+    if let Some(path) = find_config_file(root) {
+        paths.push(path);
+    }
+    paths
+}
+
+fn read_file_config(path: &Path) -> Result<FileConfig, ConfigError> {
+    let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    toml::from_str(&text).map_err(|source| ConfigError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn apply_file_config(
+    config: &mut Config,
+    file: FileConfig,
+    path: &Path,
+) -> Result<(), ConfigError> {
+    if let Some(value) = file.min_lines {
+        config.min_lines = value;
+    }
+    if let Some(value) = file.min_occurrences {
+        config.min_occurrences = value;
+    }
+    if let Some(value) = file.max_bucket {
+        config.max_bucket = value;
+    }
+    if let Some(value) = file.seed_window {
+        config.seed_window = value;
+    }
+    if let Some(value) = file.max_groups {
+        config.max_groups = Some(value);
+    }
+    if let Some(value) = file.parameterize_literals {
+        config.parameterize_literals = value;
+    }
+    if let Some(value) = file.max_file_bytes {
+        config.max_file_bytes = value;
+    }
+    if let Some(value) = file.include_hidden {
+        config.include_hidden = value;
+    }
+    if let Some(value) = file.no_ignore {
+        config.no_ignore = value;
+    }
+    if let Some(value) = file.filter_boilerplate {
+        config.filter_boilerplate = value;
+    }
+    if let Some(names) = file.languages {
+        let mut languages = Vec::with_capacity(names.len());
+        for name in names {
+            let language =
+                LanguageId::from_name(&name).ok_or_else(|| ConfigError::UnknownLanguage {
+                    path: path.to_path_buf(),
+                    name: name.clone(),
+                })?;
+            languages.push(language);
+        }
+        config.languages = languages;
+    }
+    let invalid = |key: &'static str, message: &str| ConfigError::InvalidValue {
+        path: path.to_path_buf(),
+        key,
+        message: message.to_string(),
+    };
+    if let Some(name) = file.cache_location {
+        config.cache_location = CacheLocation::from_name(&name)
+            .ok_or_else(|| invalid("cache_location", "expected `project` or `user-cache`"))?;
+    }
+    if config.min_lines == 0 {
+        return Err(invalid("min_lines", "must be at least 1"));
+    }
+    if config.min_occurrences == 0 {
+        return Err(invalid("min_occurrences", "must be at least 1"));
+    }
+    if config.max_bucket == 0 {
+        return Err(invalid("max_bucket", "must be at least 1"));
+    }
+    if config.seed_window == 0 {
+        return Err(invalid("seed_window", "must be at least 1"));
+    }
+    if config.max_file_bytes == 0 {
+        return Err(invalid("max_file_bytes", "must be at least 1"));
+    }
+    if config.max_file_bytes > u32::MAX as u64 {
+        return Err(invalid(
+            "max_file_bytes",
+            "exceeds the 4 GiB token-offset limit",
+        ));
+    }
+    Ok(())
+}
+
 impl Config {
-    /// Load the project config by searching for `dup-detector.toml` from `root`
-    /// upwards to the filesystem root.
+    /// Load the effective configuration for `root`: built-in defaults,
+    /// overridden by the user-level config file, overridden by the nearest
+    /// project-level `dup-detector.toml`.
     ///
-    /// Returns `Ok(None)` when no config file is found. `root` may be a file, in
-    /// which case the search starts at its parent directory.
+    /// Returns `Ok(None)` when neither config file exists. `root` may be a file,
+    /// in which case the project search starts at its parent directory.
     pub fn load(root: impl AsRef<Path>) -> Result<Option<Self>, ConfigError> {
-        let Some(path) = find_config_file(root.as_ref()) else {
-            return Ok(None);
-        };
-        Self::load_from_file(&path).map(Some)
+        Self::load_layered(root, user_config_path().as_deref())
     }
 
-    /// Like [`Config::load`], but also returns the config file's path so
-    /// long-running servers can watch it for changes.
-    pub fn load_with_source(
+    /// Like [`Config::load`], but with an explicit user-level config path.
+    pub fn load_layered(
         root: impl AsRef<Path>,
-    ) -> Result<Option<(Self, PathBuf)>, ConfigError> {
-        let Some(path) = find_config_file(root.as_ref()) else {
+        user: Option<&Path>,
+    ) -> Result<Option<Self>, ConfigError> {
+        let user = user.filter(|path| path.is_file());
+        let project = find_config_file(root.as_ref());
+        if user.is_none() && project.is_none() {
             return Ok(None);
-        };
-        let config = Self::load_from_file(&path)?;
-        Ok(Some((config, path)))
+        }
+        let mut config = Self::default();
+        if let Some(path) = user {
+            apply_file_config(&mut config, read_file_config(path)?, path)?;
+        }
+        if let Some(path) = project {
+            apply_file_config(&mut config, read_file_config(&path)?, &path)?;
+        }
+        Ok(Some(config))
     }
 
-    /// Find the nearest `dup-detector.toml` for `root` without reading it.
-    pub fn source_path(root: impl AsRef<Path>) -> Option<PathBuf> {
-        find_config_file(root.as_ref())
+    /// Existing config files for `root`, in increasing priority: the user-level
+    /// file first, then the nearest project-level file.
+    pub fn source_paths(root: impl AsRef<Path>) -> Vec<PathBuf> {
+        source_paths_layered(root.as_ref(), user_config_path().as_deref())
+    }
+
+    /// [`Config::source_paths`] paired with each file's mtime, so long-running
+    /// servers can cheaply detect created, removed and edited config files.
+    pub fn source_stamps(root: impl AsRef<Path>) -> Vec<(PathBuf, Option<SystemTime>)> {
+        Self::source_paths(root)
+            .into_iter()
+            .map(|path| {
+                let mtime = std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|meta| meta.modified().ok());
+                (path, mtime)
+            })
+            .collect()
     }
 
     pub fn load_from_file(path: &Path) -> Result<Self, ConfigError> {
-        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        Self::from_toml(&text, path)
+        let file = read_file_config(path)?;
+        let mut config = Self::default();
+        apply_file_config(&mut config, file, path)?;
+        Ok(config)
     }
 
     pub fn load_or_default(root: impl AsRef<Path>) -> Result<Self, ConfigError> {
@@ -164,74 +323,7 @@ impl Config {
             source,
         })?;
         let mut config = Self::default();
-        if let Some(value) = file.min_lines {
-            config.min_lines = value;
-        }
-        if let Some(value) = file.min_occurrences {
-            config.min_occurrences = value;
-        }
-        if let Some(value) = file.max_bucket {
-            config.max_bucket = value;
-        }
-        if let Some(value) = file.seed_window {
-            config.seed_window = value;
-        }
-        if let Some(value) = file.max_groups {
-            config.max_groups = Some(value);
-        }
-        if let Some(value) = file.parameterize_literals {
-            config.parameterize_literals = value;
-        }
-        if let Some(value) = file.max_file_bytes {
-            config.max_file_bytes = value;
-        }
-        if let Some(value) = file.include_hidden {
-            config.include_hidden = value;
-        }
-        if let Some(value) = file.no_ignore {
-            config.no_ignore = value;
-        }
-        if let Some(value) = file.filter_boilerplate {
-            config.filter_boilerplate = value;
-        }
-        if let Some(names) = file.languages {
-            let mut languages = Vec::with_capacity(names.len());
-            for name in names {
-                let language =
-                    LanguageId::from_name(&name).ok_or_else(|| ConfigError::UnknownLanguage {
-                        path: path.to_path_buf(),
-                        name: name.clone(),
-                    })?;
-                languages.push(language);
-            }
-            config.languages = languages;
-        }
-        let invalid = |key: &'static str, message: &str| ConfigError::InvalidValue {
-            path: path.to_path_buf(),
-            key,
-            message: message.to_string(),
-        };
-        if config.min_lines == 0 {
-            return Err(invalid("min_lines", "must be at least 1"));
-        }
-        if config.min_occurrences == 0 {
-            return Err(invalid("min_occurrences", "must be at least 1"));
-        }
-        if config.max_bucket == 0 {
-            return Err(invalid("max_bucket", "must be at least 1"));
-        }
-        if config.seed_window == 0 {
-            return Err(invalid("seed_window", "must be at least 1"));
-        }
-        if config.max_file_bytes == 0 {
-            return Err(invalid("max_file_bytes", "must be at least 1"));
-        }
-        if config.max_file_bytes > u32::MAX as u64 {
-            return Err(invalid(
-                "max_file_bytes",
-                "exceeds the 4 GiB token-offset limit",
-            ));
-        }
+        apply_file_config(&mut config, file, path)?;
         Ok(config)
     }
 
@@ -291,6 +383,14 @@ mod tests {
 
     use super::*;
 
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("dup-detector-config-{name}-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn parses_full_config() {
         let text = r#"
@@ -305,6 +405,7 @@ mod tests {
             include_hidden = true
             max_file_bytes = 1048576
             filter_boilerplate = false
+            cache_location = "user-cache"
         "#;
         let config = Config::from_toml(text, Path::new(CONFIG_FILE_NAME)).unwrap();
         assert_eq!(
@@ -321,24 +422,96 @@ mod tests {
                 include_hidden: true,
                 max_file_bytes: 1048576,
                 filter_boilerplate: false,
+                cache_location: CacheLocation::UserCache,
                 types: None,
             }
         );
     }
 
     #[test]
-    fn load_with_source_reports_config_path() {
-        let dir =
-            std::env::temp_dir().join(format!("dup-detector-config-source-{}", std::process::id()));
+    fn parses_cache_location() {
+        let user = Config::from_toml(
+            "cache_location = \"user-cache\"\n",
+            Path::new(CONFIG_FILE_NAME),
+        )
+        .unwrap();
+        assert_eq!(user.cache_location, CacheLocation::UserCache);
+        let project = Config::from_toml(
+            "cache_location = \"project\"\n",
+            Path::new(CONFIG_FILE_NAME),
+        )
+        .unwrap();
+        assert_eq!(project.cache_location, CacheLocation::Project);
+        let error = Config::from_toml(
+            "cache_location = \"elsewhere\"\n",
+            Path::new(CONFIG_FILE_NAME),
+        );
+        assert!(
+            matches!(
+                error,
+                Err(ConfigError::InvalidValue {
+                    key: "cache_location",
+                    ..
+                })
+            ),
+            "unknown cache location must be rejected"
+        );
+    }
+
+    #[test]
+    fn project_config_overrides_user_config() {
+        let dir = temp_dir("layered");
+        let project = dir.join("project");
+        let user = dir.join("user");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&user).unwrap();
+        let user_config = user.join(CONFIG_FILE_NAME);
+        fs::write(
+            &user_config,
+            "min_lines = 9\nmax_bucket = 64\ncache_location = \"user-cache\"\n",
+        )
+        .unwrap();
+        let project_config = project.join(CONFIG_FILE_NAME);
+        fs::write(&project_config, "min_lines = 4\n").unwrap();
+        let config = Config::load_layered(&project, Some(&user_config))
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.min_lines, 4, "project config wins");
+        assert_eq!(
+            config.max_bucket, 64,
+            "user config fills the remaining keys"
+        );
+        assert_eq!(config.cache_location, CacheLocation::UserCache);
+        assert_eq!(
+            source_paths_layered(&project, Some(&user_config)),
+            vec![user_config, project_config]
+        );
         fs::remove_dir_all(&dir).ok();
-        fs::create_dir_all(&dir).unwrap();
-        assert_eq!(Config::source_path(&dir), None);
-        let path = dir.join(CONFIG_FILE_NAME);
-        fs::write(&path, "min_lines = 11\n").unwrap();
-        assert_eq!(Config::source_path(&dir), Some(path.clone()));
-        let (config, source) = Config::load_with_source(&dir).unwrap().unwrap();
-        assert_eq!(source, path);
-        assert_eq!(config.min_lines, 11);
+    }
+
+    #[test]
+    fn user_config_applies_without_project_config() {
+        let dir = temp_dir("user-only");
+        let user = dir.join("user");
+        fs::create_dir_all(&user).unwrap();
+        let user_config = user.join(CONFIG_FILE_NAME);
+        fs::write(&user_config, "min_lines = 3\n").unwrap();
+        let config = Config::load_layered(&dir, Some(&user_config))
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.min_lines, 3);
+        assert_eq!(config.min_occurrences, Config::default().min_occurrences);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ignored_missing_user_config() {
+        let dir = temp_dir("user-missing");
+        let user_config = dir.join("nope.toml");
+        assert_eq!(
+            Config::load_layered(&dir, Some(&user_config)).unwrap(),
+            None
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -434,39 +607,37 @@ mod tests {
 
     #[test]
     fn missing_file_yields_none() {
-        let dir = std::env::temp_dir().join(format!("dup-detector-config-{}", std::process::id()));
-        fs::remove_dir_all(&dir).ok();
-        fs::create_dir_all(&dir).unwrap();
-        assert_eq!(Config::load(&dir).unwrap(), None);
-        assert_eq!(Config::load_or_default(&dir).unwrap(), Config::default());
+        let dir = temp_dir("none");
+        assert_eq!(Config::load_layered(&dir, None).unwrap(), None);
+        assert_eq!(
+            Config::load_layered(&dir, None)
+                .unwrap()
+                .unwrap_or_default(),
+            Config::default()
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn loads_from_project_root() {
-        let dir =
-            std::env::temp_dir().join(format!("dup-detector-config-root-{}", std::process::id()));
-        fs::remove_dir_all(&dir).ok();
-        fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("root");
         fs::write(dir.join(CONFIG_FILE_NAME), "min_lines = 7\n").unwrap();
-        let config = Config::load(&dir).unwrap().unwrap();
+        let config = Config::load_layered(&dir, None).unwrap().unwrap();
         assert_eq!(config.min_lines, 7);
-        let from_file = Config::load(dir.join("src.rs")).unwrap().unwrap();
+        let from_file = Config::load_layered(dir.join("src.rs"), None)
+            .unwrap()
+            .unwrap();
         assert_eq!(from_file.min_lines, 7);
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn finds_config_in_ancestor_directory() {
-        let dir = std::env::temp_dir().join(format!(
-            "dup-detector-config-ancestor-{}",
-            std::process::id()
-        ));
-        fs::remove_dir_all(&dir).ok();
+        let dir = temp_dir("ancestor");
         let nested = dir.join("src").join("nested");
         fs::create_dir_all(&nested).unwrap();
         fs::write(dir.join(CONFIG_FILE_NAME), "min_lines = 9\n").unwrap();
-        let config = Config::load(&nested).unwrap().unwrap();
+        let config = Config::load_layered(&nested, None).unwrap().unwrap();
         assert_eq!(config.min_lines, 9);
         fs::remove_dir_all(&dir).ok();
     }

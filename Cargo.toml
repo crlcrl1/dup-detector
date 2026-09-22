@@ -8,6 +8,7 @@ license = "Apache-2.0"
 anyhow = "1.0.104"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 clap = { version = "4.6.7", features = ["derive"] }
+dirs = "7.0.0"
 ignore = "0.4.33"
 memmap2 = "0.9.11"
 rayon = "1.12.0"

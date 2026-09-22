@@ -21,14 +21,16 @@ Register the release binary with your MCP client. Example configuration:
 ```
 
 The server keeps an in-memory index per workspace root and refreshes it
-incrementally by file mtime/size. Each root's `dup-detector.toml` supplies its
-configuration, falling back to the server's startup directory. Parsed token
-streams are also cached in the `.dup-detector/` directory at the scanned root,
-one entry per source file named by a hash of its root-relative path (validated
-by mtime, size and a text hash), so new processes only reparse changed files and
-only changed entries are rewritten; use `reindex` to clear the directory. Add
-`.dup-detector/` to `.gitignore` if you don't want it tracked. All logs go to
-stderr so the stdio protocol stays clean.
+incrementally by file mtime/size. Each root merges its `dup-detector.toml` with
+the user-level config, falling back to the server's startup directory. Parsed
+token streams are also cached, one entry per source file named by a hash of its
+root-relative path (validated by mtime, size and a text hash), so new processes
+only reparse changed files and only changed entries are rewritten. By default
+the cache lives in `.dup-detector/` at the scanned root; `cache_location =
+"user-cache"` moves it under the platform user cache directory instead (see
+[Configuration](configuration.md)). Use `reindex` to clear it, and add
+`.dup-detector/` to `.gitignore` if you keep the default location and don't want
+it tracked. All logs go to stderr so the stdio protocol stays clean.
 
 ## Tools
 
