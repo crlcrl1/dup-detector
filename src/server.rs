@@ -64,6 +64,62 @@ fn evict_least_recently_used(indexes: &mut HashMap<PathBuf, CachedIndex>) {
     }
 }
 
+fn run_with_index<T, F>(state: &ServerState, scope: &str, f: F) -> Result<T, String>
+where
+    F: FnOnce(&SourceIndex, &Config) -> T,
+{
+    let root = Path::new(scope)
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve scope `{scope}`: {e}"))?;
+    let holder = {
+        let mut indexes = state
+            .indexes
+            .lock()
+            .map_err(|_| "index lock poisoned".to_string())?;
+        if indexes.len() >= MAX_CACHED_INDEXES && !indexes.contains_key(&root) {
+            evict_least_recently_used(&mut indexes);
+        }
+        match indexes.entry(root.clone()) {
+            Entry::Occupied(mut entry) => {
+                let cached = entry.get_mut();
+                cached.last_used = Instant::now();
+                reload_config(state, &root, cached)?;
+                cached.index.clone()
+            }
+            Entry::Vacant(entry) => {
+                let config = match Config::load(&root).map_err(|e| e.to_string())? {
+                    Some(config) => config,
+                    None => state.default_config.clone(),
+                };
+                let index = SourceIndex::build(&root, &config)
+                    .map_err(|e| format!("failed to index: {e}"))?;
+                let config_sources = Config::source_stamps(&root);
+                entry
+                    .insert(CachedIndex {
+                        index: Arc::new(RwLock::new(index)),
+                        config_sources,
+                        last_used: Instant::now(),
+                    })
+                    .index
+                    .clone()
+            }
+        }
+    };
+    {
+        // Refresh briefly under the write lock; detection below runs
+        // under the read lock so concurrent tool calls parallelize.
+        let mut index = holder
+            .write()
+            .map_err(|_| "index lock poisoned".to_string())?;
+        index.refresh();
+    }
+    let index = holder
+        .read()
+        .map_err(|_| "index lock poisoned".to_string())?;
+    let config = index.config().clone();
+    Ok(f(&index, &config))
+}
+
 impl CloneServer {
     pub fn new(default_config: Config) -> Self {
         Self {
@@ -81,60 +137,9 @@ impl CloneServer {
     {
         let scope = scope.unwrap_or(".").to_string();
         let state = self.state.clone();
-        tokio::task::spawn_blocking(move || {
-            let root = Path::new(&scope)
-                .canonicalize()
-                .map_err(|e| format!("cannot resolve scope `{scope}`: {e}"))?;
-            let holder = {
-                let mut indexes = state
-                    .indexes
-                    .lock()
-                    .map_err(|_| "index lock poisoned".to_string())?;
-                if indexes.len() >= MAX_CACHED_INDEXES && !indexes.contains_key(&root) {
-                    evict_least_recently_used(&mut indexes);
-                }
-                match indexes.entry(root.clone()) {
-                    Entry::Occupied(mut entry) => {
-                        let cached = entry.get_mut();
-                        cached.last_used = Instant::now();
-                        reload_config(&state, &root, cached)?;
-                        cached.index.clone()
-                    }
-                    Entry::Vacant(entry) => {
-                        let config = match Config::load(&root).map_err(|e| e.to_string())? {
-                            Some(config) => config,
-                            None => state.default_config.clone(),
-                        };
-                        let index = SourceIndex::build(&root, &config)
-                            .map_err(|e| format!("failed to index: {e}"))?;
-                        let config_sources = Config::source_stamps(&root);
-                        entry
-                            .insert(CachedIndex {
-                                index: Arc::new(RwLock::new(index)),
-                                config_sources,
-                                last_used: Instant::now(),
-                            })
-                            .index
-                            .clone()
-                    }
-                }
-            };
-            {
-                // Refresh briefly under the write lock; detection below runs
-                // under the read lock so concurrent tool calls parallelize.
-                let mut index = holder
-                    .write()
-                    .map_err(|_| "index lock poisoned".to_string())?;
-                index.refresh();
-            }
-            let index = holder
-                .read()
-                .map_err(|_| "index lock poisoned".to_string())?;
-            let config = index.config().clone();
-            Ok(f(&index, &config))
-        })
-        .await
-        .map_err(|e| format!("scan task panicked: {e}"))?
+        tokio::task::spawn_blocking(move || run_with_index(&state, &scope, f))
+            .await
+            .map_err(|e| format!("scan task panicked: {e}"))?
     }
 }
 
@@ -317,6 +322,134 @@ fn line_span(file: &SourceFile, start: usize, end: usize) -> usize {
     last.saturating_sub(first) + 1
 }
 
+fn find_clones_in_index(
+    index: &SourceIndex,
+    config: &Config,
+    params: FindClonesParams,
+) -> Result<ScanResponse, String> {
+    let mut cfg = config
+        .clone()
+        .with_limits(params.min_lines, params.min_occurrences, params.max_groups)
+        .map_err(|e| e.to_string())?;
+    if let Some(v) = params.parameterize_literals {
+        cfg.parameterize_literals = v;
+    }
+    cfg.types = params.types;
+    let groups = index.find_clones(&cfg);
+    Ok(ScanResponse::from_groups(index, groups))
+}
+
+fn find_clones_in_file_from_index(
+    index: &SourceIndex,
+    config: &Config,
+    params: FindClonesInFileParams,
+) -> Result<ScanResponse, String> {
+    let resolved = resolve_file(index.root(), &params.file).ok_or_else(|| {
+        format!(
+            "cannot resolve file `{}` under `{}`",
+            params.file,
+            index.root().display()
+        )
+    })?;
+    let file_index = index.file_by_path(&resolved).ok_or_else(|| {
+        format!(
+            "`{}` is not a supported source file in the project",
+            params.file
+        )
+    })?;
+    let mut cfg = config
+        .clone()
+        .with_limits(params.min_lines, params.min_occurrences, params.max_groups)
+        .map_err(|e| e.to_string())?;
+    cfg.types = params.types;
+    let file = &index.files()[file_index];
+    let allowed = crate::detect::span_window_signatures(file, 0, file.tokens.len(), &cfg);
+    let files: Vec<&SourceFile> = index.files().iter().collect();
+    let groups: Vec<CloneGroup> = crate::detect::detect_filtered(&files, &cfg, Some(&allowed))
+        .into_iter()
+        .filter(|g| g.occurrences.iter().any(|o| o.file as usize == file_index))
+        .collect();
+    Ok(ScanResponse::from_groups(index, groups))
+}
+
+fn find_clones_for_region_in_index(
+    index: &SourceIndex,
+    config: &Config,
+    params: FindClonesForRegionParams,
+) -> Result<ScanResponse, String> {
+    if params.start_line == 0 {
+        return Err("`start_line` is 1-based and must be at least 1".to_string());
+    }
+    if params.end_line < params.start_line {
+        return Err(format!(
+            "`end_line` ({}) must be >= `start_line` ({})",
+            params.end_line, params.start_line
+        ));
+    }
+    let resolved = resolve_file(index.root(), &params.file).ok_or_else(|| {
+        format!(
+            "cannot resolve file `{}` under `{}`",
+            params.file,
+            index.root().display()
+        )
+    })?;
+    let parsed;
+    let files: Vec<&SourceFile>;
+    let (file, file_idx) = if let Some(i) = index.file_by_path(&resolved) {
+        files = index.files().iter().collect();
+        (files[i], i)
+    } else {
+        let language = LanguageId::from_path(&resolved)
+            .ok_or_else(|| format!("unsupported file type: `{}`", params.file))?;
+        if !config.language_enabled(language) {
+            return Err(format!(
+                "language `{language}` is disabled by configuration"
+            ));
+        }
+        parsed = parse_file(&resolved, language, config.max_file_bytes)
+            .ok_or_else(|| format!("cannot read or parse `{}`", params.file))?;
+        files = index
+            .files()
+            .iter()
+            .chain(std::iter::once(&parsed))
+            .collect();
+        let idx = files.len() - 1;
+        (files[idx], idx)
+    };
+    let Some((span_start, span_end)) =
+        token_span_for_lines(file, params.start_line, params.end_line)
+    else {
+        return Ok(ScanResponse {
+            files_scanned: files.len(),
+            groups: Vec::new(),
+        });
+    };
+    let region_lines = line_span(file, span_start, span_end);
+    let min_lines = params
+        .min_lines
+        .unwrap_or(config.min_lines.min(region_lines));
+    let mut cfg = config
+        .clone()
+        .with_limits(Some(min_lines), None, params.max_groups)
+        .map_err(|e| e.to_string())?;
+    cfg.types = params.types;
+    let allowed = crate::detect::span_window_signatures(file, span_start, span_end, &cfg);
+    let groups: Vec<CloneGroup> = crate::detect::detect_filtered(&files, &cfg, Some(&allowed))
+        .into_iter()
+        .filter(|g| {
+            g.occurrences.iter().any(|o| {
+                o.file as usize == file_idx
+                    && o.start < span_end as u32
+                    && o.end > span_start as u32
+            })
+        })
+        .collect();
+    Ok(ScanResponse {
+        files_scanned: files.len(),
+        groups: groups.iter().map(|g| to_dto(&files, g)).collect(),
+    })
+}
+
 #[tool_router(server_handler)]
 impl CloneServer {
     #[tool(
@@ -328,21 +461,9 @@ impl CloneServer {
     ) -> Result<Json<ScanResponse>, String> {
         let scope = params.scope.clone();
         let response = self
-            .with_index(
-                scope.as_deref(),
-                move |index, config| -> Result<ScanResponse, String> {
-                    let mut cfg = config
-                        .clone()
-                        .with_limits(params.min_lines, params.min_occurrences, params.max_groups)
-                        .map_err(|e| e.to_string())?;
-                    if let Some(v) = params.parameterize_literals {
-                        cfg.parameterize_literals = v;
-                    }
-                    cfg.types = params.types;
-                    let groups = index.find_clones(&cfg);
-                    Ok(ScanResponse::from_groups(index, groups))
-                },
-            )
+            .with_index(scope.as_deref(), move |index, config| {
+                find_clones_in_index(index, config, params)
+            })
             .await?;
         Ok(Json(response?))
     }
@@ -356,39 +477,9 @@ impl CloneServer {
     ) -> Result<Json<ScanResponse>, String> {
         let scope = params.scope.clone();
         let response = self
-            .with_index(
-                scope.as_deref(),
-                move |index, config| -> Result<ScanResponse, String> {
-                    let resolved = resolve_file(index.root(), &params.file).ok_or_else(|| {
-                        format!(
-                            "cannot resolve file `{}` under `{}`",
-                            params.file,
-                            index.root().display()
-                        )
-                    })?;
-                    let file_index = index.file_by_path(&resolved).ok_or_else(|| {
-                        format!(
-                            "`{}` is not a supported source file in the project",
-                            params.file
-                        )
-                    })?;
-                    let mut cfg = config
-                        .clone()
-                        .with_limits(params.min_lines, params.min_occurrences, params.max_groups)
-                        .map_err(|e| e.to_string())?;
-                    cfg.types = params.types;
-                    let file = &index.files()[file_index];
-                    let allowed =
-                        crate::detect::span_window_signatures(file, 0, file.tokens.len(), &cfg);
-                    let files: Vec<&SourceFile> = index.files().iter().collect();
-                    let groups: Vec<CloneGroup> =
-                        crate::detect::detect_filtered(&files, &cfg, Some(&allowed))
-                            .into_iter()
-                            .filter(|g| g.occurrences.iter().any(|o| o.file as usize == file_index))
-                            .collect();
-                    Ok(ScanResponse::from_groups(index, groups))
-                },
-            )
+            .with_index(scope.as_deref(), move |index, config| {
+                find_clones_in_file_from_index(index, config, params)
+            })
             .await?;
         Ok(Json(response?))
     }
@@ -402,84 +493,9 @@ impl CloneServer {
     ) -> Result<Json<ScanResponse>, String> {
         let scope = params.scope.clone();
         let response = self
-            .with_index(
-                scope.as_deref(),
-                move |index, config| -> Result<ScanResponse, String> {
-                    if params.start_line == 0 {
-                        return Err("`start_line` is 1-based and must be at least 1".to_string());
-                    }
-                    if params.end_line < params.start_line {
-                        return Err(format!(
-                            "`end_line` ({}) must be >= `start_line` ({})",
-                            params.end_line, params.start_line
-                        ));
-                    }
-                    let resolved = resolve_file(index.root(), &params.file).ok_or_else(|| {
-                        format!(
-                            "cannot resolve file `{}` under `{}`",
-                            params.file,
-                            index.root().display()
-                        )
-                    })?;
-                    let parsed;
-                    let files: Vec<&SourceFile>;
-                    let (file, file_idx) = if let Some(i) = index.file_by_path(&resolved) {
-                        files = index.files().iter().collect();
-                        (files[i], i)
-                    } else {
-                        let language = LanguageId::from_path(&resolved)
-                            .ok_or_else(|| format!("unsupported file type: `{}`", params.file))?;
-                        if !config.language_enabled(language) {
-                            return Err(format!(
-                                "language `{language}` is disabled by configuration"
-                            ));
-                        }
-                        parsed = parse_file(&resolved, language, config.max_file_bytes)
-                            .ok_or_else(|| format!("cannot read or parse `{}`", params.file))?;
-                        files = index
-                            .files()
-                            .iter()
-                            .chain(std::iter::once(&parsed))
-                            .collect();
-                        let idx = files.len() - 1;
-                        (files[idx], idx)
-                    };
-                    let Some((span_start, span_end)) =
-                        token_span_for_lines(file, params.start_line, params.end_line)
-                    else {
-                        return Ok(ScanResponse {
-                            files_scanned: files.len(),
-                            groups: Vec::new(),
-                        });
-                    };
-                    let region_lines = line_span(file, span_start, span_end);
-                    let min_lines = params
-                        .min_lines
-                        .unwrap_or(config.min_lines.min(region_lines));
-                    let mut cfg = config
-                        .clone()
-                        .with_limits(Some(min_lines), None, params.max_groups)
-                        .map_err(|e| e.to_string())?;
-                    cfg.types = params.types;
-                    let allowed =
-                        crate::detect::span_window_signatures(file, span_start, span_end, &cfg);
-                    let groups: Vec<CloneGroup> =
-                        crate::detect::detect_filtered(&files, &cfg, Some(&allowed))
-                            .into_iter()
-                            .filter(|g| {
-                                g.occurrences.iter().any(|o| {
-                                    o.file as usize == file_idx
-                                        && o.start < span_end as u32
-                                        && o.end > span_start as u32
-                                })
-                            })
-                            .collect();
-                    Ok(ScanResponse {
-                        files_scanned: files.len(),
-                        groups: groups.iter().map(|g| to_dto(&files, g)).collect(),
-                    })
-                },
-            )
+            .with_index(scope.as_deref(), move |index, config| {
+                find_clones_for_region_in_index(index, config, params)
+            })
             .await?;
         Ok(Json(response?))
     }
