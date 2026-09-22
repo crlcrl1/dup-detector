@@ -27,7 +27,26 @@
 
 Rust、Python、JavaScript、TypeScript、TSX、C++（`.rs`、`.py`/`.pyi`、`.js`/`.mjs`/`.cjs`/`.jsx`、`.ts`/`.mts`/`.cts`、`.tsx`、`.cpp`/`.cc`/`.cxx`/`.c++`/`.hpp`/`.hh`/`.hxx`/`.h++`/`.h`/`.ipp`/`.inl`/`.tpp`）。
 
-## 构建
+## 下载
+
+从 [GitHub Releases](https://github.com/crlcrl1/dup-detector/releases) 下载适合平台的压缩包，解压后将 `dup-detector`（Windows 下为 `dup-detector.exe`）放入 `PATH` 包含的目录。
+
+| 平台 | 架构 | Release 附件 |
+| --- | --- | --- |
+| Linux（GNU，在 Ubuntu 22.04 上构建） | x86_64 | `dup-detector-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux（GNU，在 Ubuntu 22.04 上构建） | ARM64 | `dup-detector-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS | Intel | `dup-detector-x86_64-apple-darwin.tar.gz` |
+| macOS | Apple Silicon | `dup-detector-aarch64-apple-darwin.tar.gz` |
+| Windows | x86_64 | `dup-detector-x86_64-pc-windows-msvc.zip` |
+| Windows | ARM64 | `dup-detector-aarch64-pc-windows-msvc.zip` |
+
+每个压缩包包含二进制、许可证和中英文 README。`SHA256SUMS` 列出所有压缩包的 SHA-256 校验值。在 Linux 上，将该文件和下载的压缩包放在同一目录，执行 `sha256sum --check --ignore-missing SHA256SUMS` 即可校验。
+
+发布正式版或预发布版 Release 时，[发布工作流](.github/workflows/release.yml) 会使用 Rust 1.98.1 和 `Cargo.lock`，为六个平台编译该标签对应的源码，检查各二进制能否启动并扫描示例，待全部构建成功后上传压缩包和校验文件。发布标签中需要包含该工作流。仅创建草稿或推送标签不会触发构建，需要发布 Release。
+
+若要重新构建已有 Release，在 **Actions → Release binaries → Run workflow** 中填写 `tag`。手动运行入口要求默认分支中已有该工作流；运行时会检出填写的标签，并覆盖 Release 中的同名附件。上传使用 GitHub 内置的 `GITHUB_TOKEN`，无需额外配置 secret。
+
+## 从源码构建
 
 需要 Rust 1.98+（edition 2024）。
 

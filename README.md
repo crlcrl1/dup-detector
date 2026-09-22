@@ -27,7 +27,26 @@ Unlike text/regex based tools, `dup-detector` works on the **token stream produc
 
 Rust, Python, JavaScript, TypeScript, TSX, C++ (`.rs`, `.py`/`.pyi`, `.js`/`.mjs`/`.cjs`/`.jsx`, `.ts`/`.mts`/`.cts`, `.tsx`, `.cpp`/`.cc`/`.cxx`/`.c++`/`.hpp`/`.hh`/`.hxx`/`.h++`/`.h`/`.ipp`/`.inl`/`.tpp`).
 
-## Build
+## Download
+
+Download the archive for your platform from [GitHub Releases](https://github.com/crlcrl1/dup-detector/releases), extract it, and place `dup-detector` (or `dup-detector.exe` on Windows) in a directory on your `PATH`.
+
+| Platform | Architecture | Release asset |
+| --- | --- | --- |
+| Linux (GNU, built on Ubuntu 22.04) | x86_64 | `dup-detector-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux (GNU, built on Ubuntu 22.04) | ARM64 | `dup-detector-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS | Intel | `dup-detector-x86_64-apple-darwin.tar.gz` |
+| macOS | Apple Silicon | `dup-detector-aarch64-apple-darwin.tar.gz` |
+| Windows | x86_64 | `dup-detector-x86_64-pc-windows-msvc.zip` |
+| Windows | ARM64 | `dup-detector-aarch64-pc-windows-msvc.zip` |
+
+Each archive includes the binary, license, and READMEs. `SHA256SUMS` contains the SHA-256 checksum of every archive. On Linux, place it alongside the downloaded archives and run `sha256sum --check --ignore-missing SHA256SUMS`.
+
+Publishing a release or prerelease runs the [release workflow](.github/workflows/release.yml), which builds the tagged source with Rust 1.98.1 and `Cargo.lock` on all six platforms, checks that each binary starts and scans a sample, and uploads the archives and checksums once every build succeeds. Include the workflow in the release tag. Only publishing the release triggers this workflow; creating a draft or pushing a tag alone does not.
+
+To rebuild an existing release, open **Actions → Release binaries → Run workflow** and enter its tag in the `tag` field. The manual workflow must be present on the default branch; it checks out the supplied tag and replaces assets with the same names. Uploads use the built-in `GITHUB_TOKEN`; no additional secret is needed.
+
+## Build from source
 
 Requires Rust 1.98+ (edition 2024).
 
