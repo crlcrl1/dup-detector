@@ -35,16 +35,31 @@ pub struct BuildStats {
     pub parsed_files: usize,
 }
 
-/// Metadata recorded when a file was skipped (unreadable, oversized, or
-/// unparseable); `None` means the metadata itself could not be read. Used to
-/// keep the refresh fast path valid and to avoid re-attempting unchanged
-/// skipped files.
-type SkipRecord = Option<(Option<SystemTime>, u64)>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipReason {
+    /// Stable: the file exceeds `max_file_bytes`, so retrying is pointless.
+    Oversized,
+    /// Transient: stat/read/tokenize failed; retried on every refresh so a
+    /// permission fix or a transient I/O error is picked up without reindex.
+    Unreadable,
+}
 
-fn current_skip_record(path: &Path) -> SkipRecord {
-    fs::metadata(path)
-        .ok()
-        .map(|meta| (meta.modified().ok(), meta.len()))
+/// Metadata recorded when a file was skipped, used to keep the refresh fast
+/// path valid and to avoid re-attempting unchanged oversized files.
+type SkipRecord = (SkipReason, Option<SystemTime>, u64);
+
+fn current_skip_record(path: &Path, max_file_bytes: u64) -> SkipRecord {
+    match fs::metadata(path) {
+        Ok(meta) => {
+            let reason = if meta.len() > max_file_bytes {
+                SkipReason::Oversized
+            } else {
+                SkipReason::Unreadable
+            };
+            (reason, meta.modified().ok(), meta.len())
+        }
+        Err(_) => (SkipReason::Unreadable, None, 0),
+    }
 }
 
 pub struct SourceIndex {
@@ -115,7 +130,10 @@ impl SourceIndex {
         let mut skipped: HashMap<PathBuf, SkipRecord> = HashMap::new();
         for (index, slot) in slots.iter().enumerate() {
             if slot.is_none() {
-                skipped.insert(paths[index].0.clone(), current_skip_record(&paths[index].0));
+                skipped.insert(
+                    paths[index].0.clone(),
+                    current_skip_record(&paths[index].0, max_file_bytes),
+                );
             }
         }
         let files: Vec<SourceFile> = slots.into_iter().flatten().collect();
@@ -150,6 +168,7 @@ impl SourceIndex {
                 return Vec::new();
             }
         };
+        let max_file_bytes = self.config.max_file_bytes;
         if paths.len() == self.files.len() + self.skipped.len()
             && paths.par_iter().all(|(path, _)| {
                 if let Some(&slot) = self.by_path.get(path) {
@@ -158,7 +177,10 @@ impl SourceIndex {
                         file.modified == meta.modified().ok() && file.size == meta.len()
                     })
                 } else if let Some(record) = self.skipped.get(path) {
-                    *record == current_skip_record(path)
+                    // Only oversized files are stable enough to skip forever;
+                    // everything else takes the slow path so it is retried.
+                    record.0 == SkipReason::Oversized
+                        && *record == current_skip_record(path, max_file_bytes)
                 } else {
                     false
                 }
@@ -191,10 +213,12 @@ impl SourceIndex {
                 slots.push(existing);
                 continue;
             }
-            // A file skipped on a previous pass whose metadata is unchanged is
-            // not re-attempted and not reported as changed.
+            // An oversized file whose metadata is unchanged is not
+            // re-attempted; unreadable files always fall through so they are
+            // retried.
             if let Some(record) = self.skipped.get(path)
-                && *record == current_skip_record(path)
+                && record.0 == SkipReason::Oversized
+                && *record == current_skip_record(path, max_file_bytes)
             {
                 skipped.insert(path.clone(), *record);
                 slots.push(None);
@@ -206,7 +230,6 @@ impl SourceIndex {
         }
         let root = &self.root;
         let cache_dir = &self.cache_dir;
-        let max_file_bytes = self.config.max_file_bytes;
         let parsed: Vec<(Option<SourceFile>, bool)> = misses
             .par_iter()
             .map(|&index| {
@@ -250,7 +273,7 @@ impl SourceIndex {
             }
         }
         for path in &failed {
-            skipped.insert(path.clone(), current_skip_record(path));
+            skipped.insert(path.clone(), current_skip_record(path, max_file_bytes));
         }
         changed.extend(old.into_keys());
         self.files = slots.into_iter().flatten().collect();
@@ -365,14 +388,29 @@ fn file_from_cache(
 
 #[cfg(unix)]
 fn mapped_text(path: &Path, expected_size: u64) -> Option<crate::model::Text> {
-    let file = fs::File::open(path).ok()?;
-    if file.metadata().ok()?.len() != expected_size {
-        return None;
+    // Mapping a file that is concurrently truncated raises SIGBUS on access,
+    // so only return a mapping whose metadata stayed stable across the map;
+    // otherwise fall back to the owned read path, which narrows the window to
+    // a truncation that lands after the final stat.
+    for _ in 0..2 {
+        let before = fs::metadata(path).ok()?;
+        if before.len() != expected_size {
+            return None;
+        }
+        let file = fs::File::open(path).ok()?;
+        if file.metadata().ok()?.len() != expected_size {
+            continue;
+        }
+        // SAFETY: the mapping is read-only; the source file is replaced (not
+        // truncated) by editors and build tools, so existing mappings stay
+        // valid. The post-map stability check below narrows the window.
+        let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+        let after = fs::metadata(path).ok()?;
+        if after.len() == expected_size && after.modified().ok() == before.modified().ok() {
+            return crate::model::Text::mapped(Arc::new(map));
+        }
     }
-    // SAFETY: the mapping is read-only; the source file is replaced (not
-    // truncated) by editors and build tools, so existing mappings stay valid.
-    let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
-    crate::model::Text::mapped(Arc::new(map))
+    None
 }
 
 #[cfg(not(unix))]
@@ -630,6 +668,33 @@ mod tests {
         let changed = index.refresh();
         assert!(changed.contains(&large));
         assert_eq!(index.files().len(), 2);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_files_are_retried_after_permission_fix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("unreadable-retry");
+        let path = dir.join("a.rs");
+        fs::write(&path, "fn a() { let x = 1; }\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_to_string(&path).is_ok() {
+            // Running as root: permission bits are not enforced, skip.
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            fs::remove_dir_all(&dir).ok();
+            return;
+        }
+        let mut index = SourceIndex::build_with_cache(&dir, &Config::default(), None).unwrap();
+        assert!(index.files().is_empty());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let changed = index.refresh();
+        assert!(
+            changed.contains(&path),
+            "permission fix must be picked up without a reindex"
+        );
+        assert_eq!(index.files().len(), 1);
         fs::remove_dir_all(&dir).ok();
     }
 

@@ -69,7 +69,7 @@ impl LanguageId {
         match name.to_ascii_lowercase().as_str() {
             "rust" | "rs" => Some(LanguageId::Rust),
             "python" | "py" => Some(LanguageId::Python),
-            "javascript" | "js" => Some(LanguageId::JavaScript),
+            "javascript" | "js" | "jsx" => Some(LanguageId::JavaScript),
             "typescript" | "ts" => Some(LanguageId::TypeScript),
             "tsx" => Some(LanguageId::Tsx),
             "cpp" | "c++" | "cxx" => Some(LanguageId::Cpp),

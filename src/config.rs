@@ -20,6 +20,9 @@ pub struct Config {
     pub no_ignore: bool,
     pub include_hidden: bool,
     pub max_file_bytes: u64,
+    /// Drop clone groups whose occurrences look like pure declarations
+    /// (imports, struct fields, ...) with no logic markers.
+    pub filter_boilerplate: bool,
     /// Per-request clone type filter; applied during detection so that
     /// `max_groups` truncation happens after filtering. Not settable from the
     /// config file.
@@ -39,6 +42,7 @@ impl Default for Config {
             no_ignore: false,
             include_hidden: false,
             max_file_bytes: 2 * 1024 * 1024,
+            filter_boilerplate: true,
             types: None,
         }
     }
@@ -81,6 +85,7 @@ struct FileConfig {
     no_ignore: Option<bool>,
     include_hidden: Option<bool>,
     max_file_bytes: Option<u64>,
+    filter_boilerplate: Option<bool>,
 }
 
 fn find_config_file(root: &Path) -> Option<PathBuf> {
@@ -118,15 +123,35 @@ impl Config {
     /// Returns `Ok(None)` when no config file is found. `root` may be a file, in
     /// which case the search starts at its parent directory.
     pub fn load(root: impl AsRef<Path>) -> Result<Option<Self>, ConfigError> {
-        let root = root.as_ref();
-        let Some(path) = find_config_file(root) else {
+        let Some(path) = find_config_file(root.as_ref()) else {
             return Ok(None);
         };
-        let text = std::fs::read_to_string(&path).map_err(|source| ConfigError::Io {
-            path: path.clone(),
+        Self::load_from_file(&path).map(Some)
+    }
+
+    /// Like [`Config::load`], but also returns the config file's path so
+    /// long-running servers can watch it for changes.
+    pub fn load_with_source(
+        root: impl AsRef<Path>,
+    ) -> Result<Option<(Self, PathBuf)>, ConfigError> {
+        let Some(path) = find_config_file(root.as_ref()) else {
+            return Ok(None);
+        };
+        let config = Self::load_from_file(&path)?;
+        Ok(Some((config, path)))
+    }
+
+    /// Find the nearest `dup-detector.toml` for `root` without reading it.
+    pub fn source_path(root: impl AsRef<Path>) -> Option<PathBuf> {
+        find_config_file(root.as_ref())
+    }
+
+    pub fn load_from_file(path: &Path) -> Result<Self, ConfigError> {
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
+            path: path.to_path_buf(),
             source,
         })?;
-        Self::from_toml(&text, &path).map(Some)
+        Self::from_toml(&text, path)
     }
 
     pub fn load_or_default(root: impl AsRef<Path>) -> Result<Self, ConfigError> {
@@ -165,6 +190,9 @@ impl Config {
         }
         if let Some(value) = file.no_ignore {
             config.no_ignore = value;
+        }
+        if let Some(value) = file.filter_boilerplate {
+            config.filter_boilerplate = value;
         }
         if let Some(names) = file.languages {
             let mut languages = Vec::with_capacity(names.len());
@@ -276,6 +304,7 @@ mod tests {
             no_ignore = true
             include_hidden = true
             max_file_bytes = 1048576
+            filter_boilerplate = false
         "#;
         let config = Config::from_toml(text, Path::new(CONFIG_FILE_NAME)).unwrap();
         assert_eq!(
@@ -291,9 +320,26 @@ mod tests {
                 no_ignore: true,
                 include_hidden: true,
                 max_file_bytes: 1048576,
+                filter_boilerplate: false,
                 types: None,
             }
         );
+    }
+
+    #[test]
+    fn load_with_source_reports_config_path() {
+        let dir =
+            std::env::temp_dir().join(format!("dup-detector-config-source-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        assert_eq!(Config::source_path(&dir), None);
+        let path = dir.join(CONFIG_FILE_NAME);
+        fs::write(&path, "min_lines = 11\n").unwrap();
+        assert_eq!(Config::source_path(&dir), Some(path.clone()));
+        let (config, source) = Config::load_with_source(&dir).unwrap().unwrap();
+        assert_eq!(source, path);
+        assert_eq!(config.min_lines, 11);
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

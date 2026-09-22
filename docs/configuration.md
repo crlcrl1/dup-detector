@@ -5,9 +5,10 @@
 Configuration is per project: put a `dup-detector.toml` at the project root. It
 is read at startup by searching upwards from the scanned path for `scan`, and
 from the server's working directory and each `scope` root for the MCP server, so
-scanning a subdirectory still finds the project config. Command-line flags and
-MCP tool parameters override the file. Every key is optional and falls back to
-the default.
+scanning a subdirectory still finds the project config. The `mcp` and `lsp`
+servers also watch the file and reload it when it changes, rebuilding the
+affected index. Command-line flags and MCP tool parameters override the file.
+Every key is optional and falls back to the default.
 
 ```toml
 # dup-detector.toml
@@ -21,6 +22,7 @@ languages = ["rust", "python", "javascript", "typescript", "tsx", "cpp"]
 no_ignore = false         # also scan files excluded by .gitignore/.ignore rules
 include_hidden = false    # also scan dot-directories like .github (off by default)
 max_file_bytes = 2097152   # skip files larger than 2 MiB
+filter_boilerplate = true  # drop clones that are pure declarations without logic
 ```
 
 | Key                     | Default | Meaning                                                            |
@@ -35,6 +37,7 @@ max_file_bytes = 2097152   # skip files larger than 2 MiB
 | `no_ignore`             | `false` | Also scan files excluded by `.gitignore`/`.ignore` rules           |
 | `include_hidden`        | `false` | Also scan hidden (dot) directories, e.g. `.github`                 |
 | `max_file_bytes`        | `2097152` | Files larger than this are skipped (bounds parse memory)         |
+| `filter_boilerplate`    | `true`  | Drop clone groups that are pure declarations without logic markers |
 
 Unknown keys and unknown language names are reported as errors. Degenerate values
 (`0` for `min_lines`, `min_occurrences`, `max_bucket`, `seed_window` or `max_file_bytes`,

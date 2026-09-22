@@ -4,8 +4,9 @@
 
 配置以项目为单位：在项目根目录放置 `dup-detector.toml`。启动时从被扫描路径向上查找
 该文件（`scan`），MCP 服务器则从其工作目录以及每个 `scope` 根目录向上查找，因此扫描
-子目录时也能找到项目配置。命令行参数与 MCP 工具参数会覆盖配置文件。所有键均可选，
-缺省时使用默认值。
+子目录时也能找到项目配置。`mcp` 与 `lsp` 服务器还会监视该文件，发生变化时自动重载并
+重建受影响的索引。命令行参数与 MCP 工具参数会覆盖配置文件。所有键均可选，缺省时使用
+默认值。
 
 ```toml
 # dup-detector.toml
@@ -19,6 +20,7 @@ languages = ["rust", "python", "javascript", "typescript", "tsx", "cpp"]
 no_ignore = false         # 同时扫描被 .gitignore/.ignore 排除的文件
 include_hidden = false    # 同时扫描 .github 等点目录（默认关闭）
 max_file_bytes = 2097152   # 超过 2 MiB 的文件跳过
+filter_boilerplate = true  # 丢弃无逻辑标记的纯声明类克隆
 ```
 
 | 键                      | 默认值  | 说明                                       |
@@ -33,6 +35,7 @@ max_file_bytes = 2097152   # 超过 2 MiB 的文件跳过
 | `no_ignore`             | `false` | 同时扫描被 `.gitignore`/`.ignore` 排除的文件 |
 | `include_hidden`        | `false` | 同时扫描隐藏（点）目录，如 `.github`       |
 | `max_file_bytes`        | `2097152` | 超过该大小的文件跳过（限制解析内存）          |
+| `filter_boilerplate`    | `true`  | 丢弃无逻辑标记的纯声明类克隆组             |
 
 未知的键和未知的语言名会报错。退化取值（`min_lines`、`min_occurrences`、`max_bucket`、
 `seed_window`、`max_file_bytes` 为 `0`，或 `max_file_bytes` 超过 4 GiB）也会被拒绝。

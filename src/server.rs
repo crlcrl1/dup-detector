@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Instant, SystemTime};
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::schemars::JsonSchema;
@@ -17,9 +20,58 @@ pub struct CloneServer {
     state: Arc<ServerState>,
 }
 
+const MAX_CACHED_INDEXES: usize = 8;
+
+struct CachedIndex {
+    index: Arc<RwLock<SourceIndex>>,
+    config_path: Option<PathBuf>,
+    config_mtime: Option<SystemTime>,
+    last_used: Instant,
+}
+
 struct ServerState {
     default_config: Config,
-    indexes: Mutex<HashMap<PathBuf, Arc<RwLock<SourceIndex>>>>,
+    indexes: Mutex<HashMap<PathBuf, CachedIndex>>,
+}
+
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+}
+
+/// Rebuilds the index when the project config file appears, disappears, or
+/// changes, so a long-running server picks up `dup-detector.toml` edits.
+fn reload_config(state: &ServerState, root: &Path, cached: &mut CachedIndex) -> Result<(), String> {
+    let source = Config::source_path(root);
+    let mtime = source.as_deref().and_then(file_mtime);
+    if source == cached.config_path && mtime == cached.config_mtime {
+        return Ok(());
+    }
+    let config = match &source {
+        Some(path) => Config::load_from_file(path).map_err(|error| error.to_string())?,
+        None => state.default_config.clone(),
+    };
+    let mut index = cached
+        .index
+        .write()
+        .map_err(|_| "index lock poisoned".to_string())?;
+    *index = SourceIndex::build(root, &config).map_err(|e| format!("failed to index: {e}"))?;
+    drop(index);
+    cached.config_path = source;
+    cached.config_mtime = mtime;
+    tracing::info!(root = %root.display(), "configuration reloaded");
+    Ok(())
+}
+
+fn evict_least_recently_used(indexes: &mut HashMap<PathBuf, CachedIndex>) {
+    let oldest = indexes
+        .iter()
+        .min_by_key(|(_, cached)| cached.last_used)
+        .map(|(path, _)| path.clone());
+    if let Some(path) = oldest {
+        indexes.remove(&path);
+    }
 }
 
 impl CloneServer {
@@ -48,18 +100,33 @@ impl CloneServer {
                     .indexes
                     .lock()
                     .map_err(|_| "index lock poisoned".to_string())?;
-                match indexes.entry(root) {
-                    std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        let key = entry.key().clone();
-                        let config = Config::load(&key)
-                            .map_err(|e| e.to_string())?
-                            .unwrap_or_else(|| state.default_config.clone());
+                if indexes.len() >= MAX_CACHED_INDEXES && !indexes.contains_key(&root) {
+                    evict_least_recently_used(&mut indexes);
+                }
+                match indexes.entry(root.clone()) {
+                    Entry::Occupied(mut entry) => {
+                        let cached = entry.get_mut();
+                        cached.last_used = Instant::now();
+                        reload_config(&state, &root, cached)?;
+                        cached.index.clone()
+                    }
+                    Entry::Vacant(entry) => {
+                        let (config, config_path) =
+                            match Config::load_with_source(&root).map_err(|e| e.to_string())? {
+                                Some((config, path)) => (config, Some(path)),
+                                None => (state.default_config.clone(), None),
+                            };
+                        let index = SourceIndex::build(&root, &config)
+                            .map_err(|e| format!("failed to index: {e}"))?;
+                        let config_mtime = config_path.as_deref().and_then(file_mtime);
                         entry
-                            .insert(Arc::new(RwLock::new(
-                                SourceIndex::build(&key, &config)
-                                    .map_err(|e| format!("failed to index: {e}"))?,
-                            )))
+                            .insert(CachedIndex {
+                                index: Arc::new(RwLock::new(index)),
+                                config_path,
+                                config_mtime,
+                                last_used: Instant::now(),
+                            })
+                            .index
                             .clone()
                     }
                 }
@@ -417,7 +484,11 @@ impl CloneServer {
                 .indexes
                 .lock()
                 .map_err(|_| "index lock poisoned".to_string())?;
-            indexes.remove(&root);
+            if let Some(cached) = indexes.remove(&root) {
+                // Wait for in-flight detections on the dropped index, otherwise
+                // they could write cache entries after the directory is cleared.
+                drop(cached.index.write());
+            }
             SourceIndex::clear_cache(&root);
             Ok(Json(ReindexResponse { ok: true }))
         })

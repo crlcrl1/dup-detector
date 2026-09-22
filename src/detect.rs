@@ -361,6 +361,7 @@ pub fn span_window_signatures(
 
 const COVER_NONE: u32 = u32::MAX;
 const COVER_INDEX_MIN_CANDIDATES: usize = 4096;
+const COMPLETE_RANGES_MAX_TOKENS: usize = 4096;
 
 #[derive(Default)]
 struct CoverIndex {
@@ -808,6 +809,9 @@ fn cluster(
         .into_iter()
         .flatten()
         .collect();
+    // Refined groups are disjoint by construction (classes and units do not
+    // overlap), but merging any that share an occurrence keeps the output
+    // well-formed if refinement ever starts overlapping.
     let mut dsu = Dsu::new(refined_groups.len());
     let mut seen_occurrence: FastMap<Occurrence, usize> = FastMap::default();
     for (index, group) in refined_groups.iter().enumerate() {
@@ -847,7 +851,7 @@ fn cluster(
         if line_count < config.min_lines {
             continue;
         }
-        if is_boilerplate(files, &merged) {
+        if config.filter_boilerplate && is_boilerplate(files, &merged) {
             continue;
         }
         let clone_type = classify_type(files, &merged);
@@ -1228,7 +1232,14 @@ fn complete_ranges(
         return;
     }
     let len = end - start;
-    if len > 4096 {
+    // The search below is quadratic in the span length, so oversized
+    // representatives are skipped; log instead of dropping them silently.
+    if len > COMPLETE_RANGES_MAX_TOKENS {
+        tracing::debug!(
+            len,
+            max = COMPLETE_RANGES_MAX_TOKENS,
+            "skipping complete-span search for oversized representative"
+        );
         return;
     }
     scratch.depth.clear();
@@ -1445,9 +1456,12 @@ fn classify_type(files: &[&SourceFile], occurrences: &[Occurrence]) -> CloneType
         let file_b = files[occ.file as usize];
         let tokens_b = &file_b.tokens[occ.start as usize..occ.end as usize];
         let text_b = &file_b.text;
-        for i in 0..tokens_a.len() {
-            if text_a[tokens_a[i].start as usize..tokens_a[i].end as usize]
-                != text_b[tokens_b[i].start as usize..tokens_b[i].end as usize]
+        if tokens_a.len() != tokens_b.len() {
+            return CloneType::Type2;
+        }
+        for (token_a, token_b) in tokens_a.iter().zip(tokens_b) {
+            if text_a[token_a.start as usize..token_a.end as usize]
+                != text_b[token_b.start as usize..token_b.end as usize]
             {
                 return CloneType::Type2;
             }
@@ -2092,6 +2106,24 @@ use anyhow::Result;
             "pub struct Beta { pub left: i32, pub right: i32, pub extra: i32 }",
         );
         assert!(detect(&[&a, &b], &config()).is_empty());
+        assert!(detect(&[&a, &b], &fine_config()).is_empty());
+    }
+
+    #[test]
+    fn boilerplate_filter_can_be_disabled() {
+        let a = file(
+            "a.rs",
+            "pub struct Alpha { pub first: i32, pub second: i32, pub third: i32 }",
+        );
+        let b = file(
+            "b.rs",
+            "pub struct Beta { pub left: i32, pub right: i32, pub extra: i32 }",
+        );
+        let cfg = Config {
+            filter_boilerplate: false,
+            ..fine_config()
+        };
+        assert_eq!(detect(&[&a, &b], &cfg).len(), 1);
     }
 
     #[test]

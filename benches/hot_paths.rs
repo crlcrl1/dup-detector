@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 
 use dup_detector::cache;
 use dup_detector::config::Config;
@@ -58,6 +59,134 @@ fn big_rust_file() -> (String, Vec<Token>, Vec<u64>) {
     let tokens = tokenize::tokenize(&text, LanguageId::Rust).unwrap();
     let hashes = encode::token_hashes(&text, &tokens);
     (text, tokens, hashes)
+}
+
+const TEXT_SYNC_TARGET_BYTES: usize = 1 << 20;
+const TEXT_SYNC_EDIT_CYCLES: usize = 24;
+const TEXT_SYNC_INSERTED: &str = "let value = 42;\n";
+
+fn text_sync_base() -> String {
+    let text = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/detect.rs"))
+        .expect("detect.rs must be readable");
+    let mut base = String::with_capacity(TEXT_SYNC_TARGET_BYTES + text.len());
+    while base.len() < TEXT_SYNC_TARGET_BYTES {
+        base.push_str(&text);
+    }
+    base
+}
+
+fn text_sync_change(
+    start: (u32, u32),
+    end: (u32, u32),
+    text: &str,
+) -> TextDocumentContentChangeEvent {
+    TextDocumentContentChangeEvent {
+        range: Some(Range {
+            start: Position {
+                line: start.0,
+                character: start.1,
+            },
+            end: Position {
+                line: end.0,
+                character: end.1,
+            },
+        }),
+        range_length: None,
+        text: text.to_string(),
+    }
+}
+
+/// Alternates "insert a line / delete its body" near the end of the file, so
+/// each edit sits a realistic distance from the document start.
+fn text_sync_changes(base: &str) -> Vec<TextDocumentContentChangeEvent> {
+    let body_len = (TEXT_SYNC_INSERTED.len() - 1) as u32;
+    let lines = base.bytes().filter(|&byte| byte == b'\n').count() as u32;
+    let line = lines.saturating_sub(2);
+    let mut changes = Vec::with_capacity(TEXT_SYNC_EDIT_CYCLES * 2);
+    for _ in 0..TEXT_SYNC_EDIT_CYCLES {
+        changes.push(text_sync_change((line, 0), (line, 0), TEXT_SYNC_INSERTED));
+        changes.push(text_sync_change((line, 0), (line, body_len), ""));
+    }
+    changes
+}
+
+/// The pre-refactor offset lookup: scan from the document start for every
+/// position. Kept as the reference the incremental line-start path replaced.
+fn position_to_byte_rescan(text: &str, position: Position) -> usize {
+    let mut line = 0u32;
+    let mut line_start = 0usize;
+    if position.line > 0 {
+        for (index, byte) in text.bytes().enumerate() {
+            if byte == b'\n' {
+                line += 1;
+                line_start = index + 1;
+                if line == position.line {
+                    break;
+                }
+            }
+        }
+    }
+    let mut utf16 = 0u32;
+    let mut offset = line_start;
+    for character in text[line_start..].chars() {
+        if utf16 >= position.character || character == '\n' {
+            break;
+        }
+        utf16 += character.len_utf16() as u32;
+        offset += character.len_utf8();
+    }
+    offset
+}
+
+fn apply_content_changes_rescan(
+    text: &mut String,
+    changes: &[TextDocumentContentChangeEvent],
+) -> Vec<(usize, usize, usize)> {
+    let mut edits = Vec::new();
+    for change in changes {
+        let Some(range) = &change.range else {
+            continue;
+        };
+        let start = position_to_byte_rescan(text, range.start);
+        let end = position_to_byte_rescan(text, range.end);
+        if start <= end && end <= text.len() {
+            text.replace_range(start..end, &change.text);
+            edits.push((start, end, start + change.text.len()));
+        }
+    }
+    edits
+}
+
+fn bench_text_sync(c: &mut Criterion) {
+    let base = text_sync_base();
+    let changes = text_sync_changes(&base);
+
+    // Both implementations must produce identical documents before measuring.
+    let mut incremental = base.clone();
+    let edits = dup_detector::lsp::apply_content_changes(&mut incremental, &changes);
+    assert_eq!(edits.len(), changes.len());
+    let mut reference = base.clone();
+    apply_content_changes_rescan(&mut reference, &changes);
+    assert_eq!(incremental, reference, "reference must match incremental");
+
+    let mut group = c.benchmark_group("text_sync");
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_secs(1));
+    group.bench_function("incremental", |b| {
+        b.iter_batched(
+            || base.clone(),
+            |mut text| dup_detector::lsp::apply_content_changes(&mut text, &changes),
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function("rescan_reference", |b| {
+        b.iter_batched(
+            || base.clone(),
+            |mut text| apply_content_changes_rescan(&mut text, &changes),
+            BatchSize::LargeInput,
+        );
+    });
+    group.finish();
 }
 
 fn bench_encode(c: &mut Criterion) {
@@ -173,6 +302,6 @@ fn bench_index(c: &mut Criterion) {
 criterion_group!(
     name = hot_paths;
     config = Criterion::default();
-    targets = bench_encode, bench_detect, bench_index
+    targets = bench_encode, bench_detect, bench_index, bench_text_sync
 );
 criterion_main!(hot_paths);

@@ -2,8 +2,8 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::Notify;
 use tower_lsp::jsonrpc::Result as LspResult;
@@ -113,7 +113,9 @@ fn rebase_and_record(ranges: &mut Vec<(usize, usize)>, edits: &[(usize, usize, u
 
 struct State {
     root: PathBuf,
-    config: Config,
+    config: RwLock<Config>,
+    config_path: Mutex<Option<PathBuf>>,
+    config_mtime: Mutex<Option<SystemTime>>,
     documents: Mutex<HashMap<PathBuf, Arc<Document>>>,
     update_lock: Mutex<()>,
     index: Mutex<Option<SourceIndex>>,
@@ -125,9 +127,13 @@ struct State {
 
 impl State {
     fn new(root: PathBuf, config: Config) -> Self {
+        let config_path = Config::source_path(&root);
+        let config_mtime = config_path.as_deref().and_then(file_mtime);
         Self {
             root,
-            config,
+            config: RwLock::new(config),
+            config_path: Mutex::new(config_path),
+            config_mtime: Mutex::new(config_mtime),
             documents: Mutex::new(HashMap::new()),
             update_lock: Mutex::new(()),
             index: Mutex::new(None),
@@ -138,10 +144,71 @@ impl State {
         }
     }
 
+    /// Re-reads the project config when its file appears, disappears, or
+    /// changes, dropping the index so the next analysis rebuilds it.
+    fn reload_config(&self) -> bool {
+        let source = Config::source_path(&self.root);
+        let mtime = source.as_deref().and_then(file_mtime);
+        let stored_path = self
+            .config_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stored_mtime = self
+            .config_mtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if source == *stored_path && mtime == *stored_mtime {
+            return false;
+        }
+        drop(stored_path);
+        drop(stored_mtime);
+        let config = match &source {
+            Some(path) => match Config::load_from_file(path) {
+                Ok(config) => config,
+                Err(error) => {
+                    tracing::warn!(error = %error, "cannot reload config; keeping the previous one");
+                    return false;
+                }
+            },
+            None => Config::default(),
+        };
+        *self
+            .config
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = config;
+        *self
+            .config_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = source;
+        *self
+            .config_mtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = mtime;
+        *self
+            .index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        tracing::info!(root = %self.root.display(), "configuration reloaded");
+        true
+    }
+
+    fn config(&self) -> Config {
+        self.config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     fn bump(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.notify.notify_one();
     }
+}
+
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
 }
 
 impl std::fmt::Debug for State {
@@ -249,14 +316,20 @@ impl Backend {
             return Self::open_document(state, uri, path, language, text);
         };
         let mut text = existing.file.text.as_str().to_string();
+        let mut starts = build_line_starts(&text);
         let mut edits: Vec<(usize, usize, usize)> = Vec::new();
         let mut whole = false;
         for change in &changes {
-            if apply_change(&mut text, change, &mut edits) {
+            if apply_change(&mut text, &mut starts, change, &mut edits) {
                 whole = true;
             }
         }
-        if text.len() as u64 > state.config.max_file_bytes {
+        let max_file_bytes = state
+            .config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .max_file_bytes;
+        if text.len() as u64 > max_file_bytes {
             tracing::debug!(path = %path.display(), size = text.len(), "skipping large file");
             trace(&format!(
                 "did_change drop large {} bytes={}",
@@ -344,7 +417,16 @@ impl Backend {
             tracing::debug!(uri = %uri, "ignoring file outside the workspace root");
             return None;
         }
-        if text.len() as u64 > state.config.max_file_bytes {
+        let max_file_bytes = state
+            .config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .max_file_bytes;
+        if !state.config().language_enabled(language) {
+            tracing::debug!(uri = %uri, "ignoring file of a disabled language");
+            return None;
+        }
+        if text.len() as u64 > max_file_bytes {
             tracing::debug!(uri = %uri, size = text.len(), "skipping large file");
             trace(&format!(
                 "open skip large {} bytes={}",
@@ -698,6 +780,7 @@ fn spawn_analysis(client: Client, state: Arc<State>) {
 }
 
 fn analyze(state: &State) -> anyhow::Result<Option<Analysis>> {
+    let reloaded = state.reload_config();
     let documents: Vec<Arc<Document>> = match state.documents.lock() {
         Ok(guard) => guard.values().cloned().collect(),
         Err(poisoned) => poisoned.into_inner().values().cloned().collect(),
@@ -706,7 +789,8 @@ fn analyze(state: &State) -> anyhow::Result<Option<Analysis>> {
         return Ok(None);
     }
 
-    let config = &state.config;
+    let config = state.config();
+    let config = &config;
     let previous = match state.snapshot.lock() {
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
@@ -752,6 +836,13 @@ fn analyze(state: &State) -> anyhow::Result<Option<Analysis>> {
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if reloaded {
+            // A config change invalidates the previous seeds; re-seed every
+            // open document so the next detection is a full one over them.
+            for doc in &documents {
+                live.mark_whole(doc.path.clone());
+            }
+        }
         for path in external {
             live.mark_whole(path);
         }
@@ -771,7 +862,9 @@ fn analyze(state: &State) -> anyhow::Result<Option<Analysis>> {
 
     let overlay: HashMap<PathBuf, Arc<SourceFile>> = documents
         .iter()
-        .filter(|doc| doc.path.starts_with(&state.root))
+        .filter(|doc| {
+            doc.path.starts_with(&state.root) && config.language_enabled(doc.file.language)
+        })
         .map(|doc| (doc.path.clone(), doc.file.clone()))
         .collect();
 
@@ -843,7 +936,7 @@ fn analyze(state: &State) -> anyhow::Result<Option<Analysis>> {
         let occurrences: Vec<NavOccurrence> = group
             .occurrences
             .iter()
-            .map(|occ| nav_occurrence(&files, occ, &mut lines))
+            .filter_map(|occ| nav_occurrence(&files, occ, &mut lines))
             .collect();
         if !occurrences
             .iter()
@@ -935,22 +1028,22 @@ fn nav_occurrence(
     files: &[&SourceFile],
     occurrence: &Occurrence,
     lines: &mut HashMap<PathBuf, Vec<usize>>,
-) -> NavOccurrence {
+) -> Option<NavOccurrence> {
     let file = files[occurrence.file as usize];
+    let uri = Url::from_file_path(&file.path).ok()?;
     let starts = lines
         .entry(file.path.clone())
         .or_insert_with(|| build_line_starts(&file.text));
     let start_byte = file.tokens[occurrence.start as usize].start as usize;
     let end_byte = file.tokens[(occurrence.end - 1) as usize].end as usize;
-    NavOccurrence {
+    Some(NavOccurrence {
         path: file.path.clone(),
-        uri: Url::from_file_path(&file.path)
-            .unwrap_or_else(|_| Url::parse("file:///").expect("static file url must parse")),
+        uri,
         range: Range {
             start: byte_to_position(&file.text, starts, start_byte),
             end: byte_to_position(&file.text, starts, end_byte),
         },
-    }
+    })
 }
 
 fn clone_type_label(clone_type: CloneType) -> &'static str {
@@ -1008,23 +1101,15 @@ fn byte_to_position(text: &str, line_starts: &[usize], byte: usize) -> Position 
     }
 }
 
-fn position_to_byte(text: &str, position: Position) -> usize {
-    let mut line = 0u32;
-    let mut line_start = 0usize;
-    if position.line > 0 {
-        for (index, byte) in text.bytes().enumerate() {
-            if byte == b'\n' {
-                line += 1;
-                line_start = index + 1;
-                if line == position.line {
-                    break;
-                }
-            }
-        }
-    }
+fn position_to_byte(text: &str, line_starts: &[usize], position: Position) -> usize {
+    let line = position.line as usize;
+    let Some(&line_start) = line_starts.get(line) else {
+        return text.len();
+    };
+    let line_end = line_starts.get(line + 1).copied().unwrap_or(text.len());
     let mut utf16 = 0u32;
     let mut offset = line_start;
-    for character in text[line_start..].chars() {
+    for character in text[line_start..line_end].chars() {
         if utf16 >= position.character || character == '\n' {
             break;
         }
@@ -1036,15 +1121,17 @@ fn position_to_byte(text: &str, position: Position) -> usize {
 
 fn apply_change(
     text: &mut String,
+    starts: &mut Vec<usize>,
     change: &TextDocumentContentChangeEvent,
     edits: &mut Vec<(usize, usize, usize)>,
 ) -> bool {
     match &change.range {
         Some(range) => {
-            let start = position_to_byte(text, range.start);
-            let end = position_to_byte(text, range.end);
+            let start = position_to_byte(text, starts, range.start);
+            let end = position_to_byte(text, starts, range.end);
             if start <= end && end <= text.len() {
                 text.replace_range(start..end, &change.text);
+                splice_line_starts(starts, start, end, &change.text);
                 edits.push((start, end, start + change.text.len()));
             } else {
                 // Skipping a change silently desyncs server text from the
@@ -1060,8 +1147,49 @@ fn apply_change(
         }
         None => {
             *text = change.text.clone();
+            *starts = build_line_starts(text);
             edits.clear();
             true
+        }
+    }
+}
+
+/// Applies a batch of LSP content changes to `text`, keeping the line-start
+/// index in sync incrementally. Exposed so benchmarks can drive the exact code
+/// path the language server uses for `didChange`.
+#[doc(hidden)]
+pub fn apply_content_changes(
+    text: &mut String,
+    changes: &[TextDocumentContentChangeEvent],
+) -> Vec<(usize, usize, usize)> {
+    let mut starts = build_line_starts(text);
+    let mut edits = Vec::new();
+    for change in changes {
+        apply_change(text, &mut starts, change, &mut edits);
+    }
+    edits
+}
+
+/// Keeps `starts` in sync with `text` after `text[start..end]` was replaced by
+/// `replacement`, without rescanning the whole text.
+fn splice_line_starts(starts: &mut Vec<usize>, start: usize, end: usize, replacement: &str) {
+    let delta = replacement.len() as i64 - (end - start) as i64;
+    let head = starts.partition_point(|&line| line <= start);
+    // A start exactly at `end` belongs to the boundary line, whose leading
+    // newline was replaced; it is re-added below only if the replacement ends
+    // with a newline (the empty replacement collapses it into `start`).
+    let tail = starts.partition_point(|&line| line <= end);
+    if tail > head {
+        starts.drain(head..tail);
+    }
+    for line in &mut starts[head..] {
+        *line = (*line as i64 + delta).max(0) as usize;
+    }
+    let mut inserted = 0usize;
+    for (offset, byte) in replacement.bytes().enumerate() {
+        if byte == b'\n' {
+            starts.insert(head + inserted, start + offset + 1);
+            inserted += 1;
         }
     }
 }
@@ -1110,7 +1238,7 @@ mod tests {
                 character: 3
             }
         );
-        assert_eq!(position_to_byte(text, position), 12);
+        assert_eq!(position_to_byte(text, &starts, position), 12);
     }
 
     #[test]
@@ -1142,11 +1270,95 @@ mod tests {
             range_length: None,
             text: " let x = 1;".to_string(),
         };
+        let mut starts = build_line_starts(&text);
         let mut edits = Vec::new();
-        let whole = apply_change(&mut text, &change, &mut edits);
+        let whole = apply_change(&mut text, &mut starts, &change, &mut edits);
         assert!(!whole);
         assert_eq!(text, "fn main() { let x = 1;}\n");
         assert_eq!(edits, vec![(11, 11, 22)]);
+        assert_eq!(starts, build_line_starts(&text));
+    }
+
+    #[test]
+    fn line_starts_stay_in_sync_with_edits() {
+        fn ranged(
+            start: (u32, u32),
+            end: (u32, u32),
+            text: &str,
+        ) -> TextDocumentContentChangeEvent {
+            TextDocumentContentChangeEvent {
+                range: Some(Range {
+                    start: Position {
+                        line: start.0,
+                        character: start.1,
+                    },
+                    end: Position {
+                        line: end.0,
+                        character: end.1,
+                    },
+                }),
+                range_length: None,
+                text: text.to_string(),
+            }
+        }
+
+        let mut text = "fn a() {\n    let x = 1;\n}\n".to_string();
+        let mut starts = build_line_starts(&text);
+        let mut edits = Vec::new();
+        let changes = [
+            ranged((1, 4), (1, 4), "let y = 2;\n    "),
+            ranged((0, 0), (0, 2), "fn"),
+            ranged((2, 0), (3, 0), ""),
+            ranged((1, 4), (2, 0), ""),
+            ranged((1, 4), (1, 4), "x = 1;\n"),
+        ];
+        for change in &changes {
+            assert!(!apply_change(&mut text, &mut starts, change, &mut edits));
+            assert_eq!(starts, build_line_starts(&text), "after {change:?}");
+            assert_eq!(
+                position_to_byte(
+                    &text,
+                    &starts,
+                    Position {
+                        line: 0,
+                        character: 0
+                    }
+                ),
+                0
+            );
+        }
+        let whole = TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: "a\nb\nc\n".to_string(),
+        };
+        assert!(apply_change(&mut text, &mut starts, &whole, &mut edits));
+        assert_eq!(text, "a\nb\nc\n");
+        assert_eq!(starts, build_line_starts(&text));
+    }
+
+    #[test]
+    fn open_document_ignores_disabled_languages() {
+        let dir =
+            std::env::temp_dir().join(format!("dup-detector-lsp-disabled-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.canonicalize().unwrap();
+        let config = Config {
+            languages: vec![LanguageId::Rust],
+            ..Config::default()
+        };
+        let state = State::new(root.clone(), config);
+        let path = root.join("a.py");
+        let text = "def f():\n    return 1\n";
+        std::fs::write(&path, text).unwrap();
+        let uri = Url::from_file_path(&path).unwrap();
+        assert_eq!(
+            Backend::open_document(&state, uri, path, LanguageId::Python, text.to_string()),
+            None
+        );
+        assert!(state.documents.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn source_file(text: &str) -> SourceFile {
@@ -1300,8 +1512,15 @@ mod tests {
     /// restricted to groups touching open documents — the reference the
     /// incremental snapshot must equal.
     fn full_keys(state: &State) -> Vec<Vec<(PathBuf, u32, u32)>> {
-        let documents: Vec<Arc<Document>> =
-            state.documents.lock().unwrap().values().cloned().collect();
+        let config = state.config();
+        let documents: Vec<Arc<Document>> = state
+            .documents
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|doc| config.language_enabled(doc.file.language))
+            .cloned()
+            .collect();
         let open: HashSet<PathBuf> = documents.iter().map(|doc| doc.path.clone()).collect();
         let index_guard = state.index.lock().unwrap();
         let index = index_guard.as_ref().unwrap();
@@ -1313,7 +1532,7 @@ mod tests {
         for doc in &documents {
             files.push(&doc.file);
         }
-        let groups = detect::detect_filtered(&files, &state.config, None);
+        let groups = detect::detect_filtered(&files, &config, None);
         let mut keys: Vec<Vec<(PathBuf, u32, u32)>> = groups
             .iter()
             .filter(|group| {

@@ -117,7 +117,7 @@ static KIND_TABLES: LazyLock<[KindTables; LanguageId::ALL.len()]> =
 
 thread_local! {
     static PARSERS: RefCell<[Option<Parser>; LanguageId::ALL.len()]> = const {
-        RefCell::new([None, None, None, None, None, None])
+        RefCell::new([const { None }; LanguageId::ALL.len()])
     };
 }
 
