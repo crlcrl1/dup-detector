@@ -60,3 +60,26 @@ mtime、大小和文本哈希校验），因此新进程只需重新解析发生
 ```
 
 响应保持精简：仅路径、行号范围、大小与克隆类型，不返回源码片段。
+
+## 给 coding agent 的全局指令示例
+
+agent 只有在被明确要求时才会用到这些工具。把下面这段加入 agent 的
+全局指令文件（如 `AGENTS.md` 或 `CLAUDE.md`），让它在合适的时机主动调用
+dup-detector：
+
+```markdown
+## 重复代码检测（dup-detector MCP）
+
+已配置 `dup-detector` MCP 服务器（工具：`find_clones`、
+`find_clones_in_file`、`find_clones_for_region`、`reindex`）。请主动调用，
+不要等用户点名：
+
+- 新增或重构了较大一段代码后，用 `find_clones_for_region` 检查改动区域，
+  发现重复时告知用户并给出抽取建议。
+- 用户要求查找重复代码、评估重构机会或清理冗余时，先用 `find_clones`
+  扫描项目。
+- 准备抽取公共函数/模块前，用 `find_clones` 找出全部相同或近似的实现位置。
+- 大批量改动后结果疑似过期时，先调用 `reindex`。
+
+响应只包含路径与行号范围（不含源码片段），需要源码时请自行打开文件。
+```

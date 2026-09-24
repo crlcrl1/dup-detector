@@ -67,3 +67,29 @@ it tracked. All logs go to stderr so the stdio protocol stays clean.
 
 Responses are token-efficient: paths, line ranges, size and clone type, with no
 source excerpts.
+
+## Suggested global instruction for coding agents
+
+Agents only benefit from the tools if they are told to use them. Add a block
+like the one below to your agent's global instructions (e.g. `AGENTS.md` or
+`CLAUDE.md`) so it reaches for dup-detector at the right moments:
+
+```markdown
+## Duplicate code detection (dup-detector MCP)
+
+The `dup-detector` MCP server is available (tools `find_clones`,
+`find_clones_in_file`, `find_clones_for_region`, `reindex`). Call it
+proactively — don't wait to be asked:
+
+- After adding or refactoring a substantial chunk of code, check the touched
+  region with `find_clones_for_region` and tell the user about any duplication,
+  suggesting what to extract.
+- When asked to find duplicated code, assess refactoring opportunities, or
+  clean up redundancy, scan the project with `find_clones` first.
+- Before extracting a shared helper, use `find_clones` to locate every matching
+  or near-matching implementation.
+- If results look stale after a large batch of changes, call `reindex` first.
+
+Responses only contain paths and line ranges (no source excerpts); open the
+files yourself when you need the code.
+```
