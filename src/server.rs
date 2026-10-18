@@ -9,6 +9,7 @@ use rmcp::schemars::JsonSchema;
 use rmcp::{Json, tool, tool_router};
 use serde::{Deserialize, Serialize};
 
+use crate::cache;
 use crate::config::Config;
 use crate::index::{SourceIndex, parse_file};
 use crate::language::LanguageId;
@@ -29,6 +30,9 @@ struct CachedIndex {
 
 struct ServerState {
     default_config: Config,
+    /// Canonicalized startup directory; scopes must stay inside it and the
+    /// on-disk cache lives at its `.dup-detector/` regardless of scope.
+    workspace_root: PathBuf,
     indexes: Mutex<HashMap<PathBuf, CachedIndex>>,
 }
 
@@ -47,11 +51,25 @@ fn reload_config(state: &ServerState, root: &Path, cached: &mut CachedIndex) -> 
         .index
         .write()
         .map_err(|_| "index lock poisoned".to_string())?;
-    *index = SourceIndex::build(root, &config).map_err(|e| format!("failed to index: {e}"))?;
+    *index = build_index(state, root, &config)?;
     drop(index);
     cached.config_sources = sources;
     tracing::info!(root = %root.display(), "configuration reloaded");
     Ok(())
+}
+
+/// Builds the index for `root`, keeping the on-disk cache at the workspace
+/// root — keyed by workspace-relative paths — so scopes never create their own
+/// `.dup-detector/` directories and share one cache entry per file.
+fn build_index(state: &ServerState, root: &Path, config: &Config) -> Result<SourceIndex, String> {
+    if root != state.workspace_root {
+        // Versions that cached inside the scope directory left a stray
+        // `.dup-detector/` there; remove it once.
+        let _ = cache::clear(&cache::dir_in(root));
+    }
+    let cache_dir = cache::dir_for(&state.workspace_root, config.cache_location);
+    SourceIndex::build_with_cache_base(root, config, cache_dir.as_deref(), &state.workspace_root)
+        .map_err(|e| format!("failed to index: {e}"))
 }
 
 fn evict_least_recently_used(indexes: &mut HashMap<PathBuf, CachedIndex>) {
@@ -71,6 +89,13 @@ where
     let root = Path::new(scope)
         .canonicalize()
         .map_err(|e| format!("cannot resolve scope `{scope}`: {e}"))?;
+    if !root.starts_with(&state.workspace_root) {
+        return Err(format!(
+            "scope `{}` is outside the working directory `{}`; only the working directory and its subdirectories can be scanned",
+            root.display(),
+            state.workspace_root.display()
+        ));
+    }
     let holder = {
         let mut indexes = state
             .indexes
@@ -91,8 +116,7 @@ where
                     Some(config) => config,
                     None => state.default_config.clone(),
                 };
-                let index = SourceIndex::build(&root, &config)
-                    .map_err(|e| format!("failed to index: {e}"))?;
+                let index = build_index(state, &root, &config)?;
                 let config_sources = Config::source_stamps(&root);
                 entry
                     .insert(CachedIndex {
@@ -121,10 +145,12 @@ where
 }
 
 impl CloneServer {
-    pub fn new(default_config: Config) -> Self {
+    pub fn new(default_config: Config, root: PathBuf) -> Self {
+        let workspace_root = root.canonicalize().unwrap_or(root);
         Self {
             state: Arc::new(ServerState {
                 default_config,
+                workspace_root,
                 indexes: Mutex::new(HashMap::new()),
             }),
         }
@@ -160,7 +186,7 @@ fn nullable_integer_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schem
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindClonesParams {
-    /// Subdirectory to scan; defaults to the current working directory.
+    /// Subdirectory of the current working directory to scan; defaults to the working directory itself. Paths outside the working directory are rejected.
     pub scope: Option<String>,
     /// Minimum number of lines for a clone group (default 7).
     #[schemars(schema_with = "nullable_integer_schema")]
@@ -181,7 +207,7 @@ pub struct FindClonesParams {
 pub struct FindClonesInFileParams {
     /// Path of the file to inspect, relative to the scope or absolute.
     pub file: String,
-    /// Subdirectory to scan; defaults to the current working directory.
+    /// Subdirectory of the current working directory to scan; defaults to the working directory itself. Paths outside the working directory are rejected.
     pub scope: Option<String>,
     /// Minimum number of lines for a clone group (default 7).
     #[schemars(schema_with = "nullable_integer_schema")]
@@ -206,7 +232,7 @@ pub struct FindClonesForRegionParams {
     /// Last line of the region (1-based, inclusive).
     #[schemars(schema_with = "integer_schema")]
     pub end_line: u32,
-    /// Subdirectory to scan; defaults to the current working directory.
+    /// Subdirectory of the current working directory to scan; defaults to the working directory itself. Paths outside the working directory are rejected.
     pub scope: Option<String>,
     /// Minimum number of lines for a clone group; defaults to min(config.min_lines, line span of the region).
     #[schemars(schema_with = "nullable_integer_schema")]
@@ -216,12 +242,6 @@ pub struct FindClonesForRegionParams {
     pub max_groups: Option<usize>,
     /// Restrict results to these clone types: "type-1", "type-2".
     pub types: Option<Vec<CloneType>>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ReindexParams {
-    /// Path whose index should be rebuilt; defaults to the current working directory.
-    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -501,31 +521,116 @@ impl CloneServer {
     }
 
     #[tool(
-        description = "Rebuild the in-memory index for `path` (defaults to the current working directory) and drop its on-disk token cache. The next scan re-indexes that root from scratch."
+        description = "Rebuild the in-memory indexes and drop the on-disk token cache of the current working directory. The next scan re-indexes from scratch."
     )]
-    async fn reindex(
-        &self,
-        Parameters(params): Parameters<ReindexParams>,
-    ) -> Result<Json<ReindexResponse>, String> {
-        let scope = params.path.unwrap_or_else(|| ".".to_string());
+    async fn reindex(&self) -> Result<Json<ReindexResponse>, String> {
         let state = self.state.clone();
         tokio::task::spawn_blocking(move || {
-            let root = Path::new(&scope)
-                .canonicalize()
-                .map_err(|e| format!("cannot resolve `{scope}`: {e}"))?;
             let mut indexes = state
                 .indexes
                 .lock()
                 .map_err(|_| "index lock poisoned".to_string())?;
-            if let Some(cached) = indexes.remove(&root) {
+            for (_, cached) in indexes.drain() {
                 // Wait for in-flight detections on the dropped index, otherwise
                 // they could write cache entries after the directory is cleared.
                 drop(cached.index.write());
             }
-            SourceIndex::clear_cache(&root);
+            SourceIndex::clear_cache(&state.workspace_root);
             Ok(Json(ReindexResponse { ok: true }))
         })
         .await
         .map_err(|e| format!("reindex task panicked: {e}"))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("dup-detector-server-{name}-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn state_with_workspace(workspace: &Path) -> ServerState {
+        ServerState {
+            default_config: Config::default(),
+            workspace_root: workspace.canonicalize().unwrap(),
+            indexes: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[test]
+    fn scope_outside_workspace_is_rejected() {
+        let workspace = temp_dir("scope-reject-ws");
+        let elsewhere = temp_dir("scope-reject-out");
+        let state = state_with_workspace(&workspace);
+        let result = run_with_index(&state, elsewhere.to_str().unwrap(), |_, _| ());
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("outside the working directory")
+        );
+        fs::remove_dir_all(&workspace).ok();
+        fs::remove_dir_all(&elsewhere).ok();
+    }
+
+    #[test]
+    fn subdir_scope_uses_workspace_cache_dir() {
+        let workspace = temp_dir("scope-cache-ws");
+        let sub = workspace.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let source = "fn f() {\n    let x = 1;\n    let y = 2;\n    let z = x + y;\n    println!(\"{z}\");\n}\n";
+        fs::write(sub.join("a.rs"), source).unwrap();
+        fs::write(sub.join("b.rs"), source).unwrap();
+        let state = state_with_workspace(&workspace);
+        let entry_count = |dir: &Path| {
+            fs::read_dir(dir)
+                .map(|entries| entries.count())
+                .unwrap_or(0)
+        };
+        // Index the subdir scope first: the cache lands at the workspace root.
+        let scope = sub.canonicalize().unwrap();
+        let files = run_with_index(&state, scope.to_str().unwrap(), |index, _| {
+            index.files().len()
+        })
+        .unwrap();
+        assert_eq!(files, 2);
+        assert!(workspace.join(".dup-detector").is_dir());
+        assert!(!sub.join(".dup-detector").exists());
+        let count = entry_count(&workspace.join(".dup-detector"));
+        assert_eq!(count, 2);
+        // Indexing the whole workspace afterwards must reuse the same entries.
+        let root = workspace.canonicalize().unwrap();
+        let files = run_with_index(&state, root.to_str().unwrap(), |index, _| {
+            index.files().len()
+        })
+        .unwrap();
+        assert_eq!(files, 2);
+        assert_eq!(entry_count(&workspace.join(".dup-detector")), count);
+        fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[test]
+    fn reindex_clears_workspace_cache_and_drops_indexes() {
+        let workspace = temp_dir("reindex-ws");
+        fs::write(workspace.join("a.rs"), "fn a() { let x = 1; }\n").unwrap();
+        let state = state_with_workspace(&workspace);
+        let root = workspace.canonicalize().unwrap();
+        run_with_index(&state, root.to_str().unwrap(), |index, _| {
+            assert_eq!(index.files().len(), 1)
+        })
+        .unwrap();
+        assert!(!state.indexes.lock().unwrap().is_empty());
+        assert!(workspace.join(".dup-detector").is_dir());
+        state.indexes.lock().unwrap().clear();
+        SourceIndex::clear_cache(&state.workspace_root);
+        assert!(!workspace.join(".dup-detector").exists());
+        fs::remove_dir_all(&workspace).ok();
     }
 }

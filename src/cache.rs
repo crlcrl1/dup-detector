@@ -69,8 +69,10 @@ pub fn dir_for(root: &Path, location: CacheLocation) -> Option<PathBuf> {
     }
 }
 
-pub fn entry_path(dir: &Path, root: &Path, path: &Path) -> Option<PathBuf> {
-    let relative = path.strip_prefix(root).ok()?;
+/// Cache file for `path` inside `dir`; `path` must live under `base` (the
+/// cache base — the index root, or a shared workspace root for scope indexes).
+pub fn entry_path(dir: &Path, base: &Path, path: &Path) -> Option<PathBuf> {
+    let relative = path.strip_prefix(base).ok()?;
     let key = xxh3_64(relative.as_os_str().as_encoded_bytes());
     Some(dir.join(format!("{key:016x}.bin")))
 }
@@ -136,18 +138,21 @@ fn mmap_entry(_file: &fs::File) -> Option<CacheEntry> {
     None
 }
 
-pub fn store_entry(dir: &Path, root: &Path, file: &SourceFile) -> io::Result<()> {
-    let Some(entry_path) = entry_path(dir, root, &file.path) else {
+/// Writes (atomically) the cache entry for `file` into `dir`, keyed by its
+/// `base`-relative path.
+pub fn store_entry(dir: &Path, base: &Path, file: &SourceFile) -> io::Result<()> {
+    let Some(entry_path) = entry_path(dir, base, &file.path) else {
         return Ok(());
     };
-    let Some(bytes) = encode_entry(root, file) else {
+    let Some(bytes) = encode_entry(base, file) else {
         return Ok(());
     };
     write_atomic(&entry_path, &bytes)
 }
 
-pub fn remove_entry(dir: &Path, root: &Path, path: &Path) {
-    let Some(entry_path) = entry_path(dir, root, path) else {
+/// Removes the cache entry for `path` (keyed relative to `base`) if present.
+pub fn remove_entry(dir: &Path, base: &Path, path: &Path) {
+    let Some(entry_path) = entry_path(dir, base, path) else {
         return;
     };
     if let Err(error) = fs::remove_file(&entry_path)
@@ -165,9 +170,9 @@ pub fn clear(dir: &Path) -> io::Result<()> {
     }
 }
 
-fn encode_entry(root: &Path, file: &SourceFile) -> Option<Vec<u8>> {
+fn encode_entry(base: &Path, file: &SourceFile) -> Option<Vec<u8>> {
     let modified = file.modified?;
-    let path = file.path.strip_prefix(root).ok()?.to_str()?;
+    let path = file.path.strip_prefix(base).ok()?.to_str()?;
     let (secs, nanos) = mtime_parts(modified)?;
     let path_bytes = path.as_bytes();
     let token_count = u32::try_from(file.tokens.len()).ok()?;

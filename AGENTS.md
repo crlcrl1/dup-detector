@@ -28,7 +28,7 @@ The core goal is not text-level matching but **semantic (rename-invariant) detec
 Already written into `Cargo.toml`; no need to pick versions again:
 
 - Rust **edition 2024**, toolchain 1.98+
-- MCP SDK: `rmcp` 3.4 (feat. `transport-io`, stdio transport)
+- MCP SDK: `rmcp` 3.5 (feat. `transport-io`, stdio transport)
 - LSP SDK: `tower-lsp` 0.20 (stdio transport, tokio runtime)
 - Parsing: `tree-sitter` 0.27 + grammars: rust / python / javascript / typescript / cpp
 - Traversal: `ignore` (respects .gitignore), `rayon` (parallel parsing)
@@ -55,7 +55,7 @@ src/
   encode.rs      Token stream -> parameterized encoding (rename-invariant)
   detect.rs      seed-and-extend detection + bijection check + clone clustering
   index.rs       Project-level index (file discovery, parallel parsing, incremental invalidation)
-  cache.rs       On-disk token cache (project `.dup-detector/` or, with `cache_location = "user-cache"`, `<user cache dir>/dup-detector/<hash of root>`; one entry per source file named by a hash of its root-relative path, mtime/size/text-hash validated; entries are flat little-endian POD arrays (`Token`/hash) mapped zero-copy via `memmap2` on big-endian fallback decoded)
+  cache.rs       On-disk token cache (project `.dup-detector/` or, with `cache_location = "user-cache"`, `<user cache dir>/dup-detector/<hash of root>`; one entry per source file named by a hash of its cache-base-relative path — the index root, or the server's startup directory when scope indexes share one cache — mtime/size/text-hash validated; entries are flat little-endian POD arrays (`Token`/hash) mapped zero-copy via `memmap2` on big-endian fallback decoded)
   server.rs      rmcp ServerHandler + #[tool] tool definitions
   lsp.rs         tower-lsp LanguageServer (diagnostics, definition, references, hover)
 editors/
@@ -98,14 +98,14 @@ Correctness invariant: for every clone whose occurrences include an open file, t
 
 ## 5. MCP Tool Interface
 
-The server is long-running, maintains an in-memory index keyed by workspace root, and invalidates incrementally by file mtime. All four tools are implemented in `server.rs`:
+The server is long-running, maintains an in-memory index keyed by workspace root, and invalidates incrementally by file mtime. A `scope` must be the server's startup directory or one of its subdirectories (resolved after canonicalization; anything outside is rejected), and the on-disk token cache always lives at the startup directory (`<startup dir>/.dup-detector` by default, or the user cache dir keyed by the startup dir), never inside a scope subdirectory. Cache entries are keyed by startup-directory-relative paths, so all scopes of one workspace share a single entry per file (older per-scope `.dup-detector/` leftovers are removed on the next build). All four tools are implemented in `server.rs`:
 
 | Tool | Purpose | Key params |
 | --- | --- | --- |
 | `find_clones` | Project-wide duplicated code | `scope?`, `min_lines?`, `min_occurrences?`, `max_groups?`, `types?`, `parameterize_literals?` |
 | `find_clones_in_file` | Clones involving a given file | `file`, `scope?`, `min_lines?`, `min_occurrences?`, `max_groups?`, `types?` |
 | `find_clones_for_region` | **Most used by agents**: is the code I'm writing duplicated? | `file`, `start_line`, `end_line`, `scope?`, `min_lines?`, `max_groups?`, `types?` |
-| `reindex` | Drop the in-memory index and clear its on-disk cache (rebuilt on next scan) | `path?` |
+| `reindex` | Drop all in-memory indexes and clear the startup directory's on-disk cache (rebuilt on next scan) | (none) |
 
 Defaults: `min_lines = 7`, `min_occurrences = 2`, `max_groups = unlimited`, `max_bucket = 32`, seed window 8. `types` accepts `"type-1"` / `"type-2"`. `find_clones_for_region` defaults `min_lines` to `min(config.min_lines, line span of the queried region)` and parses the file on the fly if it is not indexed yet; `file` must resolve inside `scope`.
 
@@ -144,7 +144,7 @@ Note: the `rmcp` and LSP servers must not write to stdout; all logs go to stderr
 - **Phase 2** Done: tree-sitter token extraction and parameterized encoding, with unit tests.
 - **Phase 3** Done: seed-and-extend detection + bijection check + maximal matching + clone clustering; `find_clones` usable.
 - **Phase 4** Done: filtering/sorting/clustering for Type-1/Type-2 clones.
-- **Phase 5** Done: project index with mtime/size incremental refresh and a best-effort on-disk token cache (`.dup-detector/` in the scanned root by default, or a per-root directory under the user cache dir when `cache_location = "user-cache"`; one entry per source file, named by a hash of its root-relative path and validated by mtime/size/text hash; corrupt/missing entries fall back to parsing; refresh only rewrites changed entries and drops entries for removed files; `reindex` clears both locations).
+- **Phase 5** Done: project index with mtime/size incremental refresh and a best-effort on-disk token cache (`.dup-detector/` in the scanned root by default, or a per-root directory under the user cache dir when `cache_location = "user-cache"`; one entry per source file, named by a hash of its cache-base-relative path and validated by mtime/size/text hash; corrupt/missing entries fall back to parsing; refresh only rewrites changed entries and drops entries for removed files; MCP scope indexes key entries by startup-directory-relative path so all scopes of one workspace share a single entry per file; `reindex` clears both locations).
 - **Phase 6** Done: corpus regression under `tests/corpus/` (rename / change constant / add line / same file / unrelated) with precision/recall assertions in `tests/corpus.rs`.
 - **Phase 7** Done: `lsp.rs` LSP server over stdio publishing clone warnings for open documents plus go-to-definition / references / hover navigation, with incremental sync, debouncing, generation-based cancellation and open-document seed filtering.
 

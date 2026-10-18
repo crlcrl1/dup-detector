@@ -59,6 +59,9 @@ directory instead — `~/.cache/dup-detector/<hash of the root>` on Linux,
 on Windows — which keeps the project tree clean. The `reindex` tool clears both
 locations, so switching the setting never leaves stale entries behind. This is
 usually set in the user-level file, but a project-level value overrides it.
+For the MCP server the root is always the server's startup directory: the
+`scope` parameter never changes where the cache lives. The `scan` CLI and the
+LSP server use the scanned/workspace root as usual.
 
 Unknown keys and unknown language names are reported as errors. Degenerate values
 (`0` for `min_lines`, `min_occurrences`, `max_bucket`, `seed_window` or `max_file_bytes`,

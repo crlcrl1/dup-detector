@@ -52,7 +52,8 @@ cache_location = "project" # "project"（根目录下 .dup-detector/）或 "user
 `~/.cache/dup-detector/<根路径哈希>`，macOS 为 `~/Library/Caches/dup-detector/<哈希>`，
 Windows 为 `%LOCALAPPDATA%\dup-detector\<哈希>`——从而保持项目目录干净。`reindex`
 工具会同时清空两个位置，切换该设置后不会残留旧条目。该键通常写在用户级文件中，但
-项目级取值会覆盖它。
+项目级取值会覆盖它。对 MCP 服务器而言，项目根固定为服务器的启动目录：`scope`
+参数不影响缓存位置；`scan` CLI 和 LSP 服务器仍按扫描目录/工作区根目录存放。
 
 未知的键和未知的语言名会报错。退化取值（`min_lines`、`min_occurrences`、`max_bucket`、
 `seed_window`、`max_file_bytes` 为 `0`，或 `max_file_bytes` 超过 4 GiB）也会被拒绝。

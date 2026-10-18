@@ -97,7 +97,7 @@ fn run_mcp() -> anyhow::Result<()> {
     let root = std::env::current_dir().context("cannot resolve the current directory")?;
     let config = Config::load_or_default(&root)
         .with_context(|| format!("failed to load config from {}", root.display()))?;
-    let server = CloneServer::new(config);
+    let server = CloneServer::new(config, root);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;

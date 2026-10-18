@@ -69,6 +69,10 @@ pub struct SourceIndex {
     by_path: HashMap<PathBuf, usize>,
     skipped: HashMap<PathBuf, SkipRecord>,
     cache_dir: Option<PathBuf>,
+    /// Cache entry keys (and the relative paths stored in entries) are computed
+    /// against this directory instead of `root`, so several indexes covering
+    /// different scopes of one workspace share a single on-disk entry per file.
+    cache_base: PathBuf,
     stats: BuildStats,
 }
 
@@ -76,7 +80,7 @@ impl SourceIndex {
     pub fn build(root: impl AsRef<Path>, config: &Config) -> Result<Self, IndexError> {
         let root = canonicalize_root(root)?;
         let cache_dir = cache::dir_for(&root, config.cache_location);
-        Self::build_at(root, config, cache_dir)
+        Self::build_at(root, config, cache_dir, None)
     }
 
     pub fn build_with_cache(
@@ -85,22 +89,43 @@ impl SourceIndex {
         cache_dir: Option<&Path>,
     ) -> Result<Self, IndexError> {
         let root = canonicalize_root(root)?;
-        Self::build_at(root, config, cache_dir.map(Path::to_path_buf))
+        Self::build_at(root, config, cache_dir.map(Path::to_path_buf), None)
+    }
+
+    /// Like [`SourceIndex::build_with_cache`], but cache entries are keyed by
+    /// `cache_base`-relative paths, letting one cache directory serve several
+    /// scope indexes of the same workspace without duplicating entries.
+    pub fn build_with_cache_base(
+        root: impl AsRef<Path>,
+        config: &Config,
+        cache_dir: Option<&Path>,
+        cache_base: impl AsRef<Path>,
+    ) -> Result<Self, IndexError> {
+        let root = canonicalize_root(root)?;
+        let cache_base = cache_base.as_ref().to_path_buf();
+        Self::build_at(
+            root,
+            config,
+            cache_dir.map(Path::to_path_buf),
+            Some(cache_base),
+        )
     }
 
     fn build_at(
         root: PathBuf,
         config: &Config,
         cache_dir: Option<PathBuf>,
+        cache_base: Option<PathBuf>,
     ) -> Result<Self, IndexError> {
         let paths = discover(&root, config)?;
         let max_file_bytes = config.max_file_bytes;
+        let cache_base = cache_base.unwrap_or_else(|| root.clone());
         let mut slots: Vec<Option<SourceFile>> = paths
             .par_iter()
             .map(|(path, language)| {
-                cache_dir
-                    .as_deref()
-                    .and_then(|dir| file_from_cache(dir, &root, path, *language, max_file_bytes))
+                cache_dir.as_deref().and_then(|dir| {
+                    file_from_cache(dir, &cache_base, path, *language, max_file_bytes)
+                })
             })
             .collect();
         let mut misses: Vec<usize> = Vec::new();
@@ -117,7 +142,7 @@ impl SourceIndex {
                 let (path, language) = (&paths[index].0, paths[index].1);
                 let parsed = parse_file(path, language, max_file_bytes)?;
                 if let Some(dir) = &cache_dir
-                    && let Err(error) = cache::store_entry(dir, &root, &parsed)
+                    && let Err(error) = cache::store_entry(dir, &cache_base, &parsed)
                 {
                     tracing::debug!(error = %error, "cannot write cache entry");
                 }
@@ -141,7 +166,15 @@ impl SourceIndex {
             cache_hits,
             parsed_files,
         };
-        let index = Self::from_parts(root, config.clone(), files, skipped, cache_dir, stats);
+        let index = Self::from_parts(
+            root,
+            config.clone(),
+            files,
+            skipped,
+            cache_dir,
+            cache_base,
+            stats,
+        );
         tracing::debug!(
             cache_hits = index.stats.cache_hits,
             parsed_files = index.stats.parsed_files,
@@ -241,7 +274,7 @@ impl SourceIndex {
             changed.push(path.clone());
             slots.push(None);
         }
-        let root = &self.root;
+        let root = &self.cache_base;
         let cache_dir = &self.cache_dir;
         let parsed: Vec<(Option<SourceFile>, bool)> = misses
             .par_iter()
@@ -279,10 +312,10 @@ impl SourceIndex {
         }
         if let Some(dir) = &self.cache_dir {
             for removed in old.values() {
-                cache::remove_entry(dir, &self.root, &removed.path);
+                cache::remove_entry(dir, &self.cache_base, &removed.path);
             }
             for path in &failed {
-                cache::remove_entry(dir, &self.root, path);
+                cache::remove_entry(dir, &self.cache_base, path);
             }
         }
         for path in &failed {
@@ -335,6 +368,7 @@ impl SourceIndex {
         files: Vec<SourceFile>,
         skipped: HashMap<PathBuf, SkipRecord>,
         cache_dir: Option<PathBuf>,
+        cache_base: PathBuf,
         stats: BuildStats,
     ) -> Self {
         let by_path = files
@@ -349,6 +383,7 @@ impl SourceIndex {
             by_path,
             skipped,
             cache_dir,
+            cache_base,
             stats,
         }
     }
@@ -363,13 +398,13 @@ fn canonicalize_root(root: impl AsRef<Path>) -> Result<PathBuf, IndexError> {
 
 fn file_from_cache(
     dir: &Path,
-    root: &Path,
+    base: &Path,
     path: &Path,
     language: LanguageId,
     max_file_bytes: u64,
 ) -> Option<SourceFile> {
-    let entry = cache::load_entry(&cache::entry_path(dir, root, path)?)?;
-    if entry.path != path.strip_prefix(root).ok()? {
+    let entry = cache::load_entry(&cache::entry_path(dir, base, path)?)?;
+    if entry.path != path.strip_prefix(base).ok()? {
         return None;
     }
     if entry.size > max_file_bytes {
