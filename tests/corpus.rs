@@ -68,6 +68,7 @@ fn corpus_precision_and_recall() {
         ("rename_rust", &[("a.rs", "b.rs")]),
         ("rename_python", &[("a.py", "b.py")]),
         ("rename_cpp", &[("a.cpp", "b.cpp")]),
+        ("rename_c", &[("a.c", "b.c")]),
         ("rename_typescript", &[("a.ts", "b.ts")]),
         ("rename_javascript", &[("a.js", "b.js")]),
         ("rename_tsx", &[("a.tsx", "b.tsx")]),
@@ -103,7 +104,7 @@ fn corpus_precision_and_recall() {
     assert!(recall >= 0.9, "recall {recall}");
     assert_eq!(
         (true_positives, false_positives, false_negatives),
-        (7, 0, 0)
+        (8, 0, 0)
     );
 }
 
@@ -126,6 +127,7 @@ fn renamed_clones_are_type2() {
         "rename_rust",
         "rename_python",
         "rename_cpp",
+        "rename_c",
         "rename_typescript",
         "rename_javascript",
         "rename_tsx",

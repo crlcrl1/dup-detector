@@ -333,6 +333,16 @@ mod tests {
     }
 
     #[test]
+    fn c_preprocessor_is_tolerated() {
+        let source = "#include <stdio.h>\nint main(void) { return 0; }\n";
+        let tokens = tokenize(source, LanguageId::C).unwrap();
+        assert!(!tokens.is_empty());
+        let texts = texts(source, &tokens);
+        assert!(texts.contains(&"int"));
+        assert!(texts.contains(&"main"));
+    }
+
+    #[test]
     fn cpp_preprocessor_is_tolerated() {
         let source = "#include <vector>\nint main() { return 0; }\n";
         let tokens = tokenize(source, LanguageId::Cpp).unwrap();
@@ -448,6 +458,10 @@ mod tests {
             (
                 LanguageId::Cpp,
                 "#include <vector>\nint main() { auto l = [](int x) { return x; }; return l(0); }\n",
+            ),
+            (
+                LanguageId::C,
+                "#include <stdio.h>\nstruct S { int f; };\nint main(void) { struct S s = {0}; return s.f; }\n",
             ),
         ];
         for (language, source) in samples {

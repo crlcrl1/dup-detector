@@ -19,13 +19,13 @@
 
 - **语义级而非文本级** —— 注释、空白和格式完全不影响结果。
 - **重命名不变** —— `a = b + c` 与 `x = y + z` 视为同一克隆。
-- **多语言** —— Rust、Python、JavaScript、TypeScript/TSX、C++。
+- **多语言** —— Rust、Python、JavaScript、TypeScript/TSX、C、C++。
 - **高性能** —— 并行解析、遵循 `.gitignore` 的文件发现、种子哈希、基于 mtime 增量刷新的内存索引，以及跨进程复用的磁盘 token 缓存。
 - **三种使用方式** —— 面向编码代理的常驻 MCP 服务器、面向编辑器的 LSP 服务器，以及 `scan` 命令行。
 
 ## 支持的语言
 
-Rust、Python、JavaScript、TypeScript、TSX、C++（`.rs`、`.py`/`.pyi`、`.js`/`.mjs`/`.cjs`/`.jsx`、`.ts`/`.mts`/`.cts`、`.tsx`、`.cpp`/`.cc`/`.cxx`/`.c++`/`.hpp`/`.hh`/`.hxx`/`.h++`/`.h`/`.ipp`/`.inl`/`.tpp`）。
+Rust、Python、JavaScript、TypeScript、TSX、C、C++（`.rs`、`.py`/`.pyi`、`.js`/`.mjs`/`.cjs`/`.jsx`、`.ts`/`.mts`/`.cts`、`.tsx`、`.c`、`.cpp`/`.cc`/`.cxx`/`.c++`/`.hpp`/`.hh`/`.hxx`/`.h++`/`.h`/`.ipp`/`.inl`/`.tpp`）。`.h` 头文件按 C++ 语法解析。
 
 ## 下载
 

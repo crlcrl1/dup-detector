@@ -19,13 +19,13 @@ Unlike text/regex based tools, `dup-detector` works on the **token stream produc
 
 - **Semantic, not textual** — comments, whitespace and formatting never matter.
 - **Rename invariant** — `a = b + c` and `x = y + z` are the same clone.
-- **Multi-language** — Rust, Python, JavaScript, TypeScript/TSX, C++.
+- **Multi-language** — Rust, Python, JavaScript, TypeScript/TSX, C, C++.
 - **Fast** — parallel parsing, `.gitignore`-aware discovery, seed hashing, an in-memory index with mtime-based incremental refresh, and an on-disk token cache.
 - **Three ways to use it** — a long-running MCP server for coding agents, an LSP server for editors, and a `scan` CLI.
 
 ## Supported languages
 
-Rust, Python, JavaScript, TypeScript, TSX, C++ (`.rs`, `.py`/`.pyi`, `.js`/`.mjs`/`.cjs`/`.jsx`, `.ts`/`.mts`/`.cts`, `.tsx`, `.cpp`/`.cc`/`.cxx`/`.c++`/`.hpp`/`.hh`/`.hxx`/`.h++`/`.h`/`.ipp`/`.inl`/`.tpp`).
+Rust, Python, JavaScript, TypeScript, TSX, C, C++ (`.rs`, `.py`/`.pyi`, `.js`/`.mjs`/`.cjs`/`.jsx`, `.ts`/`.mts`/`.cts`, `.tsx`, `.c`, `.cpp`/`.cc`/`.cxx`/`.c++`/`.hpp`/`.hh`/`.hxx`/`.h++`/`.h`/`.ipp`/`.inl`/`.tpp`). `.h` headers are parsed with the C++ grammar.
 
 ## Download
 

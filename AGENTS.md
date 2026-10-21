@@ -30,7 +30,7 @@ Already written into `Cargo.toml`; no need to pick versions again:
 - Rust **edition 2024**, toolchain 1.98+
 - MCP SDK: `rmcp` 3.5 (feat. `transport-io`, stdio transport)
 - LSP SDK: `tower-lsp` 0.20 (stdio transport, tokio runtime)
-- Parsing: `tree-sitter` 0.27 + grammars: rust / python / javascript / typescript / cpp
+- Parsing: `tree-sitter` 0.27 + grammars: rust / python / javascript / typescript / c / cpp
 - Traversal: `ignore` (respects .gitignore), `rayon` (parallel parsing)
 - Serialization: `serde` / `serde_json` / `schemars` (MCP tool schemas), `toml` (config file)
 - Errors: `anyhow` (application layer) / `thiserror` (library layer)
@@ -139,7 +139,7 @@ Note: the `rmcp` and LSP servers must not write to stdout; all logs go to stderr
 
 ## 8. Roadmap
 
-- **Phase 0** Done: language scope is rust / python / javascript / typescript / tsx / cpp; defaults `min_lines = 7`, seed window 8, `max_bucket = 32`.
+- **Phase 0** Done: language scope is rust / python / javascript / typescript / tsx / c / cpp; defaults `min_lines = 7`, seed window 8, `max_bucket = 32`.
 - **Phase 1** Done: MCP server over stdio + working `scan` CLI.
 - **Phase 2** Done: tree-sitter token extraction and parameterized encoding, with unit tests.
 - **Phase 3** Done: seed-and-extend detection + bijection check + maximal matching + clone clustering; `find_clones` usable.

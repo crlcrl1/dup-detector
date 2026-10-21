@@ -8,6 +8,7 @@ pub enum LanguageId {
     JavaScript,
     TypeScript,
     Tsx,
+    C,
     Cpp,
 }
 
@@ -23,6 +24,7 @@ const EXTENSIONS: &[(&str, LanguageId)] = &[
     ("mts", LanguageId::TypeScript),
     ("cts", LanguageId::TypeScript),
     ("tsx", LanguageId::Tsx),
+    ("c", LanguageId::C),
     ("cpp", LanguageId::Cpp),
     ("cc", LanguageId::Cpp),
     ("cxx", LanguageId::Cpp),
@@ -38,12 +40,13 @@ const EXTENSIONS: &[(&str, LanguageId)] = &[
 ];
 
 impl LanguageId {
-    pub const ALL: [LanguageId; 6] = [
+    pub const ALL: [LanguageId; 7] = [
         LanguageId::Rust,
         LanguageId::Python,
         LanguageId::JavaScript,
         LanguageId::TypeScript,
         LanguageId::Tsx,
+        LanguageId::C,
         LanguageId::Cpp,
     ];
 
@@ -54,11 +57,16 @@ impl LanguageId {
             LanguageId::JavaScript => 2,
             LanguageId::TypeScript => 3,
             LanguageId::Tsx => 4,
-            LanguageId::Cpp => 5,
+            LanguageId::C => 5,
+            LanguageId::Cpp => 6,
         }
     }
 
     pub fn from_extension(extension: &str) -> Option<Self> {
+        // `.C` conventionally denotes C++, unlike case-insensitive `.c`.
+        if extension == "C" {
+            return Some(LanguageId::Cpp);
+        }
         EXTENSIONS
             .iter()
             .find(|(ext, _)| extension.eq_ignore_ascii_case(ext))
@@ -72,6 +80,7 @@ impl LanguageId {
             "javascript" | "js" | "jsx" => Some(LanguageId::JavaScript),
             "typescript" | "ts" => Some(LanguageId::TypeScript),
             "tsx" => Some(LanguageId::Tsx),
+            "c" => Some(LanguageId::C),
             "cpp" | "c++" | "cxx" => Some(LanguageId::Cpp),
             _ => None,
         }
@@ -91,6 +100,7 @@ impl LanguageId {
             LanguageId::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
             LanguageId::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             LanguageId::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            LanguageId::C => tree_sitter_c::LANGUAGE.into(),
             LanguageId::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         }
     }
@@ -102,6 +112,7 @@ impl LanguageId {
             LanguageId::JavaScript => "javascript",
             LanguageId::TypeScript => "typescript",
             LanguageId::Tsx => "tsx",
+            LanguageId::C => "c",
             LanguageId::Cpp => "cpp",
         }
     }
@@ -118,6 +129,18 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn maps_c_extensions() {
+        assert_eq!(LanguageId::from_extension("c"), Some(LanguageId::C));
+        assert_eq!(LanguageId::from_name("c"), Some(LanguageId::C));
+        assert_eq!(LanguageId::from_name("C"), Some(LanguageId::C));
+    }
+
+    #[test]
+    fn uppercase_c_extension_is_cpp() {
+        assert_eq!(LanguageId::from_extension("C"), Some(LanguageId::Cpp));
+    }
 
     #[test]
     fn maps_cpp_extensions() {
@@ -146,6 +169,14 @@ mod tests {
             Some(LanguageId::Cpp)
         );
         assert_eq!(
+            LanguageId::from_path(path(&["src", "foo", "bar.c"])),
+            Some(LanguageId::C)
+        );
+        assert_eq!(
+            LanguageId::from_path(path(&["src", "foo", "bar.C"])),
+            Some(LanguageId::Cpp)
+        );
+        assert_eq!(
             LanguageId::from_path(path(&["include", "bar.hpp"])),
             Some(LanguageId::Cpp)
         );
@@ -166,6 +197,34 @@ mod tests {
             .expect("parse must succeed")
             .root_node()
             .has_error()
+    }
+
+    #[test]
+    fn c_corpus_parses() {
+        let source = r#"
+#include <stdlib.h>
+
+struct accumulator {
+    int total;
+};
+
+static int add_values(struct accumulator *acc, const int *values, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        int value = values[i];
+        if (value > 0) {
+            acc->total += value;
+        }
+    }
+    return acc->total;
+}
+
+int compute(int n) {
+    struct accumulator acc = {0};
+    int values[] = {n, n + 1};
+    return add_values(&acc, values, sizeof(values) / sizeof(values[0]));
+}
+"#;
+        assert!(parses(LanguageId::C, source));
     }
 
     #[test]
@@ -223,6 +282,10 @@ int compute(int n) {
         assert!(parses(
             LanguageId::Tsx,
             "const App = () => <div>hello</div>;"
+        ));
+        assert!(parses(
+            LanguageId::C,
+            "int add(int a, int b) { return a + b; }"
         ));
     }
 }
