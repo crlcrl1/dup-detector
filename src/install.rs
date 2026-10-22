@@ -153,6 +153,7 @@ pub fn compile_shared_library(sources: &[PathBuf], out: &Path) -> Result<(), Ins
     let status = Command::new(&compiler)
         .arg("-shared")
         .arg("-fPIC")
+        .arg("-O2")
         .arg("-I")
         .arg(&include)
         .arg("-o")
