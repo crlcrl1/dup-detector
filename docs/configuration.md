@@ -45,7 +45,7 @@ cache_location = "project" # "project" (.dup-detector/ at the root) or "user-cac
 | `seed_window`           | `8`     | Seed window length in tokens                                       |
 | `max_groups`            | none    | Maximum number of groups to report                                 |
 | `parameterize_literals` | `false` | Treat consistently renamed literals as equal                       |
-| `languages`             | all     | Languages to scan (`LanguageId::from_name` names)                  |
+| `languages`             | all registered | Restrict scanning to these languages; omit to scan every registered language (built-in + plugins) |
 | `no_ignore`             | `false` | Also scan files excluded by `.gitignore`/`.ignore` rules           |
 | `include_hidden`        | `false` | Also scan hidden (dot) directories, e.g. `.github`                 |
 | `max_file_bytes`        | `2097152` | Files larger than this are skipped (bounds parse memory)         |

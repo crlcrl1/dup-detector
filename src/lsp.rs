@@ -1408,7 +1408,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let root = dir.canonicalize().unwrap();
         let config = Config {
-            languages: vec![LanguageId::RUST],
+            languages: Some(vec![LanguageId::RUST]),
             ..Config::default()
         };
         let state = State::new(root.clone(), config);

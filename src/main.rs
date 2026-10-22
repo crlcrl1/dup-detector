@@ -183,7 +183,7 @@ fn run_scan(
                     .ok_or_else(|| anyhow::anyhow!("unknown language: {name}"))
             })
             .collect::<Result<_, _>>()?;
-        config.languages = ids;
+        config.languages = Some(ids);
     }
     let index = SourceIndex::build(path, &config)
         .with_context(|| format!("failed to index {}", path.display()))?;

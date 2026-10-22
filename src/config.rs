@@ -38,7 +38,9 @@ pub struct Config {
     pub seed_window: usize,
     pub max_groups: Option<usize>,
     pub parameterize_literals: bool,
-    pub languages: Vec<LanguageId>,
+    /// Languages to scan. `None` (the default) means every registered
+    /// language, built-in and plugins; `Some` restricts scanning to the list.
+    pub languages: Option<Vec<LanguageId>>,
     pub no_ignore: bool,
     pub include_hidden: bool,
     pub max_file_bytes: u64,
@@ -62,7 +64,7 @@ impl Default for Config {
             seed_window: 8,
             max_groups: None,
             parameterize_literals: false,
-            languages: LanguageId::ALL.to_vec(),
+            languages: None,
             no_ignore: false,
             include_hidden: false,
             max_file_bytes: 2 * 1024 * 1024,
@@ -223,7 +225,7 @@ fn apply_file_config(
                 })?;
             languages.push(language);
         }
-        config.languages = languages;
+        config.languages = Some(languages);
     }
     let invalid = |key: &'static str, message: &str| ConfigError::InvalidValue {
         path: path.to_path_buf(),
@@ -331,7 +333,9 @@ impl Config {
     }
 
     pub fn language_enabled(&self, language: LanguageId) -> bool {
-        self.languages.contains(&language)
+        self.languages
+            .as_ref()
+            .is_none_or(|languages| languages.contains(&language))
     }
 
     pub fn with_limits(
@@ -420,7 +424,7 @@ mod tests {
                 seed_window: 6,
                 max_groups: Some(25),
                 parameterize_literals: true,
-                languages: vec![LanguageId::RUST, LanguageId::PYTHON],
+                languages: Some(vec![LanguageId::RUST, LanguageId::PYTHON]),
                 no_ignore: true,
                 include_hidden: true,
                 max_file_bytes: 1048576,
@@ -591,6 +595,37 @@ mod tests {
         assert_eq!(config.min_lines, 12);
         assert_eq!(config.min_occurrences, Config::default().min_occurrences);
         assert_eq!(config.languages, Config::default().languages);
+    }
+
+    #[test]
+    fn default_config_enables_all_registered_languages() {
+        let config = Config::default();
+        assert_eq!(config.languages, None);
+        let registry = crate::language::registry().read().unwrap();
+        for (id, _) in registry.iter() {
+            assert!(
+                config.language_enabled(id),
+                "{} disabled by default",
+                id.name()
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_language_list_filters() {
+        let config = Config {
+            languages: Some(vec![LanguageId::RUST]),
+            ..Config::default()
+        };
+        assert!(config.language_enabled(LanguageId::RUST));
+        assert!(!config.language_enabled(LanguageId::PYTHON));
+    }
+
+    #[test]
+    fn toml_without_languages_scans_everything() {
+        let config = Config::from_toml("min_lines = 3\n", Path::new(CONFIG_FILE_NAME)).unwrap();
+        assert_eq!(config.languages, None);
+        assert!(config.language_enabled(LanguageId::CPP));
     }
 
     #[test]

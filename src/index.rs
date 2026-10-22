@@ -600,7 +600,7 @@ mod tests {
         fs::write(dir.join("b.py"), "def b(): pass").unwrap();
         fs::write(dir.join("notes.txt"), "not code").unwrap();
         let config = Config {
-            languages: vec![LanguageId::RUST],
+            languages: Some(vec![LanguageId::RUST]),
             ..Config::default()
         };
         let index = SourceIndex::build_with_cache(&dir, &config, None).unwrap();

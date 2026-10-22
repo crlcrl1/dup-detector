@@ -40,7 +40,7 @@ cache_location = "project" # "project"（根目录下 .dup-detector/）或 "user
 | `seed_window`           | `8`     | 种子窗口的 token 长度                      |
 | `max_groups`            | 无限制  | 最多返回的克隆组数量                       |
 | `parameterize_literals` | `false` | 将一致重命名的字面量视为相同               |
-| `languages`             | 全部    | 参与扫描的语言（`LanguageId::from_name` 名称） |
+| `languages`             | 全部已注册 | 只扫描这些语言；省略表示扫描所有已注册语言（内置 + 插件） |
 | `no_ignore`             | `false` | 同时扫描被 `.gitignore`/`.ignore` 排除的文件 |
 | `include_hidden`        | `false` | 同时扫描隐藏（点）目录，如 `.github`       |
 | `max_file_bytes`        | `2097152` | 超过该大小的文件跳过（限制解析内存）          |

@@ -146,7 +146,7 @@ func accumulate(values []int) int {
     fs::write(project.join("b.go"), b).unwrap();
     let config = Config {
         min_lines: 4,
-        languages: vec![go],
+        languages: Some(vec![go]),
         ..Config::default()
     };
 
