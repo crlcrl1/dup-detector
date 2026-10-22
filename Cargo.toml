@@ -1,6 +1,6 @@
 [package]
 name = "dup-detector"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -10,7 +10,7 @@ bytemuck = { version = "1.25.2", features = ["derive"] }
 clap = { version = "4.6.7", features = ["derive"] }
 dirs = "7.0.0"
 ignore = "0.4.33"
-libloading = "0.8"
+libloading = "0.9"
 memmap2 = "0.9.11"
 rayon = "1.12.0"
 rmcp = { version = "3.5.1", features = ["transport-io"] }
@@ -39,7 +39,7 @@ codegen-units = 1
 
 [dev-dependencies]
 criterion = "0.8.2"
-tree-sitter-go = "0.23"
+tree-sitter-go = "0.25"
 
 [[bench]]
 name = "hot_paths"
