@@ -61,7 +61,58 @@ locations, so switching the setting never leaves stale entries behind. This is
 usually set in the user-level file, but a project-level value overrides it.
 For the MCP server the root is always the server's startup directory: the
 `scope` parameter never changes where the cache lives. The `scan` CLI and the
-LSP server use the scanned/workspace root as usual.
+LSP server use the scanned/workspace root as usual. Cache entries additionally
+record a fingerprint of the grammar (kind names, ABI version, plugin kind
+overrides), so upgrading a grammar or changing a plugin manifest invalidates
+stale tokens even when the source file itself is unchanged.
+
+## Grammar plugins
+
+Besides the built-in languages (rust, python, javascript, typescript, tsx, c,
+cpp), any tree-sitter grammar can be added at runtime — no recompiling. The
+fastest way is one command:
+
+```bash
+dup-detector install go            # tree-sitter/tree-sitter-go from GitHub
+dup-detector install org/repo      # any other grammar repository
+dup-detector install go -e golang  # extra file extensions, if needed
+dup-detector install go --force    # overwrite an existing plugin
+```
+
+`install` clones the repository (shallow), reads the file extensions from the
+grammar's `tree-sitter.json` (or takes them from `-e/--extension`), compiles
+`src/parser.c` (+ `src/scanner.c` when present) with the system C compiler and
+writes the manifest. It needs `git` and a C compiler (`cc`, overridable via the
+`CC` environment variable). Verify with `dup-detector languages`, or run
+`dup-detector doctor` to check the toolchain and re-validate every installed
+plugin (exits non-zero when something is missing or broken).
+
+A plugin can also be installed by hand: it is a directory inside the
+user-level grammars directory (`~/.config/dup-detector/grammars` on Linux,
+`~/Library/Application Support/dup-detector/grammars` on macOS,
+`%APPDATA%\dup-detector\grammars` on Windows) containing one shared library
+(`*.so` / `*.dll` / `*.dylib`) that exports the grammar's
+`tree_sitter_<name>` symbol, plus a `grammar.toml` manifest:
+
+```toml
+name = "go"                    # optional, defaults to the directory name
+extensions = ["go"]            # required
+library = "tree-sitter-go.so"  # optional when the directory holds exactly one
+symbol = "tree_sitter_go"      # optional, defaults to tree_sitter_<name>
+identifier_kinds = [...]       # optional additive classification overrides
+literal_kinds = [...]
+unit_kinds = [...]
+container_kinds = [...]
+```
+
+Classification is derived from tree-sitter node kind names with built-in
+heuristics (kinds like `identifier`, `string`, `block`, `*_statement`), which
+most grammars match out of the box; the `*_kinds` lists extend them when a
+grammar names its nodes differently. After adding a plugin, `dup-detector
+languages` lists it and the `languages` config key / `--lang` flag accept its
+name. A broken plugin is logged and skipped — it never affects built-in
+languages or other plugins. Grammar plugins are native code loaded into the
+process: only install them from sources you trust.
 
 Unknown keys and unknown language names are reported as errors. Degenerate values
 (`0` for `min_lines`, `min_occurrences`, `max_bucket`, `seed_window` or `max_file_bytes`,

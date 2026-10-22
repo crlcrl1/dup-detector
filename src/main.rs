@@ -4,7 +4,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use dup_detector::config::Config;
 use dup_detector::index::SourceIndex;
-use dup_detector::language::LanguageId;
+use dup_detector::language::{LanguageId, LanguageSource, registry};
 use dup_detector::model::CloneGroup;
 use dup_detector::server::{CloneServer, ScanResponse};
 use tracing_subscriber::EnvFilter;
@@ -26,6 +26,21 @@ enum Command {
     Mcp,
     /// Run as a language server over stdio (diagnostics + jump to duplicates)
     Lsp,
+    /// List registered languages (built-in and plugins)
+    Languages,
+    /// Download a tree-sitter grammar, compile it and install it as a plugin
+    Install {
+        /// Grammar name (`go`), `org/repo`, or repository URL
+        source: String,
+        /// File extension for the language; auto-detected from tree-sitter.json when omitted
+        #[arg(short = 'e', long = "extension", value_name = "EXT")]
+        extensions: Vec<String>,
+        /// Overwrite an already-installed plugin with the same name
+        #[arg(long)]
+        force: bool,
+    },
+    /// Check the plugin toolchain (git, C compiler, grammars directory, installed plugins)
+    Doctor,
     /// Scan a path and print duplicated code groups
     Scan {
         /// Path to scan (defaults to the current directory)
@@ -66,9 +81,27 @@ fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    dup_detector::plugin::load_user_plugins();
+
     match Cli::parse().command {
         Command::Mcp => run_mcp(),
         Command::Lsp => run_lsp(),
+        Command::Languages => {
+            print_languages();
+            Ok(())
+        }
+        Command::Install {
+            source,
+            extensions,
+            force,
+        } => run_install(&source, extensions, force),
+        Command::Doctor => {
+            if dup_detector::doctor::run() {
+                Ok(())
+            } else {
+                std::process::exit(1);
+            }
+        }
         Command::Scan {
             path,
             min_lines,
@@ -169,6 +202,120 @@ fn run_scan(
         }
     }
     Ok(())
+}
+
+fn run_install(source: &str, extensions: Vec<String>, force: bool) -> anyhow::Result<()> {
+    let installed =
+        dup_detector::install::install_grammar(&dup_detector::install::InstallRequest {
+            source: source.to_string(),
+            extensions,
+            force,
+        })
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let shown = installed
+        .extensions
+        .iter()
+        .map(|ext| format!(".{ext}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!(
+        "installed {} ({}) -> {}",
+        installed.name,
+        shown,
+        installed.dir.display()
+    );
+    println!(
+        "run `dup-detector languages` to verify, then scan with --lang {}",
+        installed.name
+    );
+    Ok(())
+}
+
+/// Maximum width of the extensions column; longer lists are truncated with
+/// `…` (the full list lives in the plugin's `grammar.toml`).
+const EXTENSIONS_COLUMN_MAX: usize = 32;
+
+fn print_languages() {
+    struct Row {
+        name: String,
+        extensions: String,
+        abi: String,
+        source: String,
+    }
+    let registry = registry().read().expect("language registry poisoned");
+    let mut rows = Vec::new();
+    for (_, def) in registry.iter() {
+        let source = match def.source() {
+            LanguageSource::Builtin => "built-in".to_string(),
+            LanguageSource::Plugin { dir } => format!(
+                "plugin ({})",
+                dir.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("?")
+            ),
+        };
+        rows.push(Row {
+            name: def.name().to_string(),
+            extensions: format_extensions(def.extensions()),
+            abi: def.grammar().abi_version().to_string(),
+            source,
+        });
+    }
+    let name_width = rows
+        .iter()
+        .map(|row| row.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("Language".len());
+    let ext_width = rows
+        .iter()
+        .map(|row| row.extensions.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("Extensions".len());
+    println!(
+        "{:<nw$}  {:<ew$}  {:>3}  Source",
+        "Language",
+        "Extensions",
+        "ABI",
+        nw = name_width,
+        ew = ext_width,
+    );
+    for row in &rows {
+        println!(
+            "{:<nw$}  {:<ew$}  {:>3}  {}",
+            row.name,
+            row.extensions,
+            row.abi,
+            row.source,
+            nw = name_width,
+            ew = ext_width,
+        );
+    }
+}
+
+fn format_extensions(extensions: &[String]) -> String {
+    let joined = extensions
+        .iter()
+        .map(|ext| format!(".{ext}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if joined.chars().count() <= EXTENSIONS_COLUMN_MAX {
+        return joined;
+    }
+    let mut shown = String::new();
+    for ext in extensions {
+        let candidate = if shown.is_empty() {
+            format!(".{ext}")
+        } else {
+            format!("{shown} .{ext}")
+        };
+        if candidate.chars().count() + 2 > EXTENSIONS_COLUMN_MAX {
+            break;
+        }
+        shown = candidate;
+    }
+    format!("{shown} …")
 }
 
 fn print_group(n: usize, group: &CloneGroup, index: &SourceIndex) {

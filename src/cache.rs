@@ -10,8 +10,8 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::config::{CONFIG_DIR_NAME, CacheLocation};
 use crate::model::{Slice, SourceFile, Token, TokenKind};
 
-const MAGIC: &[u8; 8] = b"DUPCDT10";
-const HEADER_BYTES: usize = 44;
+const MAGIC: &[u8; 8] = b"DUPCDT11";
+const HEADER_BYTES: usize = 52;
 
 pub const CACHE_DIR: &str = ".dup-detector";
 
@@ -20,6 +20,7 @@ pub struct CacheEntry {
     pub modified: SystemTime,
     pub size: u64,
     pub text_hash: u64,
+    pub grammar_fingerprint: u64,
     pub tokens: Slice<Token>,
     pub hashes: Slice<u64>,
 }
@@ -29,6 +30,7 @@ struct Header {
     modified: SystemTime,
     size: u64,
     text_hash: u64,
+    grammar_fingerprint: u64,
     token_count: usize,
     hashes_offset: usize,
     tokens_offset: usize,
@@ -128,6 +130,7 @@ fn mmap_entry(file: &fs::File) -> Option<CacheEntry> {
         modified: header.modified,
         size: header.size,
         text_hash: header.text_hash,
+        grammar_fingerprint: header.grammar_fingerprint,
         tokens,
         hashes,
     })
@@ -190,6 +193,13 @@ fn encode_entry(base: &Path, file: &SourceFile) -> Option<Vec<u8>> {
     out.extend_from_slice(&nanos.to_le_bytes());
     out.extend_from_slice(&file.size.to_le_bytes());
     out.extend_from_slice(&text_hash_bytes(file.text.as_bytes()).to_le_bytes());
+    out.extend_from_slice(
+        &file
+            .language
+            .grammar_fingerprint()
+            .unwrap_or(0)
+            .to_le_bytes(),
+    );
     out.extend_from_slice(path_bytes);
     out.resize(hashes_offset, 0);
     for hash in file.hashes.as_slice() {
@@ -232,6 +242,7 @@ fn parse_header(bytes: &[u8]) -> Option<Header> {
     }
     let size = read_u64(bytes, &mut cursor)?;
     let text_hash = read_u64(bytes, &mut cursor)?;
+    let grammar_fingerprint = read_u64(bytes, &mut cursor)?;
     let path_end = HEADER_BYTES.checked_add(path_len)?;
     let path = PathBuf::from(std::str::from_utf8(bytes.get(HEADER_BYTES..path_end)?).ok()?);
     let hashes_offset = align8(path_end);
@@ -245,6 +256,7 @@ fn parse_header(bytes: &[u8]) -> Option<Header> {
         modified: UNIX_EPOCH.checked_add(Duration::new(secs, nanos))?,
         size,
         text_hash,
+        grammar_fingerprint,
         token_count,
         hashes_offset,
         tokens_offset,
@@ -271,6 +283,7 @@ fn decode_entry(bytes: &[u8]) -> Option<CacheEntry> {
         modified: header.modified,
         size: header.size,
         text_hash: header.text_hash,
+        grammar_fingerprint: header.grammar_fingerprint,
         tokens: Slice::owned(tokens),
         hashes: Slice::owned(hashes),
     })
@@ -358,7 +371,7 @@ mod tests {
     fn source(path: &Path, text: &str) -> SourceFile {
         SourceFile::new(
             path.to_path_buf(),
-            LanguageId::Rust,
+            LanguageId::RUST,
             text.to_string(),
             vec![Token {
                 start: 0,
@@ -395,6 +408,12 @@ mod tests {
         assert_eq!(loaded.path, relative);
         assert_eq!(loaded.size, file.size);
         assert_eq!(loaded.text_hash, text_hash(file.text.as_str()));
+        assert_eq!(
+            loaded.grammar_fingerprint,
+            file.language
+                .grammar_fingerprint()
+                .expect("rust fingerprint")
+        );
         assert_eq!(loaded.tokens.len(), 1);
         assert_eq!(loaded.tokens[0].kind, TokenKind::Identifier.as_u8());
         assert!(loaded.tokens[0].unit_start());

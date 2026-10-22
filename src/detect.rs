@@ -1485,7 +1485,7 @@ fn compute_total(items: Vec<i32>) -> i32 {
 "#;
 
     fn file(name: &str, source: &str) -> SourceFile {
-        file_with(name, source, LanguageId::Rust)
+        file_with(name, source, LanguageId::RUST)
     }
 
     fn file_with(name: &str, source: &str, language: LanguageId) -> SourceFile {
@@ -2017,7 +2017,7 @@ fn parameterized2(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
     )
     return total
 "#,
-            LanguageId::Python,
+            LanguageId::PYTHON,
         );
         let b = file_with(
             "b.py",
@@ -2030,7 +2030,7 @@ fn parameterized2(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
     )
     return total + 1
 "#,
-            LanguageId::Python,
+            LanguageId::PYTHON,
         );
         let groups = detect(&[&a, &b], &config());
         assert_eq!(groups.len(), 1);
@@ -2054,7 +2054,7 @@ fn parameterized2(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
     return total;
 }
 "#,
-            LanguageId::JavaScript,
+            LanguageId::JAVASCRIPT,
         );
         let b = file_with(
             "b.js",
@@ -2068,7 +2068,7 @@ fn parameterized2(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
     return total + 1;
 }
 "#,
-            LanguageId::JavaScript,
+            LanguageId::JAVASCRIPT,
         );
         let groups = detect(&[&a, &b], &config());
         assert_eq!(groups.len(), 1);

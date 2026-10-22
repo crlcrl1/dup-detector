@@ -421,6 +421,9 @@ fn file_from_cache(
     if cache::text_hash_bytes(text.as_bytes()) != entry.text_hash {
         return None;
     }
+    if entry.grammar_fingerprint != language.grammar_fingerprint().unwrap_or(u64::MAX) {
+        return None;
+    }
     let file = SourceFile::from_storage(
         path.to_path_buf(),
         language,
@@ -597,7 +600,7 @@ mod tests {
         fs::write(dir.join("b.py"), "def b(): pass").unwrap();
         fs::write(dir.join("notes.txt"), "not code").unwrap();
         let config = Config {
-            languages: vec![LanguageId::Rust],
+            languages: vec![LanguageId::RUST],
             ..Config::default()
         };
         let index = SourceIndex::build_with_cache(&dir, &config, None).unwrap();

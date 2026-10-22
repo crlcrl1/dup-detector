@@ -30,7 +30,8 @@ Already written into `Cargo.toml`; no need to pick versions again:
 - Rust **edition 2024**, toolchain 1.98+
 - MCP SDK: `rmcp` 3.5 (feat. `transport-io`, stdio transport)
 - LSP SDK: `tower-lsp` 0.20 (stdio transport, tokio runtime)
-- Parsing: `tree-sitter` 0.27 + grammars: rust / python / javascript / typescript / c / cpp
+- Parsing: `tree-sitter` 0.27 + grammars: rust / python / javascript / typescript / c / cpp (`tree-sitter-language` for dynamically loaded grammars)
+- Grammar plugins: `libloading` (dlopen tree-sitter grammar shared libraries at startup)
 - Traversal: `ignore` (respects .gitignore), `rayon` (parallel parsing)
 - Serialization: `serde` / `serde_json` / `schemars` (MCP tool schemas), `toml` (config file)
 - Errors: `anyhow` (application layer) / `thiserror` (library layer)
@@ -45,17 +46,20 @@ Module layout (all modules implemented; the core algorithm lives in `tokenize` /
 
 ```
 src/
-  main.rs        CLI entry: mcp / scan subcommands
+  main.rs        CLI entry: mcp / lsp / scan / languages subcommands
   lib.rs         Library root, exports public API
   config.rs      Config (min_lines, thresholds, language toggles, etc.) + user-level/project-level `dup-detector.toml` loading
-  language.rs    Extension -> LanguageId -> tree-sitter Language
+  language.rs    Global `LanguageRegistry`: LanguageId handle -> LanguageDef (name, extensions, tree-sitter grammar, kind classification tables, fingerprint); built-ins registered at startup, plugins add more
+  plugin.rs      Grammar plugin loader: scans the user-level `grammars/` directory for `grammar.toml` manifests + grammar shared libraries, loads them into the registry (best-effort, failures only warn)
+  install.rs     `dup-detector install` support: clone a tree-sitter grammar repo, compile it into a shared library and write its `grammar.toml` manifest into the user-level `grammars/` directory
+  doctor.rs      `dup-detector doctor`: health checks for the plugin toolchain (git, C compiler probe build, writable grammars dir) and per-plugin load validation
   model.rs       Token / SourceFile / Occurrence / CloneGroup / CloneType
   tokenize.rs    Source file -> CST -> leaf token stream
   fast_hash.rs   FastHasher (xxh3-based) + FastMap / FastSet aliases
   encode.rs      Token stream -> parameterized encoding (rename-invariant)
   detect.rs      seed-and-extend detection + bijection check + clone clustering
   index.rs       Project-level index (file discovery, parallel parsing, incremental invalidation)
-  cache.rs       On-disk token cache (project `.dup-detector/` or, with `cache_location = "user-cache"`, `<user cache dir>/dup-detector/<hash of root>`; one entry per source file named by a hash of its cache-base-relative path — the index root, or the server's startup directory when scope indexes share one cache — mtime/size/text-hash validated; entries are flat little-endian POD arrays (`Token`/hash) mapped zero-copy via `memmap2` on big-endian fallback decoded)
+  cache.rs       On-disk token cache (project `.dup-detector/` or, with `cache_location = "user-cache"`, `<user cache dir>/dup-detector/<hash of root>`; one entry per source file named by a hash of its cache-base-relative path — the index root, or the server's startup directory when scope indexes share one cache — mtime/size/text-hash validated plus a `grammar_fingerprint` so grammar upgrades or plugin manifest changes invalidate stale tokens; entries are flat little-endian POD arrays (`Token`/hash) mapped zero-copy via `memmap2` on big-endian fallback decoded)
   server.rs      rmcp ServerHandler + #[tool] tool definitions
   lsp.rs         tower-lsp LanguageServer (diagnostics, definition, references, hover)
 editors/
@@ -120,6 +124,9 @@ cargo run -- mcp                  # start MCP server over stdio
 cargo run -- lsp                  # start language server over stdio
 cargo run -- scan <path>          # scan from the command line and print results
 cargo run -- scan <path> --json --min-lines 7 --min-occurrences 2 --parameterize-literals --lang rust
+cargo run -- languages            # list registered languages (built-in + plugins)
+cargo run -- install go           # download tree-sitter-go, compile and install it as a plugin
+cargo run -- doctor               # check plugin toolchain dependencies and installed plugins (exit 1 on failure)
 cargo test                        # unit/integration tests
 cargo fmt                         # formatting (required before commit)
 cargo clippy --all-targets -- -D warnings   # lint (required before commit)
@@ -134,7 +141,8 @@ Note: the `rmcp` and LSP servers must not write to stdout; all logs go to stderr
 - Error handling: use `anyhow` in application/CLI layers and `thiserror` for reusable library types; avoid `unwrap`/`expect` in library code (except tests).
 - Do not write explanatory comments unless the logic is very counterintuitive. `///` doc comments are only for tool parameters that appear in the MCP JSON schema (visible to agents, so they serve a real purpose).
 - Prefer immutability and borrowing; avoid needless `clone`; watch allocations on the detection hot path (avoid creating a `HashMap` per seed window).
-- Adding a language: register the extension and grammar in `language.rs`, and add a corpus test.
+- Adding a language (built-in): register the extension and grammar in `language.rs`, and add a corpus test.
+- Adding a language (plugin, no recompile): `dup-detector install <name>` (or `org/repo` / URL; `-e/--extension` to override extensions, `--force` to overwrite) clones the tree-sitter grammar, compiles it and writes the manifest into the user-level `grammars/` directory; `dup-detector languages` verifies registration. Manual installs follow the layout in the `plugin.rs` module docs. Plugin grammars are native code — only load trusted libraries.
 - After adding/modifying an MCP tool, update Section 5 of this file accordingly.
 
 ## 8. Roadmap

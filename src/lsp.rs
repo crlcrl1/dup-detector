@@ -1408,7 +1408,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let root = dir.canonicalize().unwrap();
         let config = Config {
-            languages: vec![LanguageId::Rust],
+            languages: vec![LanguageId::RUST],
             ..Config::default()
         };
         let state = State::new(root.clone(), config);
@@ -1417,7 +1417,7 @@ mod tests {
         std::fs::write(&path, text).unwrap();
         let uri = Url::from_file_path(&path).unwrap();
         assert_eq!(
-            Backend::open_document(&state, uri, path, LanguageId::Python, text.to_string()),
+            Backend::open_document(&state, uri, path, LanguageId::PYTHON, text.to_string()),
             None
         );
         assert!(state.documents.lock().unwrap().is_empty());
@@ -1425,10 +1425,10 @@ mod tests {
     }
 
     fn source_file(text: &str) -> SourceFile {
-        let tokens = tokenize::tokenize(text, LanguageId::Rust).unwrap();
+        let tokens = tokenize::tokenize(text, LanguageId::RUST).unwrap();
         SourceFile::new(
             PathBuf::from("test.rs"),
-            LanguageId::Rust,
+            LanguageId::RUST,
             text.to_string(),
             tokens,
             None,
@@ -1626,10 +1626,10 @@ mod tests {
     }
 
     fn insert_document(state: &State, path: &Path, text: &str) {
-        let tokens = tokenize::tokenize(text, LanguageId::Rust).unwrap();
+        let tokens = tokenize::tokenize(text, LanguageId::RUST).unwrap();
         let file = Arc::new(SourceFile::new(
             path.to_path_buf(),
-            LanguageId::Rust,
+            LanguageId::RUST,
             text.to_string(),
             tokens,
             None,
@@ -1649,10 +1649,10 @@ mod tests {
     }
 
     fn apply_edit(state: &State, path: &Path, text: &str, region: Option<(usize, usize)>) {
-        let tokens = tokenize::tokenize(text, LanguageId::Rust).unwrap();
+        let tokens = tokenize::tokenize(text, LanguageId::RUST).unwrap();
         let file = Arc::new(SourceFile::new(
             path.to_path_buf(),
-            LanguageId::Rust,
+            LanguageId::RUST,
             text.to_string(),
             tokens,
             None,

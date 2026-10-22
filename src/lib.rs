@@ -1,11 +1,14 @@
 pub mod cache;
 pub mod config;
 pub mod detect;
+pub mod doctor;
 pub mod encode;
 pub(crate) mod fast_hash;
 pub mod index;
+pub mod install;
 pub mod language;
 pub mod lsp;
 pub mod model;
+pub mod plugin;
 pub mod server;
 pub mod tokenize;

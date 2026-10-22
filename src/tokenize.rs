@@ -1,11 +1,11 @@
 use std::cell::RefCell;
-use std::sync::LazyLock;
 
 use thiserror::Error;
 use tree_sitter::{Node, Parser, Tree};
 
-use crate::language::LanguageId;
-use crate::model::{FLAG_BRACKET_CLOSE, FLAG_BRACKET_OPEN, Token, TokenKind};
+use crate::fast_hash::FastMap;
+use crate::language::{KindOverrides, KindTables, LanguageId, classify};
+use crate::model::{FLAG_BRACKET_CLOSE, FLAG_BRACKET_OPEN, Token};
 
 #[derive(Debug, Error)]
 pub enum TokenizeError {
@@ -15,131 +15,22 @@ pub enum TokenizeError {
     ParseFailed,
 }
 
-const IDENTIFIER_KINDS: &[&str] = &[
-    "identifier",
-    "type_identifier",
-    "field_identifier",
-    "property_identifier",
-    "shorthand_property_identifier",
-    "shorthand_property_identifier_pattern",
-    "namespace_identifier",
-    "statement_identifier",
-    "operator_name",
-    "destructor_name",
-    "class_name",
-    "lifetime",
-    "jsx_identifier",
-    "jsx_namespace_name",
-];
-
-const LITERAL_KINDS: &[&str] = &[
-    "string",
-    "string_fragment",
-    "string_content",
-    "template_chars",
-    "regex",
-    "number",
-    "integer",
-    "float",
-    "true",
-    "false",
-    "null",
-    "none",
-    "undefined",
-    "nil",
-    "boolean",
-    "raw_string_content",
-    "system_lib_string",
-    "char",
-];
-
-const CONTAINER_KINDS: &[&str] = &[
-    "block",
-    "statement_block",
-    "compound_statement",
-    "program",
-    "module",
-    "source_file",
-    "translation_unit",
-    "declaration_list",
-    "class_body",
-    "interface_body",
-    "enum_body",
-    "field_declaration_list",
-    "switch_body",
-    "match_block",
-];
-
-const UNIT_KINDS: &[&str] = &[
-    "declaration",
-    "preproc_include",
-    "preproc_def",
-    "preproc_ifdef",
-    "preproc_if",
-    "preproc_call",
-    "linkage_specification",
-    "class_specifier",
-    "enum_specifier",
-    "if_expression",
-    "for_expression",
-    "while_expression",
-    "loop_expression",
-    "match_expression",
-];
-
-struct KindTables {
-    classify: Vec<TokenKind>,
-    unit: Vec<bool>,
-    container: Vec<bool>,
-}
-
-fn build_kind_tables(language: LanguageId) -> KindTables {
-    let grammar = language.grammar();
-    let count = grammar.node_kind_count();
-    let mut tables = KindTables {
-        classify: vec![TokenKind::Fixed; count],
-        unit: vec![false; count],
-        container: vec![false; count],
-    };
-    for id in 0..count {
-        let Some(kind) = grammar.node_kind_for_id(id as u16) else {
-            continue;
-        };
-        tables.classify[id] = classify(kind);
-        tables.unit[id] = is_unit_kind(kind);
-        tables.container[id] = is_container_kind(kind);
-    }
-    tables
-}
-
-static KIND_TABLES: LazyLock<[KindTables; LanguageId::ALL.len()]> =
-    LazyLock::new(|| LanguageId::ALL.map(build_kind_tables));
-
 thread_local! {
-    static PARSERS: RefCell<[Option<Parser>; LanguageId::ALL.len()]> = const {
-        RefCell::new([const { None }; LanguageId::ALL.len()])
-    };
+    static PARSERS: RefCell<FastMap<u32, Parser>> = RefCell::new(FastMap::default());
 }
 
 pub fn tokenize(source: &str, language: LanguageId) -> Result<Vec<Token>, TokenizeError> {
     PARSERS.with(|cell| {
         let mut parsers = cell.borrow_mut();
-        let slot = &mut parsers[language.index()];
-        if slot.is_none() {
-            let mut parser = Parser::new();
-            parser
-                .set_language(&language.grammar())
+        let slot = parsers.entry(language.index()).or_insert_with(Parser::new);
+        if slot.language().is_none() {
+            slot.set_language(&language.grammar())
                 .map_err(|_| TokenizeError::Grammar(language))?;
-            *slot = Some(parser);
         }
-        let Some(parser) = slot.as_mut() else {
-            return Err(TokenizeError::Grammar(language));
-        };
-        let tree = parser
-            .parse(source, None)
-            .ok_or(TokenizeError::ParseFailed)?;
+        let tree = slot.parse(source, None).ok_or(TokenizeError::ParseFailed)?;
         let mut tokens = Vec::with_capacity(source.len() / 5 + 16);
-        collect(&tree, &KIND_TABLES[language.index()], source, &mut tokens);
+        let tables = language.kind_tables();
+        collect(&tree, &tables, source, &mut tokens);
         Ok(tokens)
     })
 }
@@ -202,7 +93,7 @@ fn push_token(node: &Node<'_>, tables: &KindTables, source: &str, tokens: &mut V
     let kind_name = node.kind();
     let kind = match tables.classify.get(kind_id) {
         Some(&kind) => kind,
-        None => classify(kind_name),
+        None => classify(kind_name, &KindOverrides::default()),
     };
     tokens.push(Token {
         start: node.start_byte() as u32,
@@ -240,37 +131,13 @@ fn apply_marking(tokens: &mut [Token], first: u32, kind_id: u16, tables: &KindTa
     tokens[last].unit_start_of_end = tokens[last].unit_start_of_end.min(first);
 }
 
-fn is_container_kind(kind: &str) -> bool {
-    CONTAINER_KINDS.contains(&kind)
-}
-
-fn is_unit_kind(kind: &str) -> bool {
-    if kind == "parameter_declaration" {
-        return false;
-    }
-    is_container_kind(kind)
-        || UNIT_KINDS.contains(&kind)
-        || kind.ends_with("_statement")
-        || kind.ends_with("_item")
-        || kind.ends_with("_declaration")
-        || kind.ends_with("_definition")
-}
-
-fn classify(kind: &str) -> TokenKind {
-    if IDENTIFIER_KINDS.contains(&kind) {
-        TokenKind::Identifier
-    } else if kind.ends_with("_literal") || LITERAL_KINDS.contains(&kind) {
-        TokenKind::Literal
-    } else {
-        TokenKind::Fixed
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::language::{is_container_kind, is_unit_kind};
+    use crate::model::TokenKind;
 
     fn texts<'a>(source: &'a str, tokens: &[Token]) -> Vec<&'a str> {
         tokens
@@ -282,7 +149,7 @@ mod tests {
     #[test]
     fn comments_are_skipped() {
         let source = "// lead\nfn main() { /* mid */ let x = 1; }\n";
-        let tokens = tokenize(source, LanguageId::Rust).unwrap();
+        let tokens = tokenize(source, LanguageId::RUST).unwrap();
         let texts = texts(source, &tokens);
         assert!(
             !texts
@@ -295,7 +162,7 @@ mod tests {
     #[test]
     fn classifies_kinds() {
         let source = "let count = 42; let name = \"x\";";
-        let tokens = tokenize(source, LanguageId::Rust).unwrap();
+        let tokens = tokenize(source, LanguageId::RUST).unwrap();
         let texts = texts(source, &tokens);
         let by_text: HashMap<&str, u8> = texts
             .iter()
@@ -312,10 +179,10 @@ mod tests {
     #[test]
     fn records_line_numbers() {
         let source = "fn a() {\n  let x = 1;\n}\n";
-        let tokens = tokenize(source, LanguageId::Rust).unwrap();
+        let tokens = tokenize(source, LanguageId::RUST).unwrap();
         let file = crate::model::SourceFile::new(
             std::path::PathBuf::from("a.rs"),
-            LanguageId::Rust,
+            LanguageId::RUST,
             source.to_string(),
             tokens,
             None,
@@ -345,7 +212,7 @@ mod tests {
     #[test]
     fn cpp_preprocessor_is_tolerated() {
         let source = "#include <vector>\nint main() { return 0; }\n";
-        let tokens = tokenize(source, LanguageId::Cpp).unwrap();
+        let tokens = tokenize(source, LanguageId::CPP).unwrap();
         assert!(!tokens.is_empty());
         let texts = texts(source, &tokens);
         assert!(texts.contains(&"int"));
@@ -367,7 +234,7 @@ mod tests {
                 unit_end_of_start: 0,
                 unit_start_of_end: u32::MAX,
                 container_end_of_start: 0,
-                kind: classify(kind_name).as_u8(),
+                kind: classify(kind_name, &KindOverrides::default()).as_u8(),
                 flags: token_flags(kind_name, named_single_byte(&node, source)),
                 _pad: [0; 2],
             });
@@ -378,9 +245,9 @@ mod tests {
         for child in node.children(&mut cursor) {
             reference_collect(child, source, tokens);
         }
-        if tokens.len() > first && is_unit_kind(node.kind()) {
+        if tokens.len() > first && is_unit_kind(node.kind(), &KindOverrides::default()) {
             let last = tokens.len() - 1;
-            if is_container_kind(node.kind()) {
+            if is_container_kind(node.kind(), &KindOverrides::default()) {
                 tokens[first].set_container_start();
                 tokens[first].container_end_of_start = tokens[first]
                     .container_end_of_start
@@ -433,30 +300,30 @@ mod tests {
     #[test]
     fn iterative_walk_matches_reference() {
         let samples: &[(LanguageId, &str)] = &[
-            (LanguageId::Rust, ""),
-            (LanguageId::Rust, "fn broken( { let x = ; }"),
+            (LanguageId::RUST, ""),
+            (LanguageId::RUST, "fn broken( { let x = ; }"),
             (
-                LanguageId::Rust,
+                LanguageId::RUST,
                 "// c\nfn a() -> i32 { if x { 1 } else { 2 } }\nstruct S { f: u8 }\n",
             ),
             (
-                LanguageId::Python,
+                LanguageId::PYTHON,
                 "def f(a):\n    for i in a:\n        if i:\n            pass\n    return None\n",
             ),
             (
-                LanguageId::JavaScript,
+                LanguageId::JAVASCRIPT,
                 "function f() { return `t${x}`; }\nclass A {}\n",
             ),
             (
-                LanguageId::TypeScript,
+                LanguageId::TYPESCRIPT,
                 "interface I { x: number }\nconst f = <T,>(a: T): T => a;\n",
             ),
             (
-                LanguageId::Tsx,
+                LanguageId::TSX,
                 "const App = () => <div className=\"x\">{v}</div>;\n",
             ),
             (
-                LanguageId::Cpp,
+                LanguageId::CPP,
                 "#include <vector>\nint main() { auto l = [](int x) { return x; }; return l(0); }\n",
             ),
             (

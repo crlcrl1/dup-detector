@@ -40,10 +40,13 @@ file discovery (.gitignore aware)
 
 ```
 src/
-  main.rs       CLI entry: `mcp` / `lsp` / `scan`
+  main.rs       CLI entry: `mcp` / `lsp` / `scan` / `languages`
   lib.rs        library root
   config.rs     Config + user/project dup-detector.toml loading
-  language.rs   extension -> LanguageId -> tree-sitter grammar
+  language.rs   global LanguageRegistry: LanguageId -> grammar, kind tables, fingerprint
+  plugin.rs     grammar plugin loader (grammar.toml manifest + shared library)
+  install.rs    `dup-detector install`: clone/compile/install a grammar plugin
+  doctor.rs     `dup-detector doctor`: plugin toolchain + installed-plugin health checks
   model.rs      Token / SourceFile / Occurrence / CloneGroup / CloneType
   tokenize.rs   source -> CST -> leaf token stream
   fast_hash.rs  fast hasher + map/set aliases
@@ -51,7 +54,7 @@ src/
   detect.rs     seed-and-extend, bijection, clustering
   index.rs      file discovery, parallel parsing, incremental refresh
   cache.rs      on-disk token cache, project `.dup-detector/` or user cache dir
-                (mtime/size/text-hash validated, mmap'd zero-copy)
+                (mtime/size/text-hash validated, grammar fingerprint, mmap'd zero-copy)
   server.rs     rmcp server + MCP tool definitions
   lsp.rs        LSP server (diagnostics, go-to-definition, references, hover)
 editors/

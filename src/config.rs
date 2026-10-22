@@ -142,15 +142,18 @@ fn find_config_file(root: &Path) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// User-level config directory: `~/.config/dup-detector` on Linux,
+/// `~/Library/Application Support/dup-detector` on macOS and
+/// `%APPDATA%\dup-detector` on Windows.
+pub fn user_config_dir() -> Option<PathBuf> {
+    Some(dirs::config_dir()?.join(CONFIG_DIR_NAME))
+}
+
 /// Path of the user-level config file: `~/.config/dup-detector/dup-detector.toml`
 /// on Linux, `~/Library/Application Support/dup-detector/dup-detector.toml` on
 /// macOS and `%APPDATA%\dup-detector\dup-detector.toml` on Windows.
 pub fn user_config_path() -> Option<PathBuf> {
-    Some(
-        dirs::config_dir()?
-            .join(CONFIG_DIR_NAME)
-            .join(CONFIG_FILE_NAME),
-    )
+    user_config_dir().map(|dir| dir.join(CONFIG_FILE_NAME))
 }
 
 fn source_paths_layered(root: &Path, user: Option<&Path>) -> Vec<PathBuf> {
@@ -417,7 +420,7 @@ mod tests {
                 seed_window: 6,
                 max_groups: Some(25),
                 parameterize_literals: true,
-                languages: vec![LanguageId::Rust, LanguageId::Python],
+                languages: vec![LanguageId::RUST, LanguageId::PYTHON],
                 no_ignore: true,
                 include_hidden: true,
                 max_file_bytes: 1048576,

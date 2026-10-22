@@ -18,8 +18,8 @@ use dup_detector::tokenize;
 const WINDOW: usize = 8;
 
 fn source_file(name: &str, text: String) -> SourceFile {
-    let tokens = tokenize::tokenize(&text, LanguageId::Rust).unwrap();
-    SourceFile::new(PathBuf::from(name), LanguageId::Rust, text, tokens, None, 0)
+    let tokens = tokenize::tokenize(&text, LanguageId::RUST).unwrap();
+    SourceFile::new(PathBuf::from(name), LanguageId::RUST, text, tokens, None, 0)
 }
 
 fn clone_family(variant: usize, op: &str) -> String {
@@ -56,7 +56,7 @@ fn self_src_files() -> Vec<SourceFile> {
 fn big_rust_file() -> (String, Vec<Token>, Vec<u64>) {
     let text =
         fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/detect.rs")).unwrap();
-    let tokens = tokenize::tokenize(&text, LanguageId::Rust).unwrap();
+    let tokens = tokenize::tokenize(&text, LanguageId::RUST).unwrap();
     let hashes = encode::token_hashes(&text, &tokens);
     (text, tokens, hashes)
 }
@@ -195,7 +195,7 @@ fn bench_encode(c: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(300));
     group.measurement_time(Duration::from_secs(1));
     group.bench_function("tokenize", |b| {
-        b.iter(|| tokenize::tokenize(&text, LanguageId::Rust).unwrap());
+        b.iter(|| tokenize::tokenize(&text, LanguageId::RUST).unwrap());
     });
     group.bench_function("token_hashes", |b| {
         b.iter(|| encode::token_hashes(&text, &tokens));
@@ -243,10 +243,10 @@ fn bench_index(c: &mut Criterion) {
     fs::write(&cache_path, clone_family(0, "+")).unwrap();
     let cache_text = fs::read_to_string(&cache_path).unwrap();
     let cache_meta = fs::metadata(&cache_path).unwrap();
-    let cache_tokens = tokenize::tokenize(&cache_text, LanguageId::Rust).unwrap();
+    let cache_tokens = tokenize::tokenize(&cache_text, LanguageId::RUST).unwrap();
     let cache_file = SourceFile::new(
         cache_path,
-        LanguageId::Rust,
+        LanguageId::RUST,
         cache_text,
         cache_tokens,
         cache_meta.modified().ok(),

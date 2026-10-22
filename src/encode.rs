@@ -177,7 +177,7 @@ mod tests {
     use super::*;
 
     fn hashes(source: &str) -> (Vec<Token>, Vec<u64>) {
-        let tokens = tokenize(source, LanguageId::Rust).unwrap();
+        let tokens = tokenize(source, LanguageId::RUST).unwrap();
         let hashes = token_hashes(source, &tokens);
         (tokens, hashes)
     }
