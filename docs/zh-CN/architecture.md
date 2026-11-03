@@ -48,7 +48,7 @@ src/
   index.rs      文件发现、并行解析、增量刷新
   cache.rs      磁盘 token 缓存，项目 `.dup-detector/` 或用户缓存目录
                 （mtime/大小/文本哈希校验、语法指纹）
-  server.rs     rmcp 服务器 + MCP 工具定义
+  mcp.rs        rmcp 服务器 + MCP 工具定义
   lsp.rs        LSP 服务器（诊断、跳转定义、引用、悬停）
 editors/
   vscode/       VS Code 扩展（vscode-languageclient，打包为 .vsix）

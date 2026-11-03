@@ -60,7 +60,7 @@ src/
   detect.rs      seed-and-extend detection + bijection check + clone clustering
   index.rs       Project-level index (file discovery, parallel parsing, incremental invalidation)
   cache.rs       On-disk token cache (project `.dup-detector/` or, with `cache_location = "user-cache"`, `<user cache dir>/dup-detector/<hash of root>`; one entry per source file named by a hash of its cache-base-relative path — the index root, or the server's startup directory when scope indexes share one cache — mtime/size/text-hash validated plus a `grammar_fingerprint` so grammar upgrades or plugin manifest changes invalidate stale tokens; entries use a compact little-endian varint/delta encoding of the `Token` stream decoded into owned arrays on load, and token hashes are recomputed from the text instead of being stored)
-  server.rs      rmcp ServerHandler + #[tool] tool definitions
+  mcp.rs         rmcp ServerHandler + #[tool] tool definitions
   lsp.rs         tower-lsp LanguageServer (diagnostics, definition, references, hover)
 editors/
   vscode/        VS Code extension (vscode-languageclient, packages to .vsix)
@@ -102,7 +102,7 @@ Correctness invariant: for every clone whose occurrences include an open file, t
 
 ## 5. MCP Tool Interface
 
-The server is long-running, maintains an in-memory index keyed by workspace root, and invalidates incrementally by file mtime. A `scope` must be the server's startup directory or one of its subdirectories (resolved after canonicalization; anything outside is rejected), and the on-disk token cache always lives at the startup directory (`<startup dir>/.dup-detector` by default, or the user cache dir keyed by the startup dir), never inside a scope subdirectory. Cache entries are keyed by startup-directory-relative paths, so all scopes of one workspace share a single entry per file (older per-scope `.dup-detector/` leftovers are removed on the next build). All four tools are implemented in `server.rs`:
+The server is long-running, maintains an in-memory index keyed by workspace root, and invalidates incrementally by file mtime. A `scope` must be the server's startup directory or one of its subdirectories (resolved after canonicalization; anything outside is rejected), and the on-disk token cache always lives at the startup directory (`<startup dir>/.dup-detector` by default, or the user cache dir keyed by the startup dir), never inside a scope subdirectory. Cache entries are keyed by startup-directory-relative paths, so all scopes of one workspace share a single entry per file (older per-scope `.dup-detector/` leftovers are removed on the next build). All four tools are implemented in `mcp.rs`:
 
 | Tool | Purpose | Key params |
 | --- | --- | --- |
@@ -161,5 +161,5 @@ Note: the `rmcp` and LSP servers must not write to stdout; all logs go to stderr
 
 - Run `cargo build` first to confirm the baseline compiles.
 - When done, you must run `cargo fmt` and `cargo clippy --all-targets -- -D warnings`, then `cargo test`.
-- When changing public types (`model.rs`), check whether the schema in `server.rs` and the docs in Section 5 need updating.
+- When changing public types (`model.rs`), check whether the schema in `mcp.rs` and the docs in Section 5 need updating.
 - Do not commit unless explicitly asked. Use concise imperative commit messages.

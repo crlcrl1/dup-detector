@@ -54,8 +54,8 @@ src/
   detect.rs     seed-and-extend, bijection, clustering
   index.rs      file discovery, parallel parsing, incremental refresh
   cache.rs      on-disk token cache, project `.dup-detector/` or user cache dir
-                (mtime/size/text-hash validated, grammar fingerprint, mmap'd zero-copy)
-  server.rs     rmcp server + MCP tool definitions
+                (mtime/size/text-hash validated, grammar fingerprint, compact varint tokens)
+  mcp.rs        rmcp server + MCP tool definitions
   lsp.rs        LSP server (diagnostics, go-to-definition, references, hover)
 editors/
   vscode/       VS Code extension (vscode-languageclient, packages to .vsix)

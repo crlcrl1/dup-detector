@@ -5,8 +5,8 @@ use clap::{Parser, Subcommand};
 use dup_detector::config::Config;
 use dup_detector::index::SourceIndex;
 use dup_detector::language::{LanguageId, LanguageSource, registry};
+use dup_detector::mcp::{CloneServer, ScanResponse};
 use dup_detector::model::CloneGroup;
-use dup_detector::server::{CloneServer, ScanResponse};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]

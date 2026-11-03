@@ -8,7 +8,7 @@ pub mod index;
 pub mod install;
 pub mod language;
 pub mod lsp;
+pub mod mcp;
 pub mod model;
 pub mod plugin;
-pub mod server;
 pub mod tokenize;
