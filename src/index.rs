@@ -184,26 +184,32 @@ impl SourceIndex {
         Ok(index)
     }
 
-    /// Clears the on-disk cache for `root` in both possible locations, so a
-    /// `cache_location` change does not leave stale entries behind.
-    pub fn clear_cache(root: &Path) {
+    /// Removes the on-disk cache for `root` in both possible locations and
+    /// returns the directories that existed and were cleared.
+    pub fn clear_cache(root: &Path) -> Vec<PathBuf> {
         let Ok(root) = root.canonicalize() else {
-            return;
+            return Vec::new();
         };
         let mut dirs = vec![cache::dir_in(&root)];
         if let Some(dir) = cache::user_cache_dir(&root) {
             dirs.push(dir);
         }
+        let mut cleared = Vec::new();
         for dir in dirs {
-            if let Err(error) = cache::clear(&dir) {
-                tracing::debug!(
+            if !dir.exists() {
+                continue;
+            }
+            match cache::clear(&dir) {
+                Ok(()) => cleared.push(dir),
+                Err(error) => tracing::debug!(
                     root = %root.display(),
                     dir = %dir.display(),
                     error = %error,
                     "cannot clear cache"
-                );
+                ),
             }
         }
+        cleared
     }
 
     pub fn refresh(&mut self) -> Vec<PathBuf> {
@@ -792,7 +798,8 @@ mod tests {
         drop(first);
         let second = SourceIndex::build(&dir, &config).unwrap();
         assert_eq!(second.stats().cache_hits, 1);
-        SourceIndex::clear_cache(&dir);
+        let cleared = SourceIndex::clear_cache(&dir);
+        assert_eq!(cleared, vec![cache_dir.clone()]);
         assert!(!cache_dir.exists());
         fs::remove_dir_all(&dir).ok();
     }

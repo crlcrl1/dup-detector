@@ -46,7 +46,7 @@ Module layout (all modules implemented; the core algorithm lives in `tokenize` /
 
 ```
 src/
-  main.rs        CLI entry: mcp / lsp / scan / languages subcommands
+  main.rs        CLI entry: mcp / lsp / scan / clean / languages / install / doctor subcommands
   lib.rs         Library root, exports public API
   config.rs      Config (min_lines, thresholds, language toggles, etc.) + user-level/project-level `dup-detector.toml` loading
   language.rs    Global `LanguageRegistry`: LanguageId handle -> LanguageDef (name, extensions, tree-sitter grammar, kind classification tables, fingerprint); built-ins registered at startup, plugins add more
@@ -124,6 +124,7 @@ cargo run -- mcp                  # start MCP server over stdio
 cargo run -- lsp                  # start language server over stdio
 cargo run -- scan <path>          # scan from the command line and print results
 cargo run -- scan <path> --json --min-lines 7 --min-occurrences 2 --parameterize-literals --lang rust
+cargo run -- clean [path]         # remove the project's on-disk token cache (project + user-cache)
 cargo run -- languages            # list registered languages (built-in + plugins)
 cargo run -- install go           # download tree-sitter-go, compile and install it as a plugin
 cargo run -- doctor               # check plugin toolchain dependencies and installed plugins (exit 1 on failure)

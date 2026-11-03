@@ -69,6 +69,9 @@ dup-detector scan <path>
 
 # JSON output, tuned thresholds
 dup-detector scan <path> --json --min-lines 7 --max-groups 50
+
+# remove the project's on-disk token cache
+dup-detector clean <path>
 ```
 
 ## Documentation

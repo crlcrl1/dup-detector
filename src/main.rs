@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -41,6 +41,12 @@ enum Command {
     },
     /// Check the plugin toolchain (git, C compiler, grammars directory, installed plugins)
     Doctor,
+    /// Remove the on-disk token cache for a project
+    Clean {
+        /// Project path whose cache should be removed (defaults to the current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Scan a path and print duplicated code groups
     Scan {
         /// Path to scan (defaults to the current directory)
@@ -102,6 +108,7 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
+        Command::Clean { path } => run_clean(&path),
         Command::Scan {
             path,
             min_lines,
@@ -146,6 +153,24 @@ fn run_lsp() -> anyhow::Result<()> {
     let config = Config::load_or_default(&root)
         .with_context(|| format!("failed to load config from {}", root.display()))?;
     dup_detector::lsp::run(config, root)
+}
+
+fn run_clean(path: &Path) -> anyhow::Result<()> {
+    let root = path
+        .canonicalize()
+        .with_context(|| format!("cannot resolve {}", path.display()))?;
+    if !root.is_dir() {
+        anyhow::bail!("{} is not a directory", root.display());
+    }
+    let cleared = SourceIndex::clear_cache(&root);
+    if cleared.is_empty() {
+        println!("No cache found for {}", root.display());
+    } else {
+        for dir in cleared {
+            println!("Removed {}", dir.display());
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

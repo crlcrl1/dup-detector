@@ -69,6 +69,9 @@ dup-detector scan <path>
 
 # JSON 输出并调整阈值
 dup-detector scan <path> --json --min-lines 7 --max-groups 50
+
+# 清理该项目的磁盘 token 缓存
+dup-detector clean <path>
 ```
 
 ## 文档

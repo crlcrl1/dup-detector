@@ -140,6 +140,9 @@ dup-detector scan <path> --no-ignore
 
 # raise the size limit for very large generated files
 dup-detector scan <path> --max-file-bytes 8388608
+
+# remove the project's on-disk token cache (both project and user-cache locations)
+dup-detector clean <path>
 ```
 
 Scan options:

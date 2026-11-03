@@ -124,6 +124,9 @@ dup-detector scan <path> --no-ignore
 
 # 提高上限以包含超大生成文件
 dup-detector scan <path> --max-file-bytes 8388608
+
+# 清理该项目的磁盘 token 缓存（同时清理 project 与 user-cache 两处）
+dup-detector clean <path>
 ```
 
 扫描参数：
