@@ -1,16 +1,17 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use memmap2::Mmap;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::{CONFIG_DIR_NAME, CacheLocation};
-use crate::model::{Slice, SourceFile, Token, TokenKind};
+use crate::model::{
+    FLAG_CONTAINER_START, FLAG_UNIT_END, FLAG_UNIT_START, Slice, SourceFile, Token, TokenKind,
+};
 
-const MAGIC: &[u8; 8] = b"DUPCDT11";
+const MAGIC: &[u8; 8] = b"DUPCDT13";
 const HEADER_BYTES: usize = 52;
 
 pub const CACHE_DIR: &str = ".dup-detector";
@@ -22,7 +23,6 @@ pub struct CacheEntry {
     pub text_hash: u64,
     pub grammar_fingerprint: u64,
     pub tokens: Slice<Token>,
-    pub hashes: Slice<u64>,
 }
 
 struct Header {
@@ -32,12 +32,7 @@ struct Header {
     text_hash: u64,
     grammar_fingerprint: u64,
     token_count: usize,
-    hashes_offset: usize,
     tokens_offset: usize,
-}
-
-fn align8(value: usize) -> usize {
-    (value + 7) & !7
 }
 
 pub fn dir_in(root: &Path) -> PathBuf {
@@ -112,33 +107,20 @@ pub fn load_entry(path: &Path) -> Option<CacheEntry> {
     entry
 }
 
-#[cfg(target_endian = "little")]
 fn mmap_entry(file: &fs::File) -> Option<CacheEntry> {
     // SAFETY: cache entries are written atomically (temp file + rename) and
     // never modified in place while they can be mapped.
-    let map = Arc::new(unsafe { Mmap::map(file) }.ok()?);
+    let map = unsafe { Mmap::map(file) }.ok()?;
     let header = parse_header(&map)?;
-    let (tokens, hashes) = if header.token_count == 0 {
-        (Slice::owned(Vec::new()), Slice::owned(Vec::new()))
-    } else {
-        let hashes = Slice::mapped(map.clone(), header.hashes_offset, header.token_count)?;
-        let tokens = Slice::mapped(map, header.tokens_offset, header.token_count)?;
-        (tokens, hashes)
-    };
+    let tokens = decode_tokens(map.get(header.tokens_offset..)?, header.token_count)?;
     Some(CacheEntry {
         path: header.path,
         modified: header.modified,
         size: header.size,
         text_hash: header.text_hash,
         grammar_fingerprint: header.grammar_fingerprint,
-        tokens,
-        hashes,
+        tokens: Slice::owned(tokens),
     })
-}
-
-#[cfg(not(target_endian = "little"))]
-fn mmap_entry(_file: &fs::File) -> Option<CacheEntry> {
-    None
 }
 
 /// Writes (atomically) the cache entry for `file` into `dir`, keyed by its
@@ -179,13 +161,8 @@ fn encode_entry(base: &Path, file: &SourceFile) -> Option<Vec<u8>> {
     let (secs, nanos) = mtime_parts(modified)?;
     let path_bytes = path.as_bytes();
     let token_count = u32::try_from(file.tokens.len()).ok()?;
-    if file.hashes.len() != file.tokens.len() {
-        return None;
-    }
-    let hashes_offset = align8(HEADER_BYTES + path_bytes.len());
-    let tokens_offset = hashes_offset + file.hashes.len() * size_of::<u64>();
-    let total = tokens_offset + file.tokens.len() * size_of::<Token>();
-    let mut out = Vec::with_capacity(total);
+    let tokens_offset = HEADER_BYTES.checked_add(path_bytes.len())?;
+    let mut out = Vec::with_capacity(tokens_offset + file.tokens.len() * 4);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&u32::try_from(path_bytes.len()).ok()?.to_le_bytes());
     out.extend_from_slice(&token_count.to_le_bytes());
@@ -201,31 +178,37 @@ fn encode_entry(base: &Path, file: &SourceFile) -> Option<Vec<u8>> {
             .to_le_bytes(),
     );
     out.extend_from_slice(path_bytes);
-    out.resize(hashes_offset, 0);
-    for hash in file.hashes.as_slice() {
-        out.extend_from_slice(&hash.to_le_bytes());
-    }
-    append_tokens(&mut out, file.tokens.as_slice());
+    encode_tokens(&mut out, file.tokens.as_slice())?;
     Some(out)
 }
 
-#[cfg(target_endian = "little")]
-fn append_tokens(out: &mut Vec<u8>, tokens: &[Token]) {
-    out.extend_from_slice(bytemuck::cast_slice(tokens));
+fn encode_tokens(out: &mut Vec<u8>, tokens: &[Token]) -> Option<()> {
+    let mut previous_end = 0u32;
+    for (index, token) in tokens.iter().enumerate() {
+        let index = u32::try_from(index).ok()?;
+        write_varint(out, token.start.checked_sub(previous_end)?);
+        write_varint(out, token.end.checked_sub(token.start)?);
+        out.push(token.kind | (token.flags << 2));
+        if token.flags & FLAG_UNIT_START != 0 {
+            write_varint(out, token.unit_end_of_start.checked_sub(index)?);
+        }
+        if token.flags & FLAG_UNIT_END != 0 {
+            write_varint(out, index.checked_sub(token.unit_start_of_end)?);
+        }
+        if token.flags & FLAG_CONTAINER_START != 0 {
+            write_varint(out, token.container_end_of_start.checked_sub(index)?);
+        }
+        previous_end = token.end;
+    }
+    Some(())
 }
 
-#[cfg(not(target_endian = "little"))]
-fn append_tokens(out: &mut Vec<u8>, tokens: &[Token]) {
-    for token in tokens {
-        out.extend_from_slice(&token.start.to_le_bytes());
-        out.extend_from_slice(&token.end.to_le_bytes());
-        out.extend_from_slice(&token.unit_end_of_start.to_le_bytes());
-        out.extend_from_slice(&token.unit_start_of_end.to_le_bytes());
-        out.extend_from_slice(&token.container_end_of_start.to_le_bytes());
-        out.push(token.kind);
-        out.push(token.flags);
-        out.extend_from_slice(&token._pad);
+fn write_varint(out: &mut Vec<u8>, mut value: u32) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
     }
+    out.push(value as u8);
 }
 
 fn parse_header(bytes: &[u8]) -> Option<Header> {
@@ -245,12 +228,6 @@ fn parse_header(bytes: &[u8]) -> Option<Header> {
     let grammar_fingerprint = read_u64(bytes, &mut cursor)?;
     let path_end = HEADER_BYTES.checked_add(path_len)?;
     let path = PathBuf::from(std::str::from_utf8(bytes.get(HEADER_BYTES..path_end)?).ok()?);
-    let hashes_offset = align8(path_end);
-    let tokens_offset = hashes_offset.checked_add(token_count.checked_mul(size_of::<u64>())?)?;
-    let end = tokens_offset.checked_add(token_count.checked_mul(size_of::<Token>())?)?;
-    if end > bytes.len() || tokens_offset % align_of::<Token>() != 0 {
-        return None;
-    }
     Some(Header {
         path,
         modified: UNIX_EPOCH.checked_add(Duration::new(secs, nanos))?,
@@ -258,26 +235,13 @@ fn parse_header(bytes: &[u8]) -> Option<Header> {
         text_hash,
         grammar_fingerprint,
         token_count,
-        hashes_offset,
-        tokens_offset,
+        tokens_offset: path_end,
     })
 }
 
 fn decode_entry(bytes: &[u8]) -> Option<CacheEntry> {
     let header = parse_header(bytes)?;
-    let count = header.token_count;
-    let hash_bytes = bytes.get(header.hashes_offset..header.hashes_offset + count * 8)?;
-    let hashes = hash_bytes
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .map(|chunk| u64::from_le_bytes(*chunk))
-        .collect();
-    let raw = bytes.get(header.tokens_offset..header.tokens_offset + count * size_of::<Token>())?;
-    let mut tokens = Vec::with_capacity(count);
-    for chunk in raw.as_chunks::<{ size_of::<Token>() }>().0 {
-        tokens.push(decode_token(chunk)?);
-    }
+    let tokens = decode_tokens(bytes.get(header.tokens_offset..)?, header.token_count)?;
     Some(CacheEntry {
         path: header.path,
         modified: header.modified,
@@ -285,33 +249,74 @@ fn decode_entry(bytes: &[u8]) -> Option<CacheEntry> {
         text_hash: header.text_hash,
         grammar_fingerprint: header.grammar_fingerprint,
         tokens: Slice::owned(tokens),
-        hashes: Slice::owned(hashes),
     })
 }
 
-fn decode_token(raw: &[u8]) -> Option<Token> {
-    let kind = TokenKind::from_u8(*raw.get(20)?)?;
-    Some(Token {
-        start: read_u32_from(raw, 0)?,
-        end: read_u32_from(raw, 4)?,
-        unit_end_of_start: read_u32_from(raw, 8)?,
-        unit_start_of_end: read_u32_from(raw, 12)?,
-        container_end_of_start: read_u32_from(raw, 16)?,
-        kind: kind.as_u8(),
-        flags: *raw.get(21)?,
-        _pad: [0; 2],
-    })
+fn decode_tokens(bytes: &[u8], count: usize) -> Option<Vec<Token>> {
+    if count > bytes.len() / 3 {
+        return None;
+    }
+    let mut tokens = Vec::with_capacity(count);
+    let mut cursor = 0;
+    let mut previous_end = 0u32;
+    for index in 0..count {
+        let index = u32::try_from(index).ok()?;
+        let start = previous_end.checked_add(read_varint(bytes, &mut cursor)?)?;
+        let end = start.checked_add(read_varint(bytes, &mut cursor)?)?;
+        let packed = *bytes.get(cursor)?;
+        cursor += 1;
+        let kind = packed & 0b11;
+        TokenKind::from_u8(kind)?;
+        let flags = packed >> 2;
+        let mut token = Token {
+            start,
+            end,
+            unit_end_of_start: 0,
+            unit_start_of_end: u32::MAX,
+            container_end_of_start: 0,
+            kind,
+            flags,
+            _pad: [0; 2],
+        };
+        if flags & FLAG_UNIT_START != 0 {
+            token.unit_end_of_start = index.checked_add(read_varint(bytes, &mut cursor)?)?;
+        }
+        if flags & FLAG_UNIT_END != 0 {
+            token.unit_start_of_end = index.checked_sub(read_varint(bytes, &mut cursor)?)?;
+        }
+        if flags & FLAG_CONTAINER_START != 0 {
+            token.container_end_of_start = index.checked_add(read_varint(bytes, &mut cursor)?)?;
+        }
+        tokens.push(token);
+        previous_end = end;
+    }
+    if cursor != bytes.len() {
+        return None;
+    }
+    Some(tokens)
+}
+
+fn read_varint(bytes: &[u8], cursor: &mut usize) -> Option<u32> {
+    let mut value = 0u32;
+    for shift in [0, 7, 14, 21, 28] {
+        let byte = *bytes.get(*cursor)?;
+        *cursor += 1;
+        let part = (byte & 0x7F) as u32;
+        if shift == 28 && part > 0x0F {
+            return None;
+        }
+        value |= part << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
 }
 
 fn mtime_parts(time: SystemTime) -> Option<(u64, u32)> {
     time.duration_since(UNIX_EPOCH)
         .ok()
         .map(|duration| (duration.as_secs(), duration.subsec_nanos()))
-}
-
-fn read_u32_from(raw: &[u8], offset: usize) -> Option<u32> {
-    let mut cursor = offset;
-    read_u32(raw, &mut cursor)
 }
 
 fn read_u32(raw: &[u8], cursor: &mut usize) -> Option<u32> {
@@ -417,13 +422,69 @@ mod tests {
         assert_eq!(loaded.tokens.len(), 1);
         assert_eq!(loaded.tokens[0].kind, TokenKind::Identifier.as_u8());
         assert!(loaded.tokens[0].unit_start());
-        assert_eq!(loaded.hashes.as_slice(), file.hashes.as_slice());
-        #[cfg(target_endian = "little")]
-        {
-            assert!(loaded.tokens.is_mapped());
-            assert!(loaded.hashes.is_mapped());
-        }
+        assert!(!loaded.tokens.is_mapped());
         clear(&dir).unwrap();
+    }
+
+    #[test]
+    fn entries_use_compact_token_encoding() {
+        let dir = temp_dir("tokens-only");
+        let root = PathBuf::from("root");
+        let relative = Path::new("src").join("a.rs");
+        let file = source(&root.join(&relative), "let a = 1;\n");
+        store_entry(&dir, &root, &file).unwrap();
+        let entry = entry_path(&dir, &root, &file.path).expect("entry path");
+        let bytes = fs::read(entry).expect("entry file");
+        let mut payload = Vec::new();
+        encode_tokens(&mut payload, file.tokens.as_slice()).unwrap();
+        let expected = HEADER_BYTES + relative.to_str().unwrap().len() + payload.len();
+        assert_eq!(bytes.len(), expected);
+        assert!(payload.len() < file.tokens.len() * size_of::<Token>());
+        clear(&dir).unwrap();
+    }
+
+    #[test]
+    fn compact_tokens_round_trip() {
+        let dir = temp_dir("compact");
+        let root = PathBuf::from("root");
+        let relative = Path::new("src").join("a.rs");
+        let text = "fn f() { let alpha = beta + 1; }\n";
+        let tokens = crate::tokenize::tokenize(text, LanguageId::RUST).unwrap();
+        let file = SourceFile::new(
+            root.join(&relative),
+            LanguageId::RUST,
+            text.to_string(),
+            tokens,
+            Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            text.len() as u64,
+        );
+        store_entry(&dir, &root, &file).unwrap();
+        let entry = entry_path(&dir, &root, &file.path).expect("entry path");
+        let loaded = load_entry(&entry).expect("entry round-trips");
+        assert_eq!(loaded.tokens.as_slice(), file.tokens.as_slice());
+        clear(&dir).unwrap();
+    }
+
+    #[test]
+    fn varints_round_trip() {
+        for value in [0, 1, 127, 128, 16_383, 16_384, u32::MAX] {
+            let mut bytes = Vec::new();
+            write_varint(&mut bytes, value);
+            let mut cursor = 0;
+            assert_eq!(read_varint(&bytes, &mut cursor), Some(value));
+            assert_eq!(cursor, bytes.len());
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_varint() {
+        let mut cursor = 0;
+        assert_eq!(read_varint(&[0x80], &mut cursor), None);
+        let mut cursor = 0;
+        assert_eq!(
+            read_varint(&[0xFF, 0xFF, 0xFF, 0xFF, 0x1F], &mut cursor),
+            None
+        );
     }
 
     #[test]

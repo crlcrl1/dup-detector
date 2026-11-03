@@ -424,12 +424,20 @@ fn file_from_cache(
     if entry.grammar_fingerprint != language.grammar_fingerprint().unwrap_or(u64::MAX) {
         return None;
     }
+    if entry
+        .tokens
+        .iter()
+        .any(|token| token.start > token.end || token.end as usize > text.len())
+    {
+        return None;
+    }
+    let hashes = crate::encode::token_hashes(text.as_str(), entry.tokens.as_slice());
     let file = SourceFile::from_storage(
         path.to_path_buf(),
         language,
         text,
         entry.tokens,
-        entry.hashes,
+        crate::model::Slice::owned(hashes),
         Some(entry.modified),
         entry.size,
     );
@@ -803,6 +811,7 @@ mod tests {
             .iter()
             .map(|t| (t.kind, t.start, t.end))
             .collect();
+        let hashes_before = first.files()[0].hashes.to_vec();
         drop(first);
 
         let second =
@@ -815,6 +824,10 @@ mod tests {
             .map(|t| (t.kind, t.start, t.end))
             .collect();
         assert_eq!(before, after);
+        assert_eq!(
+            hashes_before.as_slice(),
+            second.files()[0].hashes.as_slice()
+        );
         fs::remove_dir_all(&dir).ok();
         fs::remove_dir_all(&cache_dir).ok();
     }
@@ -833,6 +846,32 @@ mod tests {
         index.refresh();
         assert_eq!(index.files().len(), 1);
         assert_eq!(entry_count(&cache_dir), 1);
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    #[test]
+    fn corrupt_token_offsets_fall_back_to_parsing() {
+        let dir = temp_dir("cache-corrupt-tokens");
+        let cache_dir = temp_dir("cache-corrupt-tokens-store");
+        fs::write(dir.join("a.rs"), "fn a() { let x = 1; }\n").unwrap();
+        let first =
+            SourceIndex::build_with_cache(&dir, &Config::default(), Some(&cache_dir)).unwrap();
+        drop(first);
+        let root = dir.canonicalize().unwrap();
+        let path = root.join("a.rs");
+        let entry = cache::entry_path(&cache_dir, &root, &path).expect("entry path");
+        let mut bytes = fs::read(&entry).unwrap();
+        let path_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let tokens_offset = 52 + path_len;
+        assert_eq!(bytes[tokens_offset], 0, "first token starts at offset 0");
+        bytes[tokens_offset + 1] = 0x7F;
+        fs::write(&entry, bytes).unwrap();
+        let second =
+            SourceIndex::build_with_cache(&dir, &Config::default(), Some(&cache_dir)).unwrap();
+        assert_eq!(second.stats().cache_hits, 0);
+        assert_eq!(second.stats().parsed_files, 1);
+        assert_eq!(second.files().len(), 1);
         fs::remove_dir_all(&dir).ok();
         fs::remove_dir_all(&cache_dir).ok();
     }

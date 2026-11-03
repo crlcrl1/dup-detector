@@ -59,7 +59,7 @@ src/
   encode.rs      Token stream -> parameterized encoding (rename-invariant)
   detect.rs      seed-and-extend detection + bijection check + clone clustering
   index.rs       Project-level index (file discovery, parallel parsing, incremental invalidation)
-  cache.rs       On-disk token cache (project `.dup-detector/` or, with `cache_location = "user-cache"`, `<user cache dir>/dup-detector/<hash of root>`; one entry per source file named by a hash of its cache-base-relative path — the index root, or the server's startup directory when scope indexes share one cache — mtime/size/text-hash validated plus a `grammar_fingerprint` so grammar upgrades or plugin manifest changes invalidate stale tokens; entries are flat little-endian POD arrays (`Token`/hash) mapped zero-copy via `memmap2` on big-endian fallback decoded)
+  cache.rs       On-disk token cache (project `.dup-detector/` or, with `cache_location = "user-cache"`, `<user cache dir>/dup-detector/<hash of root>`; one entry per source file named by a hash of its cache-base-relative path — the index root, or the server's startup directory when scope indexes share one cache — mtime/size/text-hash validated plus a `grammar_fingerprint` so grammar upgrades or plugin manifest changes invalidate stale tokens; entries use a compact little-endian varint/delta encoding of the `Token` stream decoded into owned arrays on load, and token hashes are recomputed from the text instead of being stored)
   server.rs      rmcp ServerHandler + #[tool] tool definitions
   lsp.rs         tower-lsp LanguageServer (diagnostics, definition, references, hover)
 editors/
