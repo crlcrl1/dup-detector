@@ -198,6 +198,7 @@ pub struct LanguageDef {
     source: LanguageSource,
     _library: Option<Library>,
     kind_tables: OnceLock<Arc<KindTables>>,
+    fingerprint: OnceLock<u64>,
 }
 
 impl LanguageDef {
@@ -234,6 +235,10 @@ impl LanguageDef {
     /// store this so a grammar upgrade or manifest change invalidates stale
     /// tokens even when the source file itself is unchanged.
     pub fn fingerprint(&self) -> u64 {
+        *self.fingerprint.get_or_init(|| self.compute_fingerprint())
+    }
+
+    fn compute_fingerprint(&self) -> u64 {
         let count = self.grammar.node_kind_count();
         let mut bytes = Vec::with_capacity(64 + count * 16);
         bytes.extend_from_slice(self.name.as_bytes());
@@ -295,6 +300,7 @@ impl LanguageRegistry {
             source: spec.source,
             _library: spec.library,
             kind_tables: OnceLock::new(),
+            fingerprint: OnceLock::new(),
         });
         self.by_name.insert(spec.name, id);
         for alias in spec.aliases {

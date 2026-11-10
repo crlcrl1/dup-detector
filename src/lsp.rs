@@ -1,22 +1,23 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use tokio::sync::Notify;
-use tower_lsp::jsonrpc::Result as LspResult;
-use tower_lsp::lsp_types::{
+use tower_lsp_server::jsonrpc::Result as LspResult;
+use tower_lsp_server::ls_types::{
     Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DidChangeTextDocumentParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
     InitializeParams, InitializeResult, InitializedParams, Location, MarkupContent, MarkupKind,
     MessageType, OneOf, Position, Range, ReferenceParams, ServerCapabilities, ServerInfo,
     TextDocumentContentChangeEvent, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Url,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Uri,
 };
-use tower_lsp::{Client, LanguageServer, LspService, Server};
+use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
 use crate::config::Config;
 use crate::detect;
@@ -29,9 +30,24 @@ use crate::tokenize;
 const DEBOUNCE: Duration = Duration::from_millis(350);
 const MAX_DIAGNOSTICS_PER_FILE: usize = 100;
 const SOURCE: &str = "dup-detector";
+const URI_SEGMENT: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'[')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
 
 struct Document {
-    uri: Url,
+    uri: Uri,
     path: PathBuf,
     file: Arc<SourceFile>,
 }
@@ -213,22 +229,27 @@ struct Snapshot {
 impl Snapshot {
     fn groups_at<'a>(
         &'a self,
-        uri: &'a Url,
+        path: &'a Path,
         position: Position,
     ) -> impl Iterator<Item = &'a NavGroup> {
         self.groups.iter().filter(move |group| {
             group
                 .occurrences
                 .iter()
-                .any(|occ| occ.contains(uri, position))
+                .any(|occ| occ.contains(path, position))
         })
     }
 
-    fn locations_at(&self, uri: &Url, position: Position, include_current: bool) -> Vec<Location> {
+    fn locations_at(
+        &self,
+        path: &Path,
+        position: Position,
+        include_current: bool,
+    ) -> Vec<Location> {
         let mut locations = Vec::new();
-        for group in self.groups_at(uri, position) {
+        for group in self.groups_at(path, position) {
             for occ in &group.occurrences {
-                if !include_current && occ.contains(uri, position) {
+                if !include_current && occ.contains(path, position) {
                     continue;
                 }
                 let location = Location {
@@ -252,18 +273,18 @@ struct NavGroup {
 
 struct NavOccurrence {
     path: PathBuf,
-    uri: Url,
+    uri: Uri,
     range: Range,
 }
 
 impl NavOccurrence {
-    fn contains(&self, uri: &Url, position: Position) -> bool {
-        self.uri == *uri && range_contains(&self.range, position)
+    fn contains(&self, path: &Path, position: Position) -> bool {
+        self.path == path && range_contains(&self.range, position)
     }
 }
 
 struct Analysis {
-    diagnostics: Vec<(Url, Vec<Diagnostic>)>,
+    diagnostics: Vec<(Uri, Vec<Diagnostic>)>,
     snapshot: Arc<Snapshot>,
     consumed: PendingChanges,
 }
@@ -290,7 +311,7 @@ impl Backend {
     }
 
     fn set_root(&self, root: PathBuf) {
-        let root = root.canonicalize().unwrap_or(root);
+        let root = dunce::canonicalize(&root).unwrap_or(root);
         let mut guard = self
             .state
             .lock()
@@ -311,10 +332,10 @@ impl Backend {
     fn update(
         &self,
         state: &Arc<State>,
-        uri: Url,
+        uri: Uri,
         changes: Vec<TextDocumentContentChangeEvent>,
-    ) -> Option<Url> {
-        let path = uri.to_file_path().ok()?;
+    ) -> Option<Uri> {
+        let path = uri_path(&uri)?;
         let path = canonical_path(path);
         let language = LanguageId::from_path(&path)?;
         // Serialize change application against other updates for the same file;
@@ -433,13 +454,16 @@ impl Backend {
     /// caller should clear any stale diagnostics published for that URI.
     fn open_document(
         state: &State,
-        uri: Url,
+        uri: Uri,
         path: PathBuf,
         language: LanguageId,
         text: String,
-    ) -> Option<Url> {
+    ) -> Option<Uri> {
         if !path.starts_with(&state.root) {
-            tracing::debug!(uri = %uri, "ignoring file outside the workspace root");
+            tracing::debug!(
+                uri = uri.as_str(),
+                "ignoring file outside the workspace root"
+            );
             return None;
         }
         let max_file_bytes = state
@@ -448,11 +472,11 @@ impl Backend {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .max_file_bytes;
         if !state.config().language_enabled(language) {
-            tracing::debug!(uri = %uri, "ignoring file of a disabled language");
+            tracing::debug!(uri = uri.as_str(), "ignoring file of a disabled language");
             return None;
         }
         if text.len() as u64 > max_file_bytes {
-            tracing::debug!(uri = %uri, size = text.len(), "skipping large file");
+            tracing::debug!(uri = uri.as_str(), size = text.len(), "skipping large file");
             trace(&format!(
                 "open skip large {} bytes={}",
                 path.display(),
@@ -493,7 +517,6 @@ impl Backend {
     }
 }
 
-#[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> LspResult<InitializeResult> {
         if let Some(root) = root_from_params(&params) {
@@ -511,13 +534,16 @@ impl LanguageServer for Backend {
                 )),
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
-                hover_provider: Some(tower_lsp::lsp_types::HoverProviderCapability::Simple(true)),
+                hover_provider: Some(tower_lsp_server::ls_types::HoverProviderCapability::Simple(
+                    true,
+                )),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
                 name: "dup-detector".to_string(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }),
+            offset_encoding: None,
         })
     }
 
@@ -537,8 +563,8 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let state = self.state();
         let item = params.text_document;
-        tracing::debug!(uri = %item.uri, "did_open");
-        let Ok(path) = item.uri.to_file_path() else {
+        tracing::debug!(uri = item.uri.as_str(), "did_open");
+        let Some(path) = uri_path(&item.uri) else {
             return;
         };
         let path = canonical_path(path);
@@ -570,7 +596,7 @@ impl LanguageServer for Backend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let state = self.state();
         let uri = params.text_document.uri;
-        if let Ok(path) = uri.to_file_path() {
+        if let Some(path) = uri_path(&uri) {
             let path = canonical_path(path);
             let mut documents = state
                 .documents
@@ -594,9 +620,11 @@ impl LanguageServer for Backend {
     ) -> LspResult<Option<GotoDefinitionResponse>> {
         let state = self.state();
         let position = params.text_document_position_params;
+        let Some(path) = request_path(&position.text_document.uri) else {
+            return Ok(None);
+        };
         let snapshot = state.snapshot();
-        let locations =
-            snapshot.locations_at(&position.text_document.uri, position.position, false);
+        let locations = snapshot.locations_at(&path, position.position, false);
         if locations.is_empty() {
             Ok(None)
         } else {
@@ -607,8 +635,11 @@ impl LanguageServer for Backend {
     async fn references(&self, params: ReferenceParams) -> LspResult<Option<Vec<Location>>> {
         let state = self.state();
         let position = params.text_document_position;
+        let Some(path) = request_path(&position.text_document.uri) else {
+            return Ok(None);
+        };
         let snapshot = state.snapshot();
-        let locations = snapshot.locations_at(&position.text_document.uri, position.position, true);
+        let locations = snapshot.locations_at(&path, position.position, true);
         if locations.is_empty() {
             Ok(None)
         } else {
@@ -619,9 +650,11 @@ impl LanguageServer for Backend {
     async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
         let state = self.state();
         let position = params.text_document_position_params;
-        let uri = &position.text_document.uri;
+        let Some(path) = request_path(&position.text_document.uri) else {
+            return Ok(None);
+        };
         let snapshot = state.snapshot();
-        let Some(group) = snapshot.groups_at(uri, position.position).next() else {
+        let Some(group) = snapshot.groups_at(&path, position.position).next() else {
             return Ok(None);
         };
         let mut value = format!(
@@ -631,7 +664,7 @@ impl LanguageServer for Backend {
             clone_type_label(group.clone_type)
         );
         for occ in &group.occurrences {
-            let here = occ.uri == *uri;
+            let here = occ.path == path;
             value.push_str(&format!(
                 "- {}{}:{}\n",
                 if here { "(here) " } else { "" },
@@ -650,7 +683,77 @@ impl LanguageServer for Backend {
 }
 
 fn canonical_path(path: PathBuf) -> PathBuf {
-    path.canonicalize().unwrap_or(path)
+    dunce::canonicalize(&path).unwrap_or(path)
+}
+
+fn uri_path(uri: &Uri) -> Option<PathBuf> {
+    if !uri.scheme().as_str().eq_ignore_ascii_case("file") {
+        return None;
+    }
+    let host = uri
+        .authority()
+        .map(|authority| authority.host())
+        .unwrap_or_default();
+    if cfg!(windows) && !host.is_empty() {
+        let path = uri.path().decode().to_string_lossy().replace('/', "\\");
+        if host.eq_ignore_ascii_case("localhost") {
+            return Some(PathBuf::from(path.trim_start_matches('\\')));
+        }
+        return Some(PathBuf::from(format!(r"\\{host}{path}")));
+    }
+    local_path(uri, host)
+}
+
+#[cfg(unix)]
+fn local_path(uri: &Uri, host: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
+        return None;
+    }
+    let bytes = uri.path().decode().to_bytes().into_owned();
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+#[cfg(not(unix))]
+fn local_path(uri: &Uri, _host: &str) -> Option<PathBuf> {
+    uri.to_file_path().map(|path| path.into_owned())
+}
+
+fn request_path(uri: &Uri) -> Option<PathBuf> {
+    uri_path(uri).map(canonical_path)
+}
+
+fn file_uri(path: &Path) -> Option<Uri> {
+    if let Some(Component::Prefix(prefix)) = path.components().next()
+        && let Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) = prefix.kind()
+    {
+        let segments: Vec<String> = std::iter::once(share)
+            .chain(path.components().filter_map(|component| match component {
+                Component::Normal(part) => Some(part),
+                _ => None,
+            }))
+            .map(|part| utf8_percent_encode(&part.to_string_lossy(), URI_SEGMENT).to_string())
+            .collect();
+        return format!("file://{}/{}", server.to_string_lossy(), segments.join("/"))
+            .parse()
+            .ok();
+    }
+    local_uri(path)
+}
+
+#[cfg(unix)]
+fn local_uri(path: &Path) -> Option<Uri> {
+    use std::os::unix::ffi::OsStrExt;
+    if !path.is_absolute() {
+        return Uri::from_file_path(path);
+    }
+    let encoded = percent_encoding::percent_encode(path.as_os_str().as_bytes(), URI_SEGMENT);
+    format!("file://{encoded}").parse().ok()
+}
+
+#[cfg(not(unix))]
+fn local_uri(path: &Path) -> Option<Uri> {
+    Uri::from_file_path(path)
 }
 
 fn trace(message: &str) {
@@ -678,9 +781,10 @@ fn trace(message: &str) {
     }
 }
 
+#[allow(deprecated)]
 fn root_from_params(params: &InitializeParams) -> Option<PathBuf> {
     if let Some(uri) = &params.root_uri
-        && let Ok(path) = uri.to_file_path()
+        && let Some(path) = uri_path(uri)
     {
         return Some(path);
     }
@@ -688,7 +792,7 @@ fn root_from_params(params: &InitializeParams) -> Option<PathBuf> {
         .workspace_folders
         .as_ref()
         .and_then(|folders| folders.first())
-        .and_then(|folder| folder.uri.to_file_path().ok())
+        .and_then(|folder| uri_path(&folder.uri))
 }
 
 fn spawn_analysis(client: Client, state: Arc<State>) {
@@ -993,7 +1097,7 @@ fn nav_occurrence(
     lines: &mut HashMap<PathBuf, Vec<usize>>,
 ) -> Option<NavOccurrence> {
     let file = files[occurrence.file as usize];
-    let uri = Url::from_file_path(&file.path).ok()?;
+    let uri = file_uri(&file.path)?;
     let starts = lines
         .entry(file.path.clone())
         .or_insert_with(|| build_line_starts(&file.text));
@@ -1158,7 +1262,7 @@ fn splice_line_starts(starts: &mut Vec<usize>, start: usize, end: usize, replace
 }
 
 fn resolve_root(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 pub fn run(config: Config, root: PathBuf) -> anyhow::Result<()> {
@@ -1192,7 +1296,7 @@ mod tests {
     async fn navigation_preserves_locations_and_first_hover_group() {
         let root = std::env::temp_dir().join("dup-detector-navigation-test");
         let location = |file: &str, start, end| Location {
-            uri: Url::from_file_path(root.join(file)).unwrap(),
+            uri: Uri::from_file_path(root.join(file)).unwrap(),
             range: Range::new(Position::new(start, 0), Position::new(end, 0)),
         };
         let here = location("a.rs", 2, 4);
@@ -1205,7 +1309,7 @@ mod tests {
             occurrences: locations
                 .iter()
                 .map(|location| NavOccurrence {
-                    path: location.uri.to_file_path().unwrap(),
+                    path: uri_path(&location.uri).unwrap(),
                     uri: location.uri.clone(),
                     range: location.range,
                 })
@@ -1286,6 +1390,94 @@ mod tests {
                 assert_eq!(hover, None);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn navigation_matches_requests_by_path_not_uri_spelling() {
+        let root = std::env::temp_dir().join("dup-detector-navigation-spelling-test");
+        let uri = |file: &str| Uri::from_file_path(root.join(file)).unwrap();
+        let range = Range::new(Position::new(2, 0), Position::new(4, 0));
+        let occurrence = |file: &str| NavOccurrence {
+            path: root.join(file),
+            uri: uri(file),
+            range,
+        };
+        let (service, _socket) =
+            LspService::new(|client| Backend::new(client, root.clone(), Config::default()));
+        let backend = service.inner();
+        *backend.state().snapshot.lock().unwrap() = Arc::new(Snapshot {
+            groups: vec![NavGroup {
+                token_count: 50,
+                clone_type: CloneType::Type2,
+                occurrences: vec![occurrence("a.rs"), occurrence("b.rs")],
+            }],
+            signatures: FastSet::default(),
+        });
+        let spelled = uri("a.rs").as_str().replace("a.rs", "%61.rs");
+        assert_ne!(spelled, uri("a.rs").as_str());
+        let params = serde_json::json!({
+            "textDocument": { "uri": spelled },
+            "position": Position::new(3, 0),
+        });
+        let definition = backend
+            .goto_definition(serde_json::from_value(params).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            definition,
+            Some(GotoDefinitionResponse::Array(vec![Location {
+                uri: uri("b.rs"),
+                range,
+            }]))
+        );
+    }
+
+    #[test]
+    fn root_uri_sets_the_root_when_workspace_folders_are_absent() {
+        let root = std::env::temp_dir().join("dup-detector-root-uri-test");
+        let params: InitializeParams = serde_json::from_value(serde_json::json!({
+            "processId": null,
+            "rootUri": file_uri(&root).unwrap(),
+            "capabilities": {},
+        }))
+        .unwrap();
+        assert_eq!(root_from_params(&params), Some(root));
+    }
+
+    #[test]
+    fn non_file_uris_do_not_map_to_paths() {
+        let path = std::env::temp_dir()
+            .join("dup-detector-scheme-test")
+            .join("a.rs");
+        let file = file_uri(&path).unwrap();
+        assert_eq!(uri_path(&file), Some(path));
+        let virtual_document: Uri = file.as_str().replacen("file:", "git:", 1).parse().unwrap();
+        assert_eq!(uri_path(&virtual_document), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unc_paths_round_trip_through_file_uris() {
+        let path = PathBuf::from(r"\\server\share\dir\a b.rs");
+        let uri = file_uri(&path).unwrap();
+        assert_eq!(
+            uri.authority()
+                .map(|authority| authority.host().to_string()),
+            Some("server".to_string())
+        );
+        assert_eq!(uri_path(&uri), Some(path.clone()));
+        let incoming: Uri = "file://server/share/dir/a%20b.rs".parse().unwrap();
+        assert_eq!(uri_path(&incoming), Some(path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_unix_filenames_round_trip_through_file_uris() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(b"/project/a\xFF.rs"));
+        let uri = file_uri(&path).unwrap();
+        assert_eq!(uri.as_str(), "file:///project/a%FF.rs");
+        assert_eq!(uri_path(&uri), Some(path));
     }
 
     #[test]
@@ -1406,7 +1598,7 @@ mod tests {
             std::env::temp_dir().join(format!("dup-detector-lsp-disabled-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
-        let root = dir.canonicalize().unwrap();
+        let root = dunce::canonicalize(&dir).unwrap();
         let config = Config {
             languages: Some(vec![LanguageId::RUST]),
             ..Config::default()
@@ -1415,7 +1607,7 @@ mod tests {
         let path = root.join("a.py");
         let text = "def f():\n    return 1\n";
         std::fs::write(&path, text).unwrap();
-        let uri = Url::from_file_path(&path).unwrap();
+        let uri = Uri::from_file_path(&path).unwrap();
         assert_eq!(
             Backend::open_document(&state, uri, path, LanguageId::PYTHON, text.to_string()),
             None
@@ -1636,7 +1828,7 @@ mod tests {
             0,
         ));
         let document = Arc::new(Document {
-            uri: Url::from_file_path(path).unwrap(),
+            uri: Uri::from_file_path(path).unwrap(),
             path: path.to_path_buf(),
             file,
         });
@@ -1692,7 +1884,7 @@ mod tests {
         fs::write(dir.join("a.rs"), fn_a).unwrap();
         fs::write(dir.join("b.rs"), fn_b).unwrap();
         fs::write(dir.join("main.rs"), main).unwrap();
-        let root = dir.canonicalize().unwrap();
+        let root = dunce::canonicalize(&dir).unwrap();
         let state = State::new(root.clone(), Config::default());
         let path_a = root.join("a.rs");
         insert_document(&state, &path_a, fn_a);
