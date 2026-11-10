@@ -29,7 +29,7 @@ Already written into `Cargo.toml`; no need to pick versions again:
 
 - Rust **edition 2024**, toolchain 1.98+
 - MCP SDK: `rmcp` 3.5 (feat. `transport-io`, stdio transport)
-- LSP SDK: `tower-lsp` 0.20 (stdio transport, tokio runtime)
+- LSP SDK: `tower-lsp-server` 0.23 (maintained fork of `tower-lsp`; stdio transport, tokio runtime, `ls_types::Uri`)
 - Parsing: `tree-sitter` 0.27 + grammars: rust / python / javascript / typescript / c / cpp (`tree-sitter-language` for dynamically loaded grammars)
 - Grammar plugins: `libloading` (dlopen tree-sitter grammar shared libraries at startup)
 - Traversal: `ignore` (respects .gitignore), `rayon` (parallel parsing)
@@ -39,6 +39,8 @@ Already written into `Cargo.toml`; no need to pick versions again:
 - Platform paths: `dirs` (user config/cache directories)
 - Logging: `tracing` / `tracing-subscriber` (env-filter)
 - Hashing: `xxhash-rust` (xxh3)
+- Paths: `dunce` (canonical paths without the Windows `\\?\` prefix, so output paths and LSP URIs stay plain)
+- Allocator: `mimalloc` as the binary's global allocator
 
 ## 3. Architecture and Module Plan
 
@@ -61,7 +63,7 @@ src/
   index.rs       Project-level index (file discovery, parallel parsing, incremental invalidation)
   cache.rs       On-disk token cache (project `.dup-detector/` or, with `cache_location = "user-cache"`, `<user cache dir>/dup-detector/<hash of root>`; one entry per source file named by a hash of its cache-base-relative path — the index root, or the server's startup directory when scope indexes share one cache — mtime/size/text-hash validated plus a `grammar_fingerprint` so grammar upgrades or plugin manifest changes invalidate stale tokens; entries use a compact little-endian varint/delta encoding of the `Token` stream decoded into owned arrays on load, and token hashes are recomputed from the text instead of being stored)
   mcp.rs         rmcp ServerHandler + #[tool] tool definitions
-  lsp.rs         tower-lsp LanguageServer (diagnostics, definition, references, hover)
+  lsp.rs         tower-lsp-server LanguageServer (diagnostics, definition, references, hover)
 editors/
   vscode/        VS Code extension (vscode-languageclient, packages to .vsix)
   zed/           Zed extension (wasm, registers the language server name)
@@ -94,7 +96,7 @@ Correctness invariant: for every clone whose occurrences include an open file, t
 2. **Parameterized encoding**: encode identifiers by "distance since previous occurrence" (first occurrence = 0, repeats = current index - previous index; same for literals, optional toggle). This makes `a=b+c` and `x=y+z` encode identically while still requiring structural identity, avoiding over-normalization.
 3. **seed-and-extend**:
    - Use fixed-length (default 8) token windows as seeds; hash and bucket them using **local** parameterized encoding within the window to guarantee rename invariance.
-   - If a bucket has too many occurrences (> `max_bucket`), it is a generic pattern; discard it to reduce noise.
+   - If a bucket has too many occurrences (> `max_bucket`), it is refined by parameterized fingerprints of doubling span (16 up to 256 tokens). Sub-buckets still above `max_bucket` recurse; base-level members that stay below it are dropped as generic noise. At refined levels every member is star-paired to the bucket's first member, and that member's sub-bucket to the first member outside it, so code copied more than `max_bucket` times is still reported at linear pair cost.
    - Run a **bijection check** on candidate pairs (identifiers must map one-to-one; any conflict fails), then extend maximally left/right to obtain the maximal matching span.
 4. **Fixed tokens** (keywords/operators/punctuation) must match exactly; identifiers use bijection; literals match exactly by default (`parameterize_literals` can be enabled).
 5. **Post-processing**: merge overlapping/adjacent matches within the same file pair only when their file-offset alignment stays constant (prevents span drift); report occurrences only at single-semantic-unit granularity — a span must be exactly one statement, item, or block (per-token unit ranges are recorded during tokenization), and multi-unit matches are split into one clone group per unit; drop groups that cannot be aligned; drop group occurrences that do not match the group representative (exact parameterized keys), so only Type-1/Type-2 clones are reported; filter boilerplate (imports, pure declarations) unless `filter_boilerplate` is disabled; sort by token count; limit the number of returned groups.
@@ -124,6 +126,8 @@ cargo run -- mcp                  # start MCP server over stdio
 cargo run -- lsp                  # start language server over stdio
 cargo run -- scan <path>          # scan from the command line and print results
 cargo run -- scan <path> --json --min-lines 7 --min-occurrences 2 --parameterize-literals --lang rust
+cargo run -- scan <path> --json --file <file> [--stdin]   # only clones involving <file> (repeatable); --stdin reads its proposed contents
+cargo run -- scan <path> --json --stdin-json              # stdin {"files":[{"path","text"}],"exclude":[path]}: check proposed files, drop excluded ones
 cargo run -- clean [path]         # remove the project's on-disk token cache (project + user-cache)
 cargo run -- languages            # list registered languages (built-in + plugins)
 cargo run -- install go           # download tree-sitter-go, compile and install it as a plugin
@@ -140,6 +144,7 @@ Note: the `rmcp` and LSP servers must not write to stdout; all logs go to stderr
 
 - Follow `rustfmt` defaults; run `cargo fmt` and `cargo clippy -- -D warnings` before committing; no warnings allowed.
 - Error handling: use `anyhow` in application/CLI layers and `thiserror` for reusable library types; avoid `unwrap`/`expect` in library code (except tests).
+- Approved lint exception: `root_from_params` in `lsp.rs` carries `#[allow(deprecated)]` because `ls_types` marks `InitializeParams::root_uri` deprecated, yet clients that send only `rootUri` still need it as the workspace root (read first, then `workspaceFolders`, as before the `tower-lsp-server` move).
 - Do not write explanatory comments unless the logic is very counterintuitive. `///` doc comments are only for tool parameters that appear in the MCP JSON schema (visible to agents, so they serve a real purpose).
 - Prefer immutability and borrowing; avoid needless `clone`; watch allocations on the detection hot path (avoid creating a `HashMap` per seed window).
 - Adding a language (built-in): register the extension and grammar in `language.rs`, and add a corpus test.
@@ -153,7 +158,7 @@ Note: the `rmcp` and LSP servers must not write to stdout; all logs go to stderr
 - **Phase 2** Done: tree-sitter token extraction and parameterized encoding, with unit tests.
 - **Phase 3** Done: seed-and-extend detection + bijection check + maximal matching + clone clustering; `find_clones` usable.
 - **Phase 4** Done: filtering/sorting/clustering for Type-1/Type-2 clones.
-- **Phase 5** Done: project index with mtime/size incremental refresh and a best-effort on-disk token cache (`.dup-detector/` in the scanned root by default, or a per-root directory under the user cache dir when `cache_location = "user-cache"`; one entry per source file, named by a hash of its cache-base-relative path and validated by mtime/size/text hash; corrupt/missing entries fall back to parsing; refresh only rewrites changed entries and drops entries for removed files; MCP scope indexes key entries by startup-directory-relative path so all scopes of one workspace share a single entry per file; `reindex` clears both locations).
+- **Phase 5** Done: project index with mtime/size incremental refresh and a best-effort on-disk token cache (`.dup-detector/` in the scanned root by default, or a per-root directory under the user cache dir when `cache_location = "user-cache"`; one entry per source file, named by a hash of its cache-base-relative path and validated by mtime/size/text hash; corrupt/missing entries fall back to parsing; refresh only rewrites changed entries and drops entries for removed files, and a one-shot build that parsed anything prunes entries whose files are gone (over all registered languages, so `--lang` scans keep other languages' entries); user-cache directories record their root in a `root` marker and are removed once that root is deleted while its parent still exists; non-UTF-8 sources are decoded (UTF-16 with BOM, otherwise lossy UTF-8); MCP scope indexes key entries by startup-directory-relative path so all scopes of one workspace share a single entry per file; `reindex` clears both locations).
 - **Phase 6** Done: corpus regression under `tests/corpus/` (rename / change constant / add line / same file / unrelated) with precision/recall assertions in `tests/corpus.rs`.
 - **Phase 7** Done: `lsp.rs` LSP server over stdio publishing clone warnings for open documents plus go-to-definition / references / hover navigation, with incremental sync, debouncing, generation-based cancellation and open-document seed filtering.
 

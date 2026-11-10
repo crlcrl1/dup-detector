@@ -1,9 +1,9 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use memmap2::Mmap;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::{CONFIG_DIR_NAME, CacheLocation};
@@ -15,6 +15,8 @@ const MAGIC: &[u8; 8] = b"DUPCDT13";
 const HEADER_BYTES: usize = 52;
 
 pub const CACHE_DIR: &str = ".dup-detector";
+const ENTRY_EXTENSION: &str = "bin";
+const ROOT_MARKER: &str = "root";
 
 pub struct CacheEntry {
     pub path: PathBuf,
@@ -69,9 +71,13 @@ pub fn dir_for(root: &Path, location: CacheLocation) -> Option<PathBuf> {
 /// Cache file for `path` inside `dir`; `path` must live under `base` (the
 /// cache base — the index root, or a shared workspace root for scope indexes).
 pub fn entry_path(dir: &Path, base: &Path, path: &Path) -> Option<PathBuf> {
+    Some(dir.join(entry_name(base, path)?))
+}
+
+pub fn entry_name(base: &Path, path: &Path) -> Option<String> {
     let relative = path.strip_prefix(base).ok()?;
     let key = xxh3_64(relative.as_os_str().as_encoded_bytes());
-    Some(dir.join(format!("{key:016x}.bin")))
+    Some(format!("{key:016x}.{ENTRY_EXTENSION}"))
 }
 
 pub fn text_hash(text: &str) -> u64 {
@@ -83,44 +89,19 @@ pub fn text_hash_bytes(bytes: &[u8]) -> u64 {
 }
 
 pub fn load_entry(path: &Path) -> Option<CacheEntry> {
-    let file = match fs::File::open(path) {
-        Ok(file) => file,
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
         Err(error) => {
             tracing::debug!(path = %path.display(), error = %error, "cannot read cache entry");
             return None;
         }
     };
-    let entry = match mmap_entry(&file) {
-        Some(entry) => Some(entry),
-        None => match fs::read(path) {
-            Ok(bytes) => decode_entry(&bytes),
-            Err(error) => {
-                tracing::debug!(path = %path.display(), error = %error, "cannot read cache entry");
-                None
-            }
-        },
-    };
+    let entry = decode_entry(&bytes);
     if entry.is_none() {
         tracing::debug!(path = %path.display(), "ignoring unusable cache entry");
     }
     entry
-}
-
-fn mmap_entry(file: &fs::File) -> Option<CacheEntry> {
-    // SAFETY: cache entries are written atomically (temp file + rename) and
-    // never modified in place while they can be mapped.
-    let map = unsafe { Mmap::map(file) }.ok()?;
-    let header = parse_header(&map)?;
-    let tokens = decode_tokens(map.get(header.tokens_offset..)?, header.token_count)?;
-    Some(CacheEntry {
-        path: header.path,
-        modified: header.modified,
-        size: header.size,
-        text_hash: header.text_hash,
-        grammar_fingerprint: header.grammar_fingerprint,
-        tokens: Slice::owned(tokens),
-    })
 }
 
 /// Writes (atomically) the cache entry for `file` into `dir`, keyed by its
@@ -152,6 +133,58 @@ pub fn clear(dir: &Path) -> io::Result<()> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
+    }
+}
+
+pub fn retain_entries(dir: &Path, live: &HashSet<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let stale = path.extension().is_some_and(|ext| ext == ENTRY_EXTENSION)
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| !live.contains(name));
+        if stale && let Err(error) = fs::remove_file(&path) {
+            tracing::debug!(path = %path.display(), error = %error, "cannot prune cache entry");
+        }
+    }
+}
+
+pub fn mark_root(dir: &Path, root: &Path) {
+    let marker = dir.join(ROOT_MARKER);
+    if marker.exists() {
+        return;
+    }
+    let Some(root) = root.to_str() else {
+        return;
+    };
+    if let Err(error) = write_atomic(&marker, root.as_bytes()) {
+        tracing::debug!(path = %marker.display(), error = %error, "cannot write cache root marker");
+    }
+}
+
+pub fn collect_stale_roots(base: &Path) {
+    let Ok(dirs) = fs::read_dir(base) else {
+        return;
+    };
+    for dir in dirs.flatten() {
+        let path = dir.path();
+        let Some(root) = fs::read(path.join(ROOT_MARKER))
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .map(PathBuf::from)
+        else {
+            continue;
+        };
+        if !root.exists()
+            && root.parent().is_some_and(Path::exists)
+            && let Err(error) = clear(&path)
+        {
+            tracing::debug!(path = %path.display(), error = %error, "cannot remove stale cache");
+        }
     }
 }
 
@@ -564,5 +597,30 @@ mod tests {
         let b = entry_path(&dir, &root, &root.join("b.rs")).expect("entry path");
         assert_ne!(a, b);
         assert_eq!(a.parent(), Some(dir.as_path()));
+    }
+
+    #[test]
+    fn collects_only_user_cache_dirs_of_removed_roots() {
+        let base = temp_dir("gc-base");
+        let live_root = temp_dir("gc-live");
+        fs::create_dir_all(&live_root).unwrap();
+        let dead_root = live_root.join("removed");
+        let live = user_cache_dir_in(&base, &live_root);
+        let dead = user_cache_dir_in(&base, &dead_root);
+        let unmarked = base.join("00000000000000ff");
+        let unmounted = user_cache_dir_in(&base, Path::new("Q:\\offline\\project"));
+        for dir in [&live, &dead, &unmarked, &unmounted] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        mark_root(&live, &live_root);
+        mark_root(&dead, &dead_root);
+        mark_root(&unmounted, Path::new("Q:\\offline\\project"));
+        collect_stale_roots(&base);
+        assert!(live.is_dir());
+        assert!(!dead.exists());
+        assert!(unmarked.is_dir());
+        assert!(unmounted.is_dir());
+        clear(&base).unwrap();
+        clear(&live_root).unwrap();
     }
 }

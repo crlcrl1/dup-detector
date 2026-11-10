@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
+use tower_lsp_server::ls_types::{Position, Range, TextDocumentContentChangeEvent};
 
 use dup_detector::cache;
 use dup_detector::config::Config;

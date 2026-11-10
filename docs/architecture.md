@@ -24,8 +24,9 @@ file discovery (.gitignore aware)
 2. **Parameterized encoding.** Identifiers are encoded as "distance since the
    previous occurrence" (first occurrence = 0). This makes `a=b+c` and `x=y+z`
    encode identically while still requiring structural identity.
-3. **Seed-and-extend.** Fixed-length windows are hashed and bucketed; generic
-   buckets (too frequent) are discarded. Candidate pairs pass a one-to-one
+3. **Seed-and-extend.** Fixed-length windows are hashed and bucketed; buckets
+   above `max_bucket` are refined by longer spans, so generic windows are
+   dropped while code copied many times is still paired. Candidate pairs pass a one-to-one
    **bijection check**, then extend maximally.
 4. **Fixed tokens match exactly**; identifiers use the bijection; literals match
    exactly unless `parameterize_literals` is enabled.

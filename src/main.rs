@@ -1,13 +1,21 @@
+use std::collections::HashSet;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use dup_detector::config::Config;
-use dup_detector::index::SourceIndex;
+use dup_detector::detect::{detect, detect_in_spans};
+use dup_detector::index::{SourceIndex, decode_source, parse_file};
 use dup_detector::language::{LanguageId, LanguageSource, registry};
 use dup_detector::mcp::{CloneServer, ScanResponse};
-use dup_detector::model::CloneGroup;
+use dup_detector::model::{CloneGroup, SourceFile};
+use dup_detector::tokenize::tokenize;
+use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser)]
 #[command(
@@ -76,7 +84,50 @@ enum Command {
         /// Print results as JSON
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        targets: Targets,
     },
+}
+
+#[derive(clap::Args)]
+struct Targets {
+    #[arg(
+        long = "file",
+        value_name = "FILE",
+        help = "Only report clone groups that involve this file (repeatable)"
+    )]
+    files: Vec<PathBuf>,
+    #[arg(
+        long,
+        requires = "files",
+        conflicts_with = "stdin_json",
+        help = "Read the contents of the single --file from stdin instead of disk"
+    )]
+    stdin: bool,
+    #[arg(
+        long,
+        help = "Read {\"files\": [{\"path\", \"text\"}], \"exclude\": [path]} from stdin: check those contents in place of the files on disk and leave the excluded files out"
+    )]
+    stdin_json: bool,
+}
+
+#[derive(Deserialize)]
+struct Batch {
+    files: Vec<BatchFile>,
+    #[serde(default)]
+    exclude: Vec<PathBuf>,
+}
+
+#[derive(Deserialize)]
+struct BatchFile {
+    path: PathBuf,
+    text: String,
+}
+
+struct Checked {
+    overlays: Vec<SourceFile>,
+    on_disk: Vec<PathBuf>,
+    exclude: HashSet<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -119,6 +170,7 @@ fn main() -> anyhow::Result<()> {
             no_ignore,
             max_file_bytes,
             json,
+            targets,
         } => run_scan(
             &path,
             min_lines,
@@ -129,6 +181,7 @@ fn main() -> anyhow::Result<()> {
             no_ignore,
             max_file_bytes,
             json,
+            &targets,
         ),
     }
 }
@@ -156,9 +209,8 @@ fn run_lsp() -> anyhow::Result<()> {
 }
 
 fn run_clean(path: &Path) -> anyhow::Result<()> {
-    let root = path
-        .canonicalize()
-        .with_context(|| format!("cannot resolve {}", path.display()))?;
+    let root =
+        dunce::canonicalize(path).with_context(|| format!("cannot resolve {}", path.display()))?;
     if !root.is_dir() {
         anyhow::bail!("{} is not a directory", root.display());
     }
@@ -184,6 +236,7 @@ fn run_scan(
     no_ignore: bool,
     max_file_bytes: Option<u64>,
     json: bool,
+    targets: &Targets,
 ) -> anyhow::Result<()> {
     let mut config = Config::load_or_default(path)
         .with_context(|| format!("failed to load config for {}", path.display()))?
@@ -212,20 +265,144 @@ fn run_scan(
     }
     let index = SourceIndex::build(path, &config)
         .with_context(|| format!("failed to index {}", path.display()))?;
-    let groups = index.find_clones(&config);
+    let checked = checked_targets(&index, targets, &config)?;
+    let (files, positions) = index.files_with(&checked.overlays, &checked.exclude);
+    let mut spans: Vec<(usize, usize, usize)> = positions
+        .iter()
+        .map(|&position| (position, 0, files[position].tokens.len()))
+        .collect();
+    for target in &checked.on_disk {
+        let position = files
+            .iter()
+            .position(|file| file.path == *target)
+            .ok_or_else(|| anyhow::anyhow!("{} is excluded", target.display()))?;
+        spans.push((position, 0, files[position].tokens.len()));
+    }
+    let targeted = !targets.files.is_empty() || targets.stdin_json;
+    let groups = match (targeted, spans.is_empty()) {
+        (false, _) => detect(&files, &config),
+        (true, true) => Vec::new(),
+        (true, false) => detect_in_spans(&files, &spans, &config),
+    };
     if json {
-        let response = ScanResponse::from_groups(&index, groups);
-        println!("{}", serde_json::to_string_pretty(&response)?);
+        let mut out = std::io::stdout().lock();
+        serde_json::to_writer_pretty(&mut out, &ScanResponse::from_files(&files, groups))?;
+        writeln!(out)?;
     } else {
         println!(
             "{} clone group(s) across {} file(s):",
             groups.len(),
-            index.files().len()
+            files.len()
         );
         for (n, group) in groups.iter().enumerate() {
-            print_group(n + 1, group, &index);
+            print_group(n + 1, group, &files);
         }
     }
+    std::mem::forget(index);
+    Ok(())
+}
+
+fn resolve_target(path: &Path) -> anyhow::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let mut missing = Vec::new();
+    let mut existing = absolute.as_path();
+    loop {
+        match dunce::canonicalize(existing) {
+            Ok(found) => return Ok(missing.iter().rev().fold(found, |acc, part| acc.join(part))),
+            Err(error) => {
+                let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+                    return Err(error.into());
+                };
+                missing.push(name);
+                existing = parent;
+            }
+        }
+    }
+}
+
+fn checked_targets(
+    index: &SourceIndex,
+    targets: &Targets,
+    config: &Config,
+) -> anyhow::Result<Checked> {
+    let mut checked = Checked {
+        overlays: Vec::new(),
+        on_disk: Vec::new(),
+        exclude: HashSet::new(),
+    };
+    if targets.stdin_json {
+        let batch: Batch = serde_json::from_reader(std::io::stdin().lock())
+            .context("stdin is not a valid --stdin-json batch")?;
+        let mut latest: Vec<(PathBuf, String)> = Vec::new();
+        for file in batch.files {
+            let path = resolve_target(&file.path)?;
+            latest.retain(|(existing, _)| *existing != path);
+            latest.push((path, file.text));
+        }
+        for (path, text) in latest {
+            overlay(path, text, config, &mut checked)?;
+        }
+        for path in batch.exclude {
+            checked.exclude.insert(resolve_target(&path)?);
+        }
+    }
+    if targets.stdin {
+        let [path] = targets.files.as_slice() else {
+            anyhow::bail!("--stdin reads the contents of exactly one --file");
+        };
+        let mut bytes = Vec::new();
+        std::io::stdin().read_to_end(&mut bytes)?;
+        overlay(
+            resolve_target(path)?,
+            decode_source(bytes),
+            config,
+            &mut checked,
+        )?;
+        return Ok(checked);
+    }
+    for path in &targets.files {
+        let path = resolve_target(path)?;
+        if checked.exclude.contains(&path) || checked.overlays.iter().any(|file| file.path == path)
+        {
+            continue;
+        }
+        if index.file_by_path(&path).is_some() {
+            checked.on_disk.push(path);
+            continue;
+        }
+        let language = language_of(&path, config)?;
+        if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > config.max_file_bytes) {
+            continue;
+        }
+        let parsed = parse_file(&path, language, config.max_file_bytes)
+            .ok_or_else(|| anyhow::anyhow!("cannot read or parse {}", path.display()))?;
+        checked.overlays.push(parsed);
+    }
+    Ok(checked)
+}
+
+fn language_of(path: &Path, config: &Config) -> anyhow::Result<LanguageId> {
+    LanguageId::from_path(path)
+        .filter(|language| config.language_enabled(*language))
+        .ok_or_else(|| anyhow::anyhow!("{} is not a scanned source file", path.display()))
+}
+
+fn overlay(
+    path: PathBuf,
+    text: String,
+    config: &Config,
+    checked: &mut Checked,
+) -> anyhow::Result<()> {
+    let language = language_of(&path, config)?;
+    if text.len() as u64 > config.max_file_bytes {
+        checked.exclude.insert(path);
+        return Ok(());
+    }
+    let tokens = tokenize(&text, language)?;
+    let size = text.len() as u64;
+    checked
+        .overlays
+        .push(SourceFile::new(path, language, text, tokens, None, size));
     Ok(())
 }
 
@@ -343,8 +520,7 @@ fn format_extensions(extensions: &[String]) -> String {
     format!("{shown} …")
 }
 
-fn print_group(n: usize, group: &CloneGroup, index: &SourceIndex) {
-    let files = index.files();
+fn print_group(n: usize, group: &CloneGroup, files: &[&SourceFile]) {
     println!(
         "#{n}: {} tokens, {:?}, {} occurrence(s)",
         group.token_count,
@@ -352,9 +528,33 @@ fn print_group(n: usize, group: &CloneGroup, index: &SourceIndex) {
         group.occurrences.len()
     );
     for occ in &group.occurrences {
-        let file = &files[occ.file as usize];
+        let file = files[occ.file as usize];
         let start_line = file.token_line(occ.start as usize);
         let end_line = file.token_end_line((occ.end - 1) as usize);
         println!("  {}:{start_line}:{end_line}", file.path.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_target_appends_missing_components_to_existing_ancestor() {
+        let dir = std::env::temp_dir().join(format!("dup-detector-resolve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let resolved = resolve_target(&dir.join("new").join("file.rs")).unwrap();
+        assert_eq!(
+            resolved,
+            dunce::canonicalize(&dir)
+                .unwrap()
+                .join("new")
+                .join("file.rs")
+        );
+        assert_eq!(
+            resolve_target(&dir).unwrap(),
+            dunce::canonicalize(&dir).unwrap()
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
