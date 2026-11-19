@@ -20,7 +20,7 @@
 # ~/.config/dup-detector/dup-detector.toml（或 <project>/dup-detector.toml）
 min_lines = 7
 min_occurrences = 2
-max_bucket = 32          # 大于该值的种子桶视为通用模式并丢弃
+max_bucket = 32          # 更大的种子桶按更长跨度细分；通用窗口被丢弃
 seed_window = 8          # 种子窗口的 token 长度
 max_groups = 100         # 省略或注释掉表示不限制
 parameterize_literals = false
@@ -36,7 +36,7 @@ cache_location = "project" # "project"（根目录下 .dup-detector/）或 "user
 | ----------------------- | ------- | ------------------------------------------ |
 | `min_lines`             | `7`     | 克隆组的最小行数                           |
 | `min_occurrences`       | `2`     | 每个克隆组的最小出现次数                   |
-| `max_bucket`            | `32`    | 超过该大小的种子桶视为通用模式并丢弃       |
+| `max_bucket`            | `32`    | 超过该大小的种子桶按更长跨度细分：通用窗口被丢弃，被复制超过该次数的代码仍会报告 |
 | `seed_window`           | `8`     | 种子窗口的 token 长度                      |
 | `max_groups`            | 无限制  | 最多返回的克隆组数量                       |
 | `parameterize_literals` | `false` | 将一致重命名的字面量视为相同               |
@@ -125,6 +125,15 @@ dup-detector scan <path> --no-ignore
 # 提高上限以包含超大生成文件
 dup-detector scan <path> --max-file-bytes 8388608
 
+# 只报告涉及某个文件的克隆（编辑器与 agent hook 的快速路径）
+dup-detector scan <path> --json --file src/lib.rs
+
+# 从 stdin 读取某个文件未保存或拟写入的内容进行检查
+dup-detector scan <path> --json --file src/lib.rs --stdin < proposed.rs
+
+# 一次检查多个拟写入的文件（如补丁或移动）；exclude 中的文件不参与索引
+echo '{"files":[{"path":"src/new.rs","text":"..."}],"exclude":["src/old.rs"]}' | dup-detector scan <path> --json --stdin-json
+
 # 清理该项目的磁盘 token 缓存（同时清理 project 与 user-cache 两处）
 dup-detector clean <path>
 ```
@@ -141,5 +150,8 @@ dup-detector clean <path>
 | `--no-ignore`             | 关闭   | 同时扫描被 `.gitignore`/`.ignore` 排除的文件 |
 | `--max-file-bytes <N>`    | `2097152` | 跳过大于 `N` 字节的文件                     |
 | `--json`                  | 关闭   | 以 JSON 输出结果                 |
+| `--file <PATH>`           | 无     | 只报告涉及该文件的克隆组（可重复；配合 `--stdin` 时文件可以尚不存在） |
+| `--stdin`                 | 关闭   | 从 stdin 读取唯一 `--file` 的内容；不写入磁盘或缓存 |
+| `--stdin-json`            | 关闭   | 从 stdin 读取 `{"files": [{"path", "text"}], "exclude": [path]}`：用这些内容替代磁盘上的文件进行检查，并排除 exclude 中的文件 |
 
 `mcp` 子命令见 [MCP 服务器](mcp.md)，`lsp` 子命令见[编辑器集成](lsp.md)。

@@ -25,7 +25,7 @@ is optional.
 # ~/.config/dup-detector/dup-detector.toml  (or <project>/dup-detector.toml)
 min_lines = 7
 min_occurrences = 2
-max_bucket = 32          # seed buckets larger than this are dropped as generic
+max_bucket = 32          # larger seed buckets are refined by longer spans; generic windows are dropped
 seed_window = 8          # seed window length in tokens
 max_groups = 100         # omit / comment out for no limit
 parameterize_literals = false
@@ -41,7 +41,7 @@ cache_location = "project" # "project" (.dup-detector/ at the root) or "user-cac
 | ----------------------- | ------- | ------------------------------------------------------------------ |
 | `min_lines`             | `7`     | Minimum line count for a clone group                               |
 | `min_occurrences`       | `2`     | Minimum occurrences per group                                      |
-| `max_bucket`            | `32`    | Seed buckets larger than this are treated as generic and discarded |
+| `max_bucket`            | `32`    | Seed buckets larger than this are refined by longer spans: generic windows are dropped, code copied more than this many times is still reported |
 | `seed_window`           | `8`     | Seed window length in tokens                                       |
 | `max_groups`            | none    | Maximum number of groups to report                                 |
 | `parameterize_literals` | `false` | Treat consistently renamed literals as equal                       |
@@ -141,6 +141,15 @@ dup-detector scan <path> --no-ignore
 # raise the size limit for very large generated files
 dup-detector scan <path> --max-file-bytes 8388608
 
+# only report clones involving one file (fast path for editor and agent hooks)
+dup-detector scan <path> --json --file src/lib.rs
+
+# check unsaved or proposed content for a file, read from stdin
+dup-detector scan <path> --json --file src/lib.rs --stdin < proposed.rs
+
+# check several proposed files at once (e.g. a patch or a move); excluded files leave the index
+echo '{"files":[{"path":"src/new.rs","text":"..."}],"exclude":["src/old.rs"]}' | dup-detector scan <path> --json --stdin-json
+
 # remove the project's on-disk token cache (both project and user-cache locations)
 dup-detector clean <path>
 ```
@@ -157,6 +166,9 @@ Scan options:
 | `--no-ignore`             | off     | Also scan files excluded by `.gitignore`/`.ignore` |
 | `--max-file-bytes <N>`    | `2097152` | Skip files larger than `N` bytes                 |
 | `--json`                  | off     | Print results as JSON                        |
+| `--file <PATH>`           | none    | Only report groups involving this file (repeatable; it need not exist yet with `--stdin`) |
+| `--stdin`                 | off     | Read the contents of the single `--file` from stdin; nothing is written to disk or the cache |
+| `--stdin-json`            | off     | Read `{"files": [{"path", "text"}], "exclude": [path]}` from stdin: check those contents in place of the files on disk and leave the excluded files out |
 
 See [MCP server](mcp.md) for the `mcp` subcommand and [Editor integration](lsp.md)
 for the `lsp` subcommand.

@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use ignore::{WalkBuilder, WalkState};
@@ -117,17 +117,34 @@ impl SourceIndex {
         cache_dir: Option<PathBuf>,
         cache_base: Option<PathBuf>,
     ) -> Result<Self, IndexError> {
-        let paths = discover(&root, config)?;
+        let started = std::time::Instant::now();
         let max_file_bytes = config.max_file_bytes;
         let cache_base = cache_base.unwrap_or_else(|| root.clone());
+        let found = discover(&root, config)?;
+        let live: Option<HashSet<String>> =
+            (cache_dir.is_some() && root == cache_base).then(|| {
+                found
+                    .iter()
+                    .filter_map(|(path, _, _)| cache::entry_name(&cache_base, path))
+                    .collect()
+            });
+        let paths = enabled(found, config);
+        let discover_ms = started.elapsed().as_millis();
         let mut slots: Vec<Option<SourceFile>> = paths
             .par_iter()
-            .map(|(path, language)| {
-                cache_dir.as_deref().and_then(|dir| {
-                    file_from_cache(dir, &cache_base, path, *language, max_file_bytes)
-                })
+            .map(|(path, language, meta)| {
+                let dir = cache_dir.as_deref()?;
+                file_from_cache(
+                    dir,
+                    &cache_base,
+                    path,
+                    *language,
+                    max_file_bytes,
+                    meta.as_ref()?,
+                )
             })
             .collect();
+        let load_ms = started.elapsed().as_millis() - discover_ms;
         let mut misses: Vec<usize> = Vec::new();
         for (index, slot) in slots.iter().enumerate() {
             if slot.is_none() {
@@ -151,6 +168,19 @@ impl SourceIndex {
             .collect();
         for (slot, file) in misses.into_iter().zip(parsed) {
             slots[slot] = file;
+        }
+        if parsed_files > 0
+            && let Some(dir) = &cache_dir
+        {
+            if let Some(live) = &live {
+                cache::retain_entries(dir, live);
+            }
+            if let Some(base) = cache::user_cache_root()
+                && dir.parent() == Some(base.as_path())
+            {
+                cache::mark_root(dir, &cache_base);
+                cache::collect_stale_roots(&base);
+            }
         }
         let mut skipped: HashMap<PathBuf, SkipRecord> = HashMap::new();
         for (index, slot) in slots.iter().enumerate() {
@@ -176,6 +206,9 @@ impl SourceIndex {
             stats,
         );
         tracing::debug!(
+            discover_ms,
+            load_ms,
+            total_ms = started.elapsed().as_millis(),
             cache_hits = index.stats.cache_hits,
             parsed_files = index.stats.parsed_files,
             files = index.files.len(),
@@ -187,7 +220,7 @@ impl SourceIndex {
     /// Removes the on-disk cache for `root` in both possible locations and
     /// returns the directories that existed and were cleared.
     pub fn clear_cache(root: &Path) -> Vec<PathBuf> {
-        let Ok(root) = root.canonicalize() else {
+        let Ok(root) = dunce::canonicalize(root) else {
             return Vec::new();
         };
         let mut dirs = vec![cache::dir_in(&root)];
@@ -214,20 +247,26 @@ impl SourceIndex {
 
     pub fn refresh(&mut self) -> Vec<PathBuf> {
         let paths = match discover(&self.root, &self.config) {
-            Ok(paths) => paths,
+            Ok(found) => enabled(found, &self.config),
             Err(e) => {
                 tracing::warn!(error = %e, "refresh: file discovery failed");
                 return Vec::new();
             }
         };
         let max_file_bytes = self.config.max_file_bytes;
+        let stamps: Vec<Option<fs::Metadata>> = paths
+            .par_iter()
+            .map(|(path, _, _)| fs::metadata(path).ok())
+            .collect();
+        let unchanged = |file: &SourceFile, meta: &Option<fs::Metadata>| {
+            meta.as_ref().is_some_and(|meta| {
+                file.modified == meta.modified().ok() && file.size == meta.len()
+            })
+        };
         if paths.len() == self.files.len() + self.skipped.len()
-            && paths.par_iter().all(|(path, _)| {
+            && paths.par_iter().zip(&stamps).all(|((path, _, _), meta)| {
                 if let Some(&slot) = self.by_path.get(path) {
-                    let file = &self.files[slot];
-                    fs::metadata(path).is_ok_and(|meta| {
-                        file.modified == meta.modified().ok() && file.size == meta.len()
-                    })
+                    unchanged(&self.files[slot], meta)
                 } else if let Some(record) = self.skipped.get(path) {
                     // Only oversized files are stable enough to skip forever;
                     // everything else takes the slow path so it is retried.
@@ -246,20 +285,15 @@ impl SourceIndex {
             .collect();
         let reusable: Vec<bool> = paths
             .par_iter()
-            .map(|(path, _)| {
-                old.get(path).is_some_and(|f| {
-                    fs::metadata(path).is_ok_and(|meta| {
-                        f.modified == meta.modified().ok() && f.size == meta.len()
-                    })
-                })
-            })
+            .zip(&stamps)
+            .map(|((path, _, _), meta)| old.get(path).is_some_and(|f| unchanged(f, meta)))
             .collect();
         let mut old = old;
         let mut slots: Vec<Option<SourceFile>> = Vec::with_capacity(paths.len());
         let mut changed = Vec::new();
         let mut misses: Vec<usize> = Vec::new();
         let mut skipped: HashMap<PathBuf, SkipRecord> = HashMap::new();
-        for (index, (path, _)) in paths.iter().enumerate() {
+        for (index, (path, _, _)) in paths.iter().enumerate() {
             let existing = old.remove(path);
             if reusable[index] {
                 slots.push(existing);
@@ -289,7 +323,9 @@ impl SourceIndex {
                 // The disk entry still covers files that changed since the last
                 // refresh but not since their entry was written.
                 if let Some(dir) = cache_dir
-                    && let Some(file) = file_from_cache(dir, root, path, language, max_file_bytes)
+                    && let Some(meta) = &stamps[index]
+                    && let Some(file) =
+                        file_from_cache(dir, root, path, language, max_file_bytes, meta)
                 {
                     return (Some(file), true);
                 }
@@ -368,6 +404,35 @@ impl SourceIndex {
         detect::detect(&files, config)
     }
 
+    pub fn files_with<'a>(
+        &'a self,
+        overlays: &'a [SourceFile],
+        exclude: &HashSet<PathBuf>,
+    ) -> (Vec<&'a SourceFile>, Vec<usize>) {
+        let latest: HashMap<&Path, usize> = overlays
+            .iter()
+            .enumerate()
+            .map(|(index, overlay)| (overlay.path.as_path(), index))
+            .collect();
+        let mut files: Vec<&SourceFile> = self
+            .files
+            .iter()
+            .filter(|file| {
+                !exclude.contains(&file.path) && !latest.contains_key(file.path.as_path())
+            })
+            .collect();
+        let mut positions = Vec::new();
+        for (index, overlay) in overlays.iter().enumerate() {
+            if latest.get(overlay.path.as_path()) == Some(&index)
+                && !exclude.contains(&overlay.path)
+            {
+                files.push(overlay);
+                positions.push(files.len() - 1);
+            }
+        }
+        (files, positions)
+    }
+
     fn from_parts(
         root: PathBuf,
         config: Config,
@@ -396,7 +461,7 @@ impl SourceIndex {
 }
 
 fn canonicalize_root(root: impl AsRef<Path>) -> Result<PathBuf, IndexError> {
-    root.as_ref().canonicalize().map_err(|e| IndexError::Io {
+    dunce::canonicalize(&root).map_err(|e| IndexError::Io {
         path: root.as_ref().to_path_buf(),
         source: e,
     })
@@ -408,6 +473,7 @@ fn file_from_cache(
     path: &Path,
     language: LanguageId,
     max_file_bytes: u64,
+    meta: &fs::Metadata,
 ) -> Option<SourceFile> {
     let entry = cache::load_entry(&cache::entry_path(dir, base, path)?)?;
     if entry.path != path.strip_prefix(base).ok()? {
@@ -416,13 +482,12 @@ fn file_from_cache(
     if entry.size > max_file_bytes {
         return None;
     }
-    let meta = fs::metadata(path).ok()?;
     if meta.len() != entry.size || meta.modified().ok() != Some(entry.modified) {
         return None;
     }
     let text = match mapped_text(path, entry.size) {
         Some(text) => text,
-        None => crate::model::Text::Owned(fs::read_to_string(path).ok()?),
+        None => crate::model::Text::Owned(decode_source(fs::read(path).ok()?)),
     };
     if cache::text_hash_bytes(text.as_bytes()) != entry.text_hash {
         return None;
@@ -472,7 +537,7 @@ fn mapped_text(path: &Path, expected_size: u64) -> Option<crate::model::Text> {
         let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
         let after = fs::metadata(path).ok()?;
         if after.len() == expected_size && after.modified().ok() == before.modified().ok() {
-            return crate::model::Text::mapped(Arc::new(map));
+            return crate::model::Text::mapped(std::sync::Arc::new(map));
         }
     }
     None
@@ -483,7 +548,9 @@ fn mapped_text(_path: &Path, _expected_size: u64) -> Option<crate::model::Text> 
     None
 }
 
-fn discover(root: &Path, config: &Config) -> Result<Vec<(PathBuf, LanguageId)>, IndexError> {
+type Discovered = (PathBuf, LanguageId, Option<fs::Metadata>);
+
+fn discover(root: &Path, config: &Config) -> Result<Vec<Discovered>, IndexError> {
     // An inaccessible root must be an error, not an empty scan.
     if let Err(source) = fs::metadata(root) {
         return Err(IndexError::Io {
@@ -512,10 +579,14 @@ fn discover(root: &Path, config: &Config) -> Result<Vec<(PathBuf, LanguageId)>, 
             Ok(entry) => {
                 if entry.file_type().is_some_and(|ft| ft.is_file())
                     && let Some(language) = LanguageId::from_path(entry.path())
-                    && config.language_enabled(language)
-                    && let Ok(mut paths) = paths.lock()
                 {
-                    paths.push((entry.into_path(), language));
+                    let metadata = config
+                        .language_enabled(language)
+                        .then(|| entry.metadata().ok())
+                        .flatten();
+                    if let Ok(mut paths) = paths.lock() {
+                        paths.push((entry.into_path(), language, metadata));
+                    }
                 }
                 WalkState::Continue
             }
@@ -539,15 +610,37 @@ fn discover(root: &Path, config: &Config) -> Result<Vec<(PathBuf, LanguageId)>, 
         );
     }
     let mut paths = paths.into_inner().unwrap_or_default();
-    paths.sort();
+    paths.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     Ok(paths)
 }
 
-pub(crate) fn parse_file(
-    path: &Path,
-    language: LanguageId,
-    max_file_bytes: u64,
-) -> Option<SourceFile> {
+fn enabled(found: Vec<Discovered>, config: &Config) -> Vec<Discovered> {
+    found
+        .into_iter()
+        .filter(|(_, language, _)| config.language_enabled(*language))
+        .collect()
+}
+
+pub fn decode_source(bytes: Vec<u8>) -> String {
+    match bytes.as_slice() {
+        [0xFF, 0xFE, rest @ ..] => decode_utf16(rest, u16::from_le_bytes),
+        [0xFE, 0xFF, rest @ ..] => decode_utf16(rest, u16::from_be_bytes),
+        _ => String::from_utf8(bytes)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()),
+    }
+}
+
+fn decode_utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> String {
+    let units: Vec<u16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| unit(*pair))
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+pub fn parse_file(path: &Path, language: LanguageId, max_file_bytes: u64) -> Option<SourceFile> {
     let meta = match fs::metadata(path) {
         Ok(meta) => meta,
         Err(e) => {
@@ -561,8 +654,8 @@ pub(crate) fn parse_file(
     }
     let text = match mapped_text(path, meta.len()) {
         Some(text) => text,
-        None => match fs::read_to_string(path) {
-            Ok(text) => crate::model::Text::Owned(text),
+        None => match fs::read(path) {
+            Ok(bytes) => crate::model::Text::Owned(decode_source(bytes)),
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "cannot read file");
                 return None;
@@ -603,7 +696,12 @@ mod tests {
 
     fn entry_count(dir: &Path) -> usize {
         fs::read_dir(dir)
-            .map(|entries| entries.count())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "bin"))
+                    .count()
+            })
             .unwrap_or(0)
     }
 
@@ -789,7 +887,7 @@ mod tests {
         let first = SourceIndex::build(&dir, &config).unwrap();
         assert_eq!(first.stats().parsed_files, 1);
         assert!(!dir.join(cache::CACHE_DIR).exists());
-        let root = dir.canonicalize().unwrap();
+        let root = dunce::canonicalize(&dir).unwrap();
         let Some(cache_dir) = cache::user_cache_dir(&root) else {
             fs::remove_dir_all(&dir).ok();
             return;
@@ -858,6 +956,28 @@ mod tests {
     }
 
     #[test]
+    fn one_shot_build_prunes_entries_of_removed_files_only() {
+        let dir = temp_dir("one-shot-prune");
+        let cache_dir = temp_dir("one-shot-prune-store");
+        fs::write(dir.join("a.rs"), "fn a() { let x = 1; }\n").unwrap();
+        fs::write(dir.join("b.rs"), "fn b() { let y = 2; }\n").unwrap();
+        fs::write(dir.join("c.py"), "def c():\n    return 1\n").unwrap();
+        SourceIndex::build_with_cache(&dir, &Config::default(), Some(&cache_dir)).unwrap();
+        assert_eq!(entry_count(&cache_dir), 3);
+        fs::remove_file(dir.join("b.rs")).unwrap();
+        fs::write(dir.join("a.rs"), "fn a() { let x = 1; let z = 3; }\n").unwrap();
+        let rust_only = Config {
+            languages: Some(vec![LanguageId::RUST]),
+            ..Config::default()
+        };
+        let index = SourceIndex::build_with_cache(&dir, &rust_only, Some(&cache_dir)).unwrap();
+        assert_eq!(index.stats().parsed_files, 1);
+        assert_eq!(entry_count(&cache_dir), 2);
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    #[test]
     fn corrupt_token_offsets_fall_back_to_parsing() {
         let dir = temp_dir("cache-corrupt-tokens");
         let cache_dir = temp_dir("cache-corrupt-tokens-store");
@@ -865,7 +985,7 @@ mod tests {
         let first =
             SourceIndex::build_with_cache(&dir, &Config::default(), Some(&cache_dir)).unwrap();
         drop(first);
-        let root = dir.canonicalize().unwrap();
+        let root = dunce::canonicalize(&dir).unwrap();
         let path = root.join("a.rs");
         let entry = cache::entry_path(&cache_dir, &root, &path).expect("entry path");
         let mut bytes = fs::read(&entry).unwrap();
@@ -895,6 +1015,147 @@ mod tests {
             SourceIndex::build_with_cache(&dir, &Config::default(), Some(&cache_dir)).unwrap();
         assert_eq!(rebuilt.stats().cache_hits, 0);
         assert_eq!(rebuilt.stats().parsed_files, 1);
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    #[test]
+    fn overlay_replaces_indexed_file_and_appends_new_file() {
+        let source = "fn total(items: Vec<i32>) -> i32 {\n    let mut sum = 0;\n    for item in items {\n        sum = sum + item * item;\n        if sum > 100 {\n            sum = sum - 50;\n        }\n    }\n    sum\n}\n";
+        let renamed = source
+            .replace("total", "score")
+            .replace("sum", "acc")
+            .replace("item", "value");
+        let dir = temp_dir("overlay");
+        fs::write(dir.join("a.rs"), source).unwrap();
+        fs::write(dir.join("b.rs"), "fn unrelated() {}\n").unwrap();
+        let config = Config {
+            min_lines: 5,
+            ..Config::default()
+        };
+        let index = SourceIndex::build_with_cache(&dir, &config, None).unwrap();
+        let overlay_at = |name: &str| {
+            SourceFile::new(
+                index.root().join(name),
+                LanguageId::RUST,
+                renamed.clone(),
+                tokenize::tokenize(&renamed, LanguageId::RUST).unwrap(),
+                None,
+                renamed.len() as u64,
+            )
+        };
+
+        let none = HashSet::new();
+        let replaced = [overlay_at("b.rs")];
+        let (files, positions) = index.files_with(&replaced, &none);
+        assert_eq!(files.len(), index.files().len());
+        assert!(std::ptr::eq(files[positions[0]], &replaced[0]));
+        let span = [(positions[0], 0, replaced[0].tokens.len())];
+        let groups = detect::detect_in_spans(&files, &span, &config);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].occurrences.len(), 2);
+
+        let appended = [overlay_at("c.rs")];
+        let (files, positions) = index.files_with(&appended, &none);
+        assert_eq!(files.len(), index.files().len() + 1);
+        let span = [(positions[0], 0, appended[0].tokens.len())];
+        assert_eq!(detect::detect_in_spans(&files, &span, &config).len(), 1);
+
+        let moved = HashSet::from([index.root().join("a.rs")]);
+        let (files, positions) = index.files_with(&appended, &moved);
+        assert_eq!(files.len(), index.files().len());
+        let span = [(positions[0], 0, appended[0].tokens.len())];
+        assert!(detect::detect_in_spans(&files, &span, &config).is_empty());
+
+        let dropped = HashSet::from([index.root().join("c.rs")]);
+        let (files, positions) = index.files_with(&appended, &dropped);
+        assert!(positions.is_empty());
+        assert_eq!(files.len(), index.files().len());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn utf16_and_latin1_sources_are_indexed_and_cached() {
+        let source = "fn total(items: Vec<i32>) -> i32 {\n    let mut sum = 0;\n    for item in items {\n        sum = sum + item * item;\n        if sum > 100 {\n            sum = sum - 50;\n        }\n    }\n    sum\n}\n";
+        let renamed = source.replace("total", "score").replace("sum", "acc");
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in renamed.encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        let mut latin1 = b"int f(void) { const char *s = \"caf".to_vec();
+        latin1.extend_from_slice(b"\xE9\"; return 0; }\n");
+        let dir = temp_dir("encodings");
+        let cache_dir = temp_dir("encodings-store");
+        fs::write(dir.join("a.rs"), source).unwrap();
+        fs::write(dir.join("b.rs"), utf16).unwrap();
+        fs::write(dir.join("c.c"), latin1).unwrap();
+        let config = Config {
+            min_lines: 5,
+            ..Config::default()
+        };
+        let first = SourceIndex::build_with_cache(&dir, &config, Some(&cache_dir)).unwrap();
+        assert_eq!(first.files().len(), 3);
+        let groups = first.find_clones(&config);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].occurrences.len(), 2);
+        drop(first);
+        let second = SourceIndex::build_with_cache(&dir, &config, Some(&cache_dir)).unwrap();
+        assert_eq!(second.stats().cache_hits, 3);
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    #[test]
+    fn concurrent_builds_share_one_cache() {
+        let dir = temp_dir("concurrent");
+        let cache_dir = temp_dir("concurrent-store");
+        for index in 0..40 {
+            fs::write(
+                dir.join(format!("m{index}.rs")),
+                format!("fn f{index}(a: i32) -> i32 {{\n    let b = a + {index};\n    b * 2\n}}\n"),
+            )
+            .unwrap();
+        }
+        type Snapshot = Vec<(PathBuf, Vec<(u8, u32, u32)>)>;
+        let snapshot = |index: &SourceIndex| -> Snapshot {
+            index
+                .files()
+                .iter()
+                .map(|file| {
+                    let tokens = file
+                        .tokens
+                        .iter()
+                        .map(|t| (t.kind, t.start, t.end))
+                        .collect();
+                    (file.path.clone(), tokens)
+                })
+                .collect()
+        };
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let index = SourceIndex::build_with_cache(
+                            &dir,
+                            &Config::default(),
+                            Some(&cache_dir),
+                        )
+                        .unwrap();
+                        snapshot(&index)
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect()
+        });
+        assert!(results.iter().all(|result| result == &results[0]));
+        assert_eq!(results[0].len(), 40);
+        let warm =
+            SourceIndex::build_with_cache(&dir, &Config::default(), Some(&cache_dir)).unwrap();
+        assert_eq!(warm.stats().cache_hits, 40);
+        assert_eq!(snapshot(&warm), results[0]);
         fs::remove_dir_all(&dir).ok();
         fs::remove_dir_all(&cache_dir).ok();
     }

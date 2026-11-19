@@ -35,6 +35,103 @@ fn push_groups<'a>(candidates: &'a [Candidate], groups: &mut Vec<(u64, &'a [Cand
     }
 }
 
+type Seed = (u64, u32, u32);
+
+const MAX_REFINED_SPAN: usize = 256;
+
+fn push_pair(candidates: &mut Vec<Candidate>, a: Seed, b: Seed, window: usize) {
+    let (_, file_a, start_a) = a;
+    let (_, file_b, start_b) = b;
+    if file_a == file_b && start_b < start_a + window as u32 {
+        return;
+    }
+    candidates.push(Candidate {
+        file_a,
+        file_b,
+        start_a,
+        start_b,
+    });
+}
+
+fn pair_bucket(
+    bucket: &[Seed],
+    span: usize,
+    files: &[&SourceFile],
+    config: &Config,
+    scratch: &mut encode::SpanScratch,
+    candidates: &mut Vec<Candidate>,
+) {
+    let window = config.seed_window;
+    if bucket.len() <= config.max_bucket {
+        for i in 0..bucket.len() {
+            for j in i + 1..bucket.len() {
+                push_pair(candidates, bucket[i], bucket[j], window);
+            }
+        }
+        return;
+    }
+    let star = |hub: Seed, members: &[Seed], candidates: &mut Vec<Candidate>| {
+        for &seed in members.iter().filter(|&&seed| seed != hub) {
+            push_pair(candidates, hub.min(seed), hub.max(seed), window);
+        }
+    };
+    let refined = span > window;
+    let next = (span * 2).min(MAX_REFINED_SPAN);
+    let reach = |seed: &Seed| (files[seed.1 as usize].hashes.len() - seed.2 as usize).min(next);
+    if bucket.iter().all(|seed| reach(seed) <= span) {
+        if refined {
+            star(bucket[0], bucket, candidates);
+        }
+        return;
+    }
+    let mut keyed: Vec<((u64, usize), Seed)> = bucket
+        .iter()
+        .map(|&seed| {
+            let length = reach(&seed);
+            let hashes: &[u64] = &files[seed.1 as usize].hashes;
+            let key = encode::span_fingerprint(
+                scratch,
+                hashes,
+                seed.2 as usize,
+                length,
+                config.parameterize_literals,
+            );
+            ((key, length), seed)
+        })
+        .collect();
+    keyed.sort_unstable_by_key(|&(key, (_, file, start))| (key, file, start));
+    let hub = bucket[0];
+    let mut hub_group: Vec<Seed> = vec![hub];
+    let mut group: Vec<Seed> = Vec::new();
+    for (index, &(key, seed)) in keyed.iter().enumerate() {
+        group.push(seed);
+        if keyed
+            .get(index + 1)
+            .is_some_and(|following| following.0 == key)
+        {
+            continue;
+        }
+        if group.len() > config.max_bucket {
+            pair_bucket(&group, key.1, files, config, scratch, candidates);
+        }
+        if group[0] == hub {
+            hub_group.clone_from(&group);
+        }
+        group.clear();
+    }
+    if refined {
+        let outside: Vec<Seed> = bucket
+            .iter()
+            .copied()
+            .filter(|seed| hub_group.binary_search(seed).is_err())
+            .collect();
+        star(hub, &outside, candidates);
+        if let Some(&other) = outside.first() {
+            star(other, &hub_group[1..], candidates);
+        }
+    }
+}
+
 const SIGNATURE_CACHE_MAX_TOKENS: usize = 1 << 25;
 
 fn total_tokens(files: &[&SourceFile]) -> usize {
@@ -236,6 +333,8 @@ pub fn detect_filtered(
     let seed_ms = started.elapsed().as_millis();
 
     let mut candidates: Vec<Candidate> = Vec::new();
+    let mut span_scratch = encode::SpanScratch::default();
+    let mut oversized: Vec<&[Seed]> = Vec::new();
     let mut index = 0;
     while index < seeds.len() {
         let mut end = index + 1;
@@ -243,25 +342,30 @@ pub fn detect_filtered(
             end += 1;
         }
         let bucket = &seeds[index..end];
-        if bucket.len() >= 2 && bucket.len() <= config.max_bucket {
-            for i in 0..bucket.len() {
-                for j in i + 1..bucket.len() {
-                    let (_, file_a, start_a) = bucket[i];
-                    let (_, file_b, start_b) = bucket[j];
-                    if file_a == file_b && start_b < start_a + window as u32 {
-                        continue;
-                    }
-                    candidates.push(Candidate {
-                        file_a,
-                        file_b,
-                        start_a,
-                        start_b,
-                    });
-                }
-            }
+        if bucket.len() > config.max_bucket {
+            oversized.push(bucket);
+        } else if bucket.len() >= 2 {
+            pair_bucket(
+                bucket,
+                window,
+                files,
+                config,
+                &mut span_scratch,
+                &mut candidates,
+            );
         }
         index = end;
     }
+    let refined: Vec<Vec<Candidate>> = oversized
+        .par_iter()
+        .map_init(encode::SpanScratch::default, |scratch, bucket| {
+            let mut local = Vec::new();
+            pair_bucket(bucket, window, files, config, scratch, &mut local);
+            local
+        })
+        .collect();
+    drop(oversized);
+    candidates.extend(refined.into_iter().flatten());
     drop(seeds);
     let mut candidate_scratch: Vec<Candidate> = Vec::new();
     let candidate_boundaries = if candidates.len() < BUCKET_SORT_MIN {
@@ -350,6 +454,33 @@ pub fn span_window_signatures(
         }
     });
     allowed
+}
+
+pub fn detect_in_spans(
+    files: &[&SourceFile],
+    spans: &[(usize, usize, usize)],
+    config: &Config,
+) -> Vec<CloneGroup> {
+    let mut allowed = FastSet::default();
+    for &(target, start, end) in spans {
+        allowed.extend(span_window_signatures(files[target], start, end, config));
+    }
+    let mut unlimited = config.clone();
+    unlimited.max_groups = None;
+    let mut groups: Vec<CloneGroup> = detect_filtered(files, &unlimited, Some(&allowed))
+        .into_iter()
+        .filter(|group| {
+            group.occurrences.iter().any(|o| {
+                spans.iter().any(|&(target, start, end)| {
+                    o.file as usize == target && (o.start as usize) < end && o.end as usize > start
+                })
+            })
+        })
+        .collect();
+    if let Some(limit) = config.max_groups {
+        groups.truncate(limit);
+    }
+    groups
 }
 
 const COVER_NONE: u32 = u32::MAX;
@@ -2190,5 +2321,100 @@ use anyhow::Result;
                 );
             }
         }
+    }
+
+    #[test]
+    fn span_detection_limits_groups_after_keeping_only_target_groups() {
+        let big = r#"
+fn big_total(items: Vec<i32>, scale: i32) -> i32 {
+    let mut sum = 0;
+    for item in items {
+        sum = sum + item * item;
+        if sum > 100 {
+            sum = sum - 50;
+        }
+    }
+    sum = sum * scale;
+    sum = sum + scale * 2;
+    sum = sum - scale / 3;
+    sum = sum + scale % 7;
+    return sum;
+}
+"#;
+        let a = file("a.rs", FN);
+        let b = file("b.rs", big);
+        let c = file("c.rs", &big.replace("big_total", "other_total"));
+        let files = [&a, &b, &c];
+        let cfg = Config {
+            max_groups: Some(1),
+            ..config()
+        };
+        let allowed = span_window_signatures(&a, 0, a.tokens.len(), &cfg);
+        let unlimited = detect_filtered(&files, &config(), Some(&allowed));
+        assert!(unlimited[0].occurrences.iter().all(|o| o.file != 0));
+        let groups = detect_in_spans(&files, &[(0, 0, a.tokens.len())], &cfg);
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].occurrences.iter().any(|o| o.file == 0));
+    }
+
+    #[test]
+    fn code_copied_more_than_max_bucket_times_is_reported() {
+        let copies: Vec<SourceFile> = (0..40)
+            .map(|index| {
+                let renamed = FN
+                    .replace("compute_total", &format!("total_{index}"))
+                    .replace("sum", &format!("acc_{index}"));
+                file(&format!("copy{index}.rs"), &renamed)
+            })
+            .collect();
+        let files: Vec<&SourceFile> = copies.iter().collect();
+        let cfg = config();
+        assert!(files.len() > cfg.max_bucket);
+        let groups = detect(&files, &cfg);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].occurrences.len(), files.len());
+        assert_eq!(groups[0].clone_type, CloneType::Type2);
+        let targeted = detect_in_spans(&files, &[(7, 0, files[7].tokens.len())], &cfg);
+        assert_eq!(targeted.len(), 1);
+        assert_eq!(targeted[0].occurrences.len(), files.len());
+    }
+
+    #[test]
+    fn widely_copied_code_is_reported_when_its_continuations_split() {
+        let trailers = [
+            "fn trailer_a() -> i32 {\n    let left = 1;\n    left + 2\n}\n",
+            "fn trailer_b(flag: bool) -> bool {\n    !flag && true\n}\n",
+        ];
+        let copies: Vec<SourceFile> = (0..40)
+            .map(|index| {
+                file(
+                    &format!("copy{index}.rs"),
+                    &format!("{FN}{}", trailers[index % 2]),
+                )
+            })
+            .collect();
+        let files: Vec<&SourceFile> = copies.iter().collect();
+        let groups = detect(&files, &config());
+        let sizes: Vec<usize> = groups.iter().map(|group| group.occurrences.len()).collect();
+        assert!(sizes.contains(&files.len()), "{sizes:?}");
+    }
+
+    #[test]
+    fn widely_copied_code_survives_a_near_match_first_member() {
+        let body: String = (0..15)
+            .map(|step| format!("    sum = sum + {step};\n"))
+            .collect();
+        let function = |tail: &str| {
+            format!(
+                "fn f(a: i32, b: i32) -> i32 {{\n    let mut sum = a + b;\n{body}    sum + {tail}\n}}\n"
+            )
+        };
+        let copies: Vec<SourceFile> = std::iter::once(file("copy00.rs", &function("a")))
+            .chain((1..40).map(|index| file(&format!("copy{index:02}.rs"), &function("b"))))
+            .collect();
+        let files: Vec<&SourceFile> = copies.iter().collect();
+        let groups = detect(&files, &config());
+        let sizes: Vec<usize> = groups.iter().map(|group| group.occurrences.len()).collect();
+        assert!(sizes.contains(&39), "{sizes:?}");
     }
 }

@@ -120,7 +120,7 @@ fn find_config_file(root: &Path) -> Option<PathBuf> {
     // Ancestor search only walks real directory components, so relative inputs
     // like `.` or `src` must be absolutized first (canonicalize also resolves
     // `..` and symlinks).
-    let root = match root.canonicalize() {
+    let root = match dunce::canonicalize(root) {
         Ok(canonical) => canonical,
         Err(_) => {
             if root.is_absolute() {
@@ -300,7 +300,14 @@ impl Config {
     /// [`Config::source_paths`] paired with each file's mtime, so long-running
     /// servers can cheaply detect created, removed and edited config files.
     pub fn source_stamps(root: impl AsRef<Path>) -> Vec<(PathBuf, Option<SystemTime>)> {
-        Self::source_paths(root)
+        Self::source_stamps_layered(root, user_config_path().as_deref())
+    }
+
+    pub fn source_stamps_layered(
+        root: impl AsRef<Path>,
+        user: Option<&Path>,
+    ) -> Vec<(PathBuf, Option<SystemTime>)> {
+        source_paths_layered(root.as_ref(), user)
             .into_iter()
             .map(|path| {
                 let mtime = std::fs::metadata(&path)

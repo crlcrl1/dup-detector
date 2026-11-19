@@ -30,23 +30,31 @@ struct CachedIndex {
 
 struct ServerState {
     default_config: Config,
+    user_config: Option<PathBuf>,
     /// Canonicalized startup directory; scopes must stay inside it and the
     /// on-disk cache lives at its `.dup-detector/` regardless of scope.
     workspace_root: PathBuf,
     indexes: Mutex<HashMap<PathBuf, CachedIndex>>,
 }
 
+fn load_config(state: &ServerState, root: &Path) -> Result<Config, String> {
+    Ok(Config::load_layered(root, state.user_config.as_deref())
+        .map_err(|error| error.to_string())?
+        .unwrap_or_else(|| state.default_config.clone()))
+}
+
+fn config_stamps(state: &ServerState, root: &Path) -> Vec<(PathBuf, Option<SystemTime>)> {
+    Config::source_stamps_layered(root, state.user_config.as_deref())
+}
+
 /// Rebuilds the index when a config file (user-level or project-level) appears,
 /// disappears, or changes, so a long-running server picks up config edits.
 fn reload_config(state: &ServerState, root: &Path, cached: &mut CachedIndex) -> Result<(), String> {
-    let sources = Config::source_stamps(root);
+    let sources = config_stamps(state, root);
     if sources == cached.config_sources {
         return Ok(());
     }
-    let config = match Config::load(root).map_err(|error| error.to_string())? {
-        Some(config) => config,
-        None => state.default_config.clone(),
-    };
+    let config = load_config(state, root)?;
     let mut index = cached
         .index
         .write()
@@ -86,9 +94,8 @@ fn run_with_index<T, F>(state: &ServerState, scope: &str, f: F) -> Result<T, Str
 where
     F: FnOnce(&SourceIndex, &Config) -> T,
 {
-    let root = Path::new(scope)
-        .canonicalize()
-        .map_err(|e| format!("cannot resolve scope `{scope}`: {e}"))?;
+    let root =
+        dunce::canonicalize(scope).map_err(|e| format!("cannot resolve scope `{scope}`: {e}"))?;
     if !root.starts_with(&state.workspace_root) {
         return Err(format!(
             "scope `{}` is outside the working directory `{}`; only the working directory and its subdirectories can be scanned",
@@ -112,12 +119,9 @@ where
                 cached.index.clone()
             }
             Entry::Vacant(entry) => {
-                let config = match Config::load(&root).map_err(|e| e.to_string())? {
-                    Some(config) => config,
-                    None => state.default_config.clone(),
-                };
+                let config = load_config(state, &root)?;
                 let index = build_index(state, &root, &config)?;
-                let config_sources = Config::source_stamps(&root);
+                let config_sources = config_stamps(state, &root);
                 entry
                     .insert(CachedIndex {
                         index: Arc::new(RwLock::new(index)),
@@ -146,10 +150,11 @@ where
 
 impl CloneServer {
     pub fn new(default_config: Config, root: PathBuf) -> Self {
-        let workspace_root = root.canonicalize().unwrap_or(root);
+        let workspace_root = dunce::canonicalize(&root).unwrap_or(root);
         Self {
             state: Arc::new(ServerState {
                 default_config,
+                user_config: crate::config::user_config_path(),
                 workspace_root,
                 indexes: Mutex::new(HashMap::new()),
             }),
@@ -254,10 +259,13 @@ pub struct ScanResponse {
 impl ScanResponse {
     pub fn from_groups(index: &SourceIndex, groups: Vec<CloneGroup>) -> Self {
         let files: Vec<&SourceFile> = index.files().iter().collect();
-        let groups = groups.into_iter().map(|g| to_dto(&files, &g)).collect();
+        Self::from_files(&files, groups)
+    }
+
+    pub fn from_files(files: &[&SourceFile], groups: Vec<CloneGroup>) -> Self {
         Self {
             files_scanned: files.len(),
-            groups,
+            groups: groups.iter().map(|g| to_dto(files, g)).collect(),
         }
     }
 }
@@ -313,7 +321,7 @@ fn resolve_file(root: &Path, file: &str) -> Option<PathBuf> {
     } else {
         root.join(path)
     };
-    let absolute = absolute.canonicalize().ok()?;
+    let absolute = dunce::canonicalize(&absolute).ok()?;
     // `root` is canonicalized at index build time; reject paths that escape it
     // (e.g. via `..`), otherwise tools would read files outside the scope.
     absolute.starts_with(root).then_some(absolute)
@@ -382,14 +390,10 @@ fn find_clones_in_file_from_index(
         .with_limits(params.min_lines, params.min_occurrences, params.max_groups)
         .map_err(|e| e.to_string())?;
     cfg.types = params.types;
-    let file = &index.files()[file_index];
-    let allowed = crate::detect::span_window_signatures(file, 0, file.tokens.len(), &cfg);
     let files: Vec<&SourceFile> = index.files().iter().collect();
-    let groups: Vec<CloneGroup> = crate::detect::detect_filtered(&files, &cfg, Some(&allowed))
-        .into_iter()
-        .filter(|g| g.occurrences.iter().any(|o| o.file as usize == file_index))
-        .collect();
-    Ok(ScanResponse::from_groups(index, groups))
+    let token_count = files[file_index].tokens.len();
+    let groups = crate::detect::detect_in_spans(&files, &[(file_index, 0, token_count)], &cfg);
+    Ok(ScanResponse::from_files(&files, groups))
 }
 
 fn find_clones_for_region_in_index(
@@ -453,21 +457,8 @@ fn find_clones_for_region_in_index(
         .with_limits(Some(min_lines), None, params.max_groups)
         .map_err(|e| e.to_string())?;
     cfg.types = params.types;
-    let allowed = crate::detect::span_window_signatures(file, span_start, span_end, &cfg);
-    let groups: Vec<CloneGroup> = crate::detect::detect_filtered(&files, &cfg, Some(&allowed))
-        .into_iter()
-        .filter(|g| {
-            g.occurrences.iter().any(|o| {
-                o.file as usize == file_idx
-                    && o.start < span_end as u32
-                    && o.end > span_start as u32
-            })
-        })
-        .collect();
-    Ok(ScanResponse {
-        files_scanned: files.len(),
-        groups: groups.iter().map(|g| to_dto(&files, g)).collect(),
-    })
+    let groups = crate::detect::detect_in_spans(&files, &[(file_idx, span_start, span_end)], &cfg);
+    Ok(ScanResponse::from_files(&files, groups))
 }
 
 #[tool_router(server_handler)]
@@ -559,7 +550,8 @@ mod tests {
     fn state_with_workspace(workspace: &Path) -> ServerState {
         ServerState {
             default_config: Config::default(),
-            workspace_root: workspace.canonicalize().unwrap(),
+            user_config: None,
+            workspace_root: dunce::canonicalize(workspace).unwrap(),
             indexes: Mutex::new(HashMap::new()),
         }
     }
@@ -595,7 +587,7 @@ mod tests {
                 .unwrap_or(0)
         };
         // Index the subdir scope first: the cache lands at the workspace root.
-        let scope = sub.canonicalize().unwrap();
+        let scope = dunce::canonicalize(&sub).unwrap();
         let files = run_with_index(&state, scope.to_str().unwrap(), |index, _| {
             index.files().len()
         })
@@ -606,7 +598,7 @@ mod tests {
         let count = entry_count(&workspace.join(".dup-detector"));
         assert_eq!(count, 2);
         // Indexing the whole workspace afterwards must reuse the same entries.
-        let root = workspace.canonicalize().unwrap();
+        let root = dunce::canonicalize(&workspace).unwrap();
         let files = run_with_index(&state, root.to_str().unwrap(), |index, _| {
             index.files().len()
         })
@@ -621,7 +613,7 @@ mod tests {
         let workspace = temp_dir("reindex-ws");
         fs::write(workspace.join("a.rs"), "fn a() { let x = 1; }\n").unwrap();
         let state = state_with_workspace(&workspace);
-        let root = workspace.canonicalize().unwrap();
+        let root = dunce::canonicalize(&workspace).unwrap();
         run_with_index(&state, root.to_str().unwrap(), |index, _| {
             assert_eq!(index.files().len(), 1)
         })
