@@ -25,8 +25,10 @@ file discovery (.gitignore aware)
    previous occurrence" (first occurrence = 0). This makes `a=b+c` and `x=y+z`
    encode identically while still requiring structural identity.
 3. **Seed-and-extend.** Fixed-length windows are hashed and bucketed; buckets
-   above `max_bucket` are refined by longer spans, so generic windows are
-   dropped while code copied many times is still paired. Candidate pairs pass a one-to-one
+   above `max_bucket` are refined by longer spans. Complete statements, blocks
+   and functions sharing a frequent seed are also grouped by length and a
+   fingerprint of the whole unit. This keeps copies connected when a near
+   match has the same 256-token prefix. Candidate pairs pass a one-to-one
    **bijection check**, then extend maximally.
 4. **Fixed tokens match exactly**; identifiers and literals use the bijection by
    default. Set `parameterize_literals = false` to require exact literals.
@@ -34,6 +36,10 @@ file discovery (.gitignore aware)
    alignment stays constant, occurrences are reported at single-semantic-unit
    granularity (multi-unit matches are split), boilerplate (imports, pure
    declarations) is filtered, and groups are sorted by size.
+
+Source files and `scan --stdin` accept UTF-8 and BOM-marked UTF-16 in either
+byte order. Other input uses a one-to-one Latin-1 byte mapping, which preserves
+differences between literals even when the original encoding is unknown.
 
 `AGENTS.md` contains the full specification and coding standards.
 

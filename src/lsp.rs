@@ -39,6 +39,7 @@ const URI_SEGMENT: &AsciiSet = &CONTROLS
     .add(b'>')
     .add(b'?')
     .add(b'[')
+    .add(b'\\')
     .add(b']')
     .add(b'^')
     .add(b'`')
@@ -1472,12 +1473,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn non_utf8_unix_filenames_round_trip_through_file_uris() {
+    fn unix_filenames_round_trip_through_file_uris() {
         use std::os::unix::ffi::OsStrExt;
-        let path = PathBuf::from(std::ffi::OsStr::from_bytes(b"/project/a\xFF.rs"));
-        let uri = file_uri(&path).unwrap();
-        assert_eq!(uri.as_str(), "file:///project/a%FF.rs");
-        assert_eq!(uri_path(&uri), Some(path));
+        for (bytes, expected) in [
+            (&b"/project/a\xFF.rs"[..], "file:///project/a%FF.rs"),
+            (&br"/project/a\b.rs"[..], "file:///project/a%5Cb.rs"),
+        ] {
+            let path = PathBuf::from(std::ffi::OsStr::from_bytes(bytes));
+            let uri = file_uri(&path).unwrap();
+            assert_eq!(uri.as_str(), expected);
+            assert_eq!(uri_path(&uri), Some(path));
+        }
     }
 
     #[test]

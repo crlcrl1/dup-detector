@@ -173,7 +173,9 @@ impl SourceIndex {
             && let Some(dir) = &cache_dir
         {
             if let Some(live) = &live {
-                cache::retain_entries(dir, live);
+                cache::prune_entries(dir, live, |relative| {
+                    matches!(cache_base.join(relative).try_exists(), Ok(false))
+                });
             }
             if let Some(base) = cache::user_cache_root()
                 && dir.parent() == Some(base.as_path())
@@ -622,22 +624,29 @@ fn enabled(found: Vec<Discovered>, config: &Config) -> Vec<Discovered> {
 }
 
 pub fn decode_source(bytes: Vec<u8>) -> String {
-    match bytes.as_slice() {
+    let decoded = match bytes.as_slice() {
         [0xFF, 0xFE, rest @ ..] => decode_utf16(rest, u16::from_le_bytes),
         [0xFE, 0xFF, rest @ ..] => decode_utf16(rest, u16::from_be_bytes),
-        _ => String::from_utf8(bytes)
-            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()),
-    }
+        _ => {
+            return String::from_utf8(bytes)
+                .unwrap_or_else(|error| decode_latin1(error.as_bytes()));
+        }
+    };
+    decoded.unwrap_or_else(|| decode_latin1(&bytes))
 }
 
-fn decode_utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> String {
-    let units: Vec<u16> = bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| unit(*pair))
-        .collect();
-    String::from_utf16_lossy(&units)
+fn decode_latin1(bytes: &[u8]) -> String {
+    bytes.iter().copied().map(char::from).collect()
+}
+
+fn decode_utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> Option<String> {
+    let (pairs, tail) = bytes.as_chunks::<2>();
+    if !tail.is_empty() {
+        return None;
+    }
+    char::decode_utf16(pairs.iter().copied().map(unit))
+        .collect::<Result<String, _>>()
+        .ok()
 }
 
 pub fn parse_file(path: &Path, language: LanguageId, max_file_bytes: u64) -> Option<SourceFile> {
@@ -959,11 +968,22 @@ mod tests {
     fn one_shot_build_prunes_entries_of_removed_files_only() {
         let dir = temp_dir("one-shot-prune");
         let cache_dir = temp_dir("one-shot-prune-store");
+        let foreign = ["other.bin", "0123456789abcdef.bin"];
+        for name in foreign {
+            fs::write(cache_dir.join(name), b"external data").unwrap();
+        }
         fs::write(dir.join("a.rs"), "fn a() { let x = 1; }\n").unwrap();
         fs::write(dir.join("b.rs"), "fn b() { let y = 2; }\n").unwrap();
         fs::write(dir.join("c.py"), "def c():\n    return 1\n").unwrap();
+        fs::write(dir.join("ignored.rs"), "fn ignored() {}\n").unwrap();
         SourceIndex::build_with_cache(&dir, &Config::default(), Some(&cache_dir)).unwrap();
-        assert_eq!(entry_count(&cache_dir), 3);
+        for name in foreign {
+            assert_eq!(fs::read(cache_dir.join(name)).unwrap(), b"external data");
+        }
+        let removed = cache::entry_path(&cache_dir, &dir, &dir.join("b.rs")).unwrap();
+        let renamed_copy = cache_dir.join("fedcba9876543210.bin");
+        fs::copy(&removed, &renamed_copy).unwrap();
+        fs::write(dir.join(".ignore"), "ignored.rs\n").unwrap();
         fs::remove_file(dir.join("b.rs")).unwrap();
         fs::write(dir.join("a.rs"), "fn a() { let x = 1; let z = 3; }\n").unwrap();
         let rust_only = Config {
@@ -972,7 +992,9 @@ mod tests {
         };
         let index = SourceIndex::build_with_cache(&dir, &rust_only, Some(&cache_dir)).unwrap();
         assert_eq!(index.stats().parsed_files, 1);
-        assert_eq!(entry_count(&cache_dir), 2);
+        assert!(!removed.exists());
+        assert!(renamed_copy.is_file());
+        assert_eq!(entry_count(&cache_dir), 3 + foreign.len() + 1);
         fs::remove_dir_all(&dir).ok();
         fs::remove_dir_all(&cache_dir).ok();
     }
@@ -1103,6 +1125,57 @@ mod tests {
         assert_eq!(second.stats().cache_hits, 3);
         fs::remove_dir_all(&dir).ok();
         fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    #[test]
+    fn exact_literal_matching_preserves_non_utf8_bytes_on_cold_and_warm_scans() {
+        let dir = temp_dir("legacy-literals");
+        let cache_dir = temp_dir("legacy-literals-store");
+        let config = Config {
+            parameterize_literals: false,
+            ..Config::default()
+        };
+        let literals: &[(&[u8], &[u8])] = &[(b"caf\xe9", b"caf\xe8"), (b"\xbc\xd7", b"\xd2\xd2")];
+        let prefix = br#"const char *f(int n) {
+    if (n < 0) {
+        n = -n;
+    }
+    if (n == 1) {
+        return "one";
+    }
+    return ""#;
+        for &(left, right) in literals {
+            for (name, literal) in [("a.c", left), ("b.c", right)] {
+                let source = [prefix.as_slice(), literal, b"\";\n}\n"].concat();
+                fs::write(dir.join(name), source).unwrap();
+            }
+            for warm in [false, true] {
+                let index = SourceIndex::build_with_cache(&dir, &config, Some(&cache_dir)).unwrap();
+                assert_eq!(index.files().len(), 2);
+                assert_eq!(index.stats().cache_hits, if warm { 2 } else { 0 });
+                assert!(index.find_clones(&config).is_empty());
+                let parameterized = index.find_clones(&Config::default());
+                assert_eq!(parameterized.len(), 1);
+                assert_eq!(parameterized[0].clone_type, crate::model::CloneType::Type2);
+            }
+        }
+        fs::remove_dir_all(dir).ok();
+        fs::remove_dir_all(cache_dir).ok();
+    }
+
+    #[test]
+    fn utf16_boms_preserve_surrogate_pairs_and_malformed_input_bytes() {
+        let text = "a🦀";
+        let mut little = vec![0xff, 0xfe];
+        let mut big = vec![0xfe, 0xff];
+        for unit in text.encode_utf16() {
+            little.extend(unit.to_le_bytes());
+            big.extend(unit.to_be_bytes());
+        }
+        assert_eq!(decode_source(little), text);
+        assert_eq!(decode_source(big), text);
+        assert_eq!(decode_source(vec![0xff, 0xfe, 0x61]), "ÿþa");
+        assert_eq!(decode_source(vec![0xfe, 0xff, 0xd8, 0x00]), "þÿØ\0");
     }
 
     #[test]

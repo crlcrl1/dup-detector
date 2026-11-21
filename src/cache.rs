@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::io::{self, Read};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use xxhash_rust::xxh3::xxh3_64;
@@ -13,6 +13,7 @@ use crate::model::{
 
 const MAGIC: &[u8; 8] = b"DUPCDT13";
 const HEADER_BYTES: usize = 52;
+const MAX_PRUNE_PATH_BYTES: usize = 128 * 1024;
 
 pub const CACHE_DIR: &str = ".dup-detector";
 const ENTRY_EXTENSION: &str = "bin";
@@ -75,9 +76,12 @@ pub fn entry_path(dir: &Path, base: &Path, path: &Path) -> Option<PathBuf> {
 }
 
 pub fn entry_name(base: &Path, path: &Path) -> Option<String> {
-    let relative = path.strip_prefix(base).ok()?;
+    Some(relative_entry_name(path.strip_prefix(base).ok()?))
+}
+
+fn relative_entry_name(relative: &Path) -> String {
     let key = xxh3_64(relative.as_os_str().as_encoded_bytes());
-    Some(format!("{key:016x}.{ENTRY_EXTENSION}"))
+    format!("{key:016x}.{ENTRY_EXTENSION}")
 }
 
 pub fn text_hash(text: &str) -> u64 {
@@ -137,20 +141,53 @@ pub fn clear(dir: &Path) -> io::Result<()> {
 }
 
 pub fn retain_entries(dir: &Path, live: &HashSet<String>) {
+    prune_entries(dir, live, |_| true);
+}
+
+pub(crate) fn prune_entries(dir: &Path, live: &HashSet<String>, stale: impl Fn(&Path) -> bool) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        let stale = path.extension().is_some_and(|ext| ext == ENTRY_EXTENSION)
-            && entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| !live.contains(name));
-        if stale && let Err(error) = fs::remove_file(&path) {
-            tracing::debug!(path = %path.display(), error = %error, "cannot prune cache entry");
+        let filename = entry.file_name();
+        let Some(name) = filename.to_str() else {
+            continue;
+        };
+        if !live.contains(name)
+            && owned_entry_source(&entry, name).is_some_and(|relative| stale(&relative))
+            && let Err(error) = fs::remove_file(entry.path())
+        {
+            tracing::debug!(path = %entry.path().display(), error = %error, "cannot prune cache entry");
         }
     }
+}
+
+fn owned_entry_source(entry: &fs::DirEntry, name: &str) -> Option<PathBuf> {
+    let (stem, extension) = name.rsplit_once('.')?;
+    if extension != ENTRY_EXTENSION || stem.len() != 16 || !entry.file_type().ok()?.is_file() {
+        return None;
+    }
+    let mut file = fs::File::open(entry.path()).ok()?;
+    let mut header = [0; HEADER_BYTES];
+    file.read_exact(&mut header).ok()?;
+    if !header.starts_with(MAGIC) {
+        return None;
+    }
+    let mut cursor = MAGIC.len();
+    let len = read_u32(&header, &mut cursor)? as usize;
+    if len == 0 || len > MAX_PRUNE_PATH_BYTES {
+        return None;
+    }
+    let mut path = String::new();
+    if file.take(len as u64).read_to_string(&mut path).ok()? != len {
+        return None;
+    }
+    let path = PathBuf::from(path);
+    (path
+        .components()
+        .all(|part| matches!(part, Component::Normal(_)))
+        && relative_entry_name(&path) == name)
+        .then_some(path)
 }
 
 pub fn mark_root(dir: &Path, root: &Path) {

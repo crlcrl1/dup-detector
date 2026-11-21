@@ -39,6 +39,35 @@ type Seed = (u64, u32, u32);
 
 const MAX_REFINED_SPAN: usize = 256;
 
+fn frequent_unit_groups(
+    bucket: &[Seed],
+    interior: &[Occurrence],
+    files: &[&SourceFile],
+    config: &Config,
+    scratch: &mut ClusterScratch,
+) -> Vec<Vec<Occurrence>> {
+    let mut units = interior.to_vec();
+    for &(_, file, start) in bucket {
+        let token = &files[file as usize].tokens[start as usize];
+        for end in [token.unit_end_of_start, token.container_end_of_start] {
+            if end >= start + config.seed_window as u32 {
+                units.push(Occurrence { file, start, end });
+            }
+        }
+    }
+    let length = |o: &Occurrence| o.end - o.start;
+    units.retain(|occ| files[occ.file as usize].line_span(occ) >= config.min_lines);
+    units.sort_unstable_by_key(|o| (std::cmp::Reverse(length(o)), *o));
+    units.dedup();
+    units
+        .chunk_by(|a, b| length(a) == length(b))
+        .filter(|occs| occs.len() >= config.min_occurrences.max(2))
+        .flat_map(|occs| representative_classes(files, occs, config, scratch))
+        .map(|(_, group)| group)
+        .filter(|group| group.len() >= 2)
+        .collect()
+}
+
 fn push_pair(candidates: &mut Vec<Candidate>, a: Seed, b: Seed, window: usize) {
     let (_, file_a, start_a) = a;
     let (_, file_b, start_b) = b;
@@ -295,6 +324,15 @@ pub fn detect_filtered(
     config: &Config,
     allowed: Option<&FastSet<u64>>,
 ) -> Vec<CloneGroup> {
+    detect_with_seeds(files, config, allowed, allowed.is_some())
+}
+
+fn detect_with_seeds(
+    files: &[&SourceFile],
+    config: &Config,
+    allowed: Option<&FastSet<u64>>,
+    include_interior: bool,
+) -> Vec<CloneGroup> {
     let started = std::time::Instant::now();
     let window = config.seed_window;
     let parameterize_literals = config.parameterize_literals;
@@ -302,9 +340,11 @@ pub fn detect_filtered(
     // (LSP incremental detection) must respect the same cap or a large project
     // would cache signatures for every file indefinitely.
     let cache_signatures = total_tokens(files) < SIGNATURE_CACHE_MAX_TOKENS;
-    let mut seeds: Vec<(u64, u32, u32)> = (0..files.len())
-        .into_par_iter()
-        .flat_map_iter(|file_index| {
+    let mut interior = vec![Vec::new(); files.len()];
+    let mut seeds: Vec<(u64, u32, u32)> = interior
+        .par_iter_mut()
+        .enumerate()
+        .flat_map_iter(|(file_index, interior)| {
             let file = files[file_index];
             if window == 0 || file.tokens.len() < window {
                 return Vec::new();
@@ -315,11 +355,31 @@ pub fn detect_filtered(
                 parameterize_literals,
                 cache_signatures,
                 |signatures| {
-                    for (start, &signature) in signatures.iter().enumerate() {
-                        if allowed.is_some_and(|allowed| !allowed.contains(&signature)) {
+                    // A targeted query may select only an interior window. Equal units
+                    // have the same first selected window wholly inside their bounds.
+                    let mut next_seed = None;
+                    for (start, &signature) in signatures.iter().enumerate().rev() {
+                        if allowed.is_none_or(|allowed| allowed.contains(&signature)) {
+                            local.push((signature, file_index as u32, start as u32));
+                            next_seed = Some((signature, (start + window) as u32));
                             continue;
                         }
-                        local.push((signature, file_index as u32, start as u32));
+                        if include_interior && let Some((anchor, window_end)) = next_seed {
+                            let token = &file.tokens[start];
+                            for end in [token.unit_end_of_start, token.container_end_of_start] {
+                                if end < window_end {
+                                    continue;
+                                }
+                                interior.push((
+                                    anchor,
+                                    Occurrence {
+                                        file: file_index as u32,
+                                        start: start as u32,
+                                        end,
+                                    },
+                                ));
+                            }
+                        }
                     }
                 },
             );
@@ -332,7 +392,7 @@ pub fn detect_filtered(
     let seed_count = seeds.len();
     let seed_ms = started.elapsed().as_millis();
 
-    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut candidates = Vec::new();
     let mut span_scratch = encode::SpanScratch::default();
     let mut oversized: Vec<&[Seed]> = Vec::new();
     let mut index = 0;
@@ -356,6 +416,21 @@ pub fn detect_filtered(
         }
         index = end;
     }
+    let mut by_anchor = FastMap::<_, Vec<_>>::default();
+    for (signature, occ) in interior.into_iter().flatten() {
+        by_anchor.entry(signature).or_default().push(occ);
+    }
+    let unit_groups: Vec<Vec<Occurrence>> = oversized
+        .par_iter()
+        .map_init(ClusterScratch::default, |scratch, bucket| {
+            let interior = by_anchor
+                .get(&bucket[0].0)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            frequent_unit_groups(bucket, interior, files, config, scratch)
+        })
+        .flatten()
+        .collect();
     let refined: Vec<Vec<Candidate>> = oversized
         .par_iter()
         .map_init(encode::SpanScratch::default, |scratch, bucket| {
@@ -413,7 +488,7 @@ pub fn detect_filtered(
         matches.extend(list);
     }
     let extend_ms = started.elapsed().as_millis();
-    let groups = cluster(files, matches, config);
+    let groups = cluster(files, matches, unit_groups, config);
     let cluster_ms = started.elapsed().as_millis() - extend_ms;
     tracing::debug!(
         seed_ms,
@@ -467,7 +542,10 @@ pub fn detect_in_spans(
     }
     let mut unlimited = config.clone();
     unlimited.max_groups = None;
-    let mut groups: Vec<CloneGroup> = detect_filtered(files, &unlimited, Some(&allowed))
+    let partial = spans
+        .iter()
+        .any(|&(id, start, end)| start != 0 || end != files[id].tokens.len());
+    let mut groups: Vec<CloneGroup> = detect_with_seeds(files, &unlimited, Some(&allowed), partial)
         .into_iter()
         .filter(|group| {
             group.occurrences.iter().any(|o| {
@@ -874,9 +952,10 @@ impl Dsu {
 fn cluster(
     files: &[&SourceFile],
     matches: Vec<(Occurrence, Occurrence)>,
+    unit_groups: Vec<Vec<Occurrence>>,
     config: &Config,
 ) -> Vec<CloneGroup> {
-    if matches.is_empty() {
+    if matches.is_empty() && unit_groups.is_empty() {
         return Vec::new();
     }
     let mut occurrences: Vec<Occurrence> = Vec::with_capacity(matches.len() * 2);
@@ -911,7 +990,7 @@ fn cluster(
     }
 
     let components: Vec<&Vec<usize>> = roots.values().collect();
-    let refined_groups: Vec<Vec<Occurrence>> = components
+    let mut refined_groups: Vec<Vec<Occurrence>> = components
         .par_iter()
         .map_init(ClusterScratch::default, |scratch, ids| {
             let mut occs: Vec<Occurrence> = ids.iter().map(|&id| occurrences[id]).collect();
@@ -933,6 +1012,7 @@ fn cluster(
         .into_iter()
         .flatten()
         .collect();
+    refined_groups.extend(maximal_unit_groups(unit_groups));
     // Refined groups are disjoint by construction (classes and units do not
     // overlap), but merging any that share an occurrence keeps the output
     // well-formed if refinement ever starts overlapping.
@@ -1003,6 +1083,32 @@ fn cluster(
         groups.truncate(limit);
     }
     groups
+}
+
+fn maximal_unit_groups(groups: Vec<Vec<Occurrence>>) -> Vec<Vec<Occurrence>> {
+    // Nested units are redundant when every copy is at the same token offset
+    // inside the same set of enclosing copies. Different occurrence sets survive.
+    let mut layouts = FastMap::<Vec<_>, Vec<_>>::default();
+    for group in groups {
+        let first = i64::from(group[0].start);
+        let layout = group
+            .iter()
+            .map(|o| (o.file, i64::from(o.start) - first))
+            .collect();
+        layouts.entry(layout).or_default().push(group);
+    }
+    let mut maximal = Vec::new();
+    for mut groups in layouts.into_values() {
+        groups.sort_unstable_by_key(|group| (group[0].start, std::cmp::Reverse(group[0].end)));
+        let mut end = 0;
+        for group in groups {
+            if group[0].end > end {
+                end = group[0].end;
+                maximal.push(group);
+            }
+        }
+    }
+    maximal
 }
 
 fn drop_contained(occs: Vec<Occurrence>) -> Vec<Occurrence> {
@@ -1513,20 +1619,23 @@ fn representative_classes(
         scratch.class_sizes[class] += 1;
         scratch.assignments.push(class as u32);
     }
-    let mut classes = Vec::new();
-    for class in 0..scratch.class_sizes.len() {
-        if scratch.class_sizes[class] as usize >= config.min_occurrences {
-            let representative = occs[scratch.class_representatives[class] as usize];
-            let merged = occs
-                .iter()
-                .zip(&scratch.assignments)
-                .filter(|(_, assigned)| **assigned as usize == class)
-                .map(|(occ, _)| *occ)
-                .collect();
-            classes.push((representative, merged));
+    let mut classes: Vec<_> = scratch
+        .class_sizes
+        .iter()
+        .map(|&size| {
+            (size as usize >= config.min_occurrences).then(|| Vec::with_capacity(size as usize))
+        })
+        .collect();
+    for (&occ, &class) in occs.iter().zip(&scratch.assignments) {
+        if let Some(group) = &mut classes[class as usize] {
+            group.push(occ);
         }
     }
     classes
+        .into_iter()
+        .flatten()
+        .map(|group| (group[0], group))
+        .collect()
 }
 
 const LOGIC_MARKERS: &[&str] = &[
@@ -1933,7 +2042,7 @@ fn parameterized2(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
             (occ(0, 0, 5), occ(0, 5, 10)),
             (occ(0, 0, 5), occ(0, 10, 17)),
         ];
-        let groups = cluster(&files, matches, &cfg);
+        let groups = cluster(&files, matches, Vec::new(), &cfg);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].occurrences.len(), 2);
         assert_eq!(groups[0].token_count, 5);
@@ -2429,5 +2538,89 @@ fn big_total(items: Vec<i32>, scale: i32) -> i32 {
         let groups = detect(&files, &config());
         let sizes: Vec<usize> = groups.iter().map(|group| group.occurrences.len()).collect();
         assert!(sizes.contains(&39), "{sizes:?}");
+    }
+
+    fn long_python_sum() -> String {
+        let terms: String = (0..127).map(|i| format!("        + {i}\n")).collect();
+        format!("def f(x, y):\n    return (\n        x\n{terms}        + y\n    )\n")
+    }
+
+    #[test]
+    fn long_copies_are_independent_of_near_match_order() {
+        let source = long_python_sum();
+        let near = file_with("near.py", &source.replace("+ y", "+ x"), LanguageId::PYTHON);
+        let config = Config::default();
+        let copies: Vec<_> = (0..=config.max_bucket)
+            .map(|i| file_with(&format!("b{i}.py"), &source, LanguageId::PYTHON))
+            .collect();
+        let mut files: Vec<_> = copies.iter().collect();
+        files.push(&near);
+        for _ in 0..2 {
+            let target = 1;
+            let middle = files[target].tokens.len() / 2;
+            for groups in [
+                detect(&files, &config),
+                detect_in_spans(&files, &[(target, middle, middle + 1)], &config),
+            ] {
+                let whole = groups
+                    .iter()
+                    .find(|g| g.token_count == copies[0].tokens.len())
+                    .expect("whole-function clone");
+                assert_eq!(whole.clone_type, CloneType::Type1);
+                assert_eq!(whole.occurrences.len(), copies.len());
+                assert!(
+                    whole
+                        .occurrences
+                        .iter()
+                        .all(|o| files[o.file as usize].path != near.path)
+                );
+            }
+            files.rotate_right(1);
+        }
+    }
+
+    #[test]
+    fn long_renamed_copies_form_one_group_across_different_surrounding_code() {
+        let contexts = [
+            ("import os\n", "print(3)\n"),
+            ("while False:\n    break\n", "class C:\n    pass\n"),
+            ("if True:\n    pass\n", "import sys\n"),
+        ];
+        let source = long_python_sum();
+        let count = file_with("f.py", &source, LanguageId::PYTHON).tokens.len();
+        let mut copies = Vec::new();
+        for i in 0..38 {
+            let (prefix, suffix) = contexts[i % 3];
+            let mut function = source
+                .replace('x', &format!("x{i}"))
+                .replace('y', &format!("y{i}"));
+            if matches!(i, 0 | 7 | 37) {
+                function = function.replace(&format!("+ y{i}"), &format!("+ x{i}"));
+            }
+            copies.push(file_with(
+                &format!("f{i}.py"),
+                &format!("{prefix}{function}{suffix}"),
+                LanguageId::PYTHON,
+            ));
+        }
+        let files: Vec<_> = copies.iter().collect();
+        let config = Config::default();
+        let middle = count / 2;
+        for groups in [
+            detect(&files, &config),
+            detect_in_spans(&files, &[(18, middle, middle + 1)], &config),
+        ] {
+            let whole = groups
+                .iter()
+                .find(|g| g.token_count == count && g.occurrences.len() == 35)
+                .expect("all 35 copies of the function");
+            assert_eq!(whole.clone_type, CloneType::Type2);
+            assert!(
+                whole
+                    .occurrences
+                    .iter()
+                    .all(|o| !matches!(o.file, 0 | 7 | 37))
+            );
+        }
     }
 }
