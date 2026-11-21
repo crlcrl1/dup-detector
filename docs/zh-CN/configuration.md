@@ -23,7 +23,7 @@ min_occurrences = 2
 max_bucket = 32          # 更大的种子桶按更长跨度细分；通用窗口被丢弃
 seed_window = 8          # 种子窗口的 token 长度
 max_groups = 100         # 省略或注释掉表示不限制
-parameterize_literals = false
+parameterize_literals = true
 languages = ["rust", "python", "javascript", "typescript", "tsx", "c", "cpp"]
 no_ignore = false         # 同时扫描被 .gitignore/.ignore 排除的文件
 include_hidden = false    # 同时扫描 .github 等点目录（默认关闭）
@@ -39,7 +39,7 @@ cache_location = "project" # "project"（根目录下 .dup-detector/）或 "user
 | `max_bucket`            | `32`    | 超过该大小的种子桶按更长跨度细分：通用窗口被丢弃，被复制超过该次数的代码仍会报告 |
 | `seed_window`           | `8`     | 种子窗口的 token 长度                      |
 | `max_groups`            | 无限制  | 最多返回的克隆组数量                       |
-| `parameterize_literals` | `false` | 将一致重命名的字面量视为相同               |
+| `parameterize_literals` | `true`  | 将一致重命名的字面量视为相同               |
 | `languages`             | 全部已注册 | 只扫描这些语言；省略表示扫描所有已注册语言（内置 + 插件） |
 | `no_ignore`             | `false` | 同时扫描被 `.gitignore`/`.ignore` 排除的文件 |
 | `include_hidden`        | `false` | 同时扫描隐藏（点）目录，如 `.github`       |
@@ -116,8 +116,8 @@ dup-detector scan <path> --lang rust --lang python --min-lines 7 --min-occurrenc
 # JSON 输出（便于工具集成）
 dup-detector scan <path> --json
 
-# 允许一致重命名的字面量参与匹配
-dup-detector scan <path> --parameterize-literals
+# 要求字面量精确匹配，不再允许一致重命名
+dup-detector scan <path> --no-parameterize-literals
 
 # 同时扫描被 .gitignore 排除的文件
 dup-detector scan <path> --no-ignore
@@ -145,7 +145,7 @@ dup-detector clean <path>
 | `--min-lines <N>`         | `7`    | 克隆组的最小行数                 |
 | `--min-occurrences <N>`   | `2`    | 每个克隆组的最小出现次数         |
 | `--max-groups <N>`        | 无限制 | 最多返回的克隆组数量             |
-| `--parameterize-literals` | 关闭   | 将一致重命名的字面量视为相同     |
+| `--no-parameterize-literals` | 关闭 | 要求字面量精确匹配               |
 | `--lang <LANG>`           | 全部   | 限定语言（可重复）               |
 | `--no-ignore`             | 关闭   | 同时扫描被 `.gitignore`/`.ignore` 排除的文件 |
 | `--max-file-bytes <N>`    | `2097152` | 跳过大于 `N` 字节的文件                     |

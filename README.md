@@ -13,7 +13,7 @@ Unlike text/regex based tools, `dup-detector` works on the **token stream produc
 | Type   | Meaning                                                    | Supported         |
 | ------ | ---------------------------------------------------------- | ----------------- |
 | Type-1 | Identical except whitespace / comments / formatting        | Yes               |
-| Type-2 | Identifiers (and optionally literals) consistently renamed | Yes (core target) |
+| Type-2 | Identifiers and literals consistently renamed              | Yes (core target) |
 
 ## Highlights
 

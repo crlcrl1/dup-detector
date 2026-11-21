@@ -1831,32 +1831,32 @@ fn parameterized2(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
     }
 
     #[test]
-    fn literal_mismatch_is_not_a_clone_by_default() {
+    fn literal_mismatch_is_not_a_clone_when_parameterization_is_disabled() {
         let a = file("a.rs", "fn one() -> i32 { 100 + 200 }");
         let b = file("b.rs", "fn two() -> i32 { 300 + 100 }");
-        assert!(detect(&[&a, &b], &fine_config()).is_empty());
+        let strict = Config {
+            parameterize_literals: false,
+            ..fine_config()
+        };
+        assert!(detect(&[&a, &b], &strict).is_empty());
     }
 
     #[test]
-    fn literal_parameterization_matches_renamed_literals() {
+    fn literal_parameterization_matches_renamed_literals_by_default() {
         let a = file("a.rs", "fn one() -> i32 { 100 + 200 }");
         let b = file("b.rs", "fn one() -> i32 { 100 + 300 }");
-        let cfg = Config {
-            parameterize_literals: true,
-            ..fine_config()
-        };
-        assert_eq!(detect(&[&a, &b], &cfg).len(), 1);
+        assert_eq!(detect(&[&a, &b], &fine_config()).len(), 1);
     }
 
     #[test]
     fn seed_cache_respects_configuration() {
         let a = file("a.rs", "fn one() -> i32 { 100 + 200 }");
         let b = file("b.rs", "fn one() -> i32 { 100 + 300 }");
-        let plain = fine_config();
-        let parameterized = Config {
-            parameterize_literals: true,
+        let plain = Config {
+            parameterize_literals: false,
             ..fine_config()
         };
+        let parameterized = fine_config();
         assert!(detect(&[&a, &b], &plain).is_empty());
         assert_eq!(detect(&[&a, &b], &parameterized).len(), 1);
         assert!(detect(&[&a, &b], &plain).is_empty());
@@ -1949,6 +1949,7 @@ fn parameterized2(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
         let occs = vec![occ(0, 0, 5), occ(0, 5, 10), occ(0, 10, 15), occ(0, 15, 20)];
         let cfg = Config {
             min_lines: 1,
+            parameterize_literals: false,
             ..Config::default()
         };
         let mut scratch = ClusterScratch::default();
@@ -2003,7 +2004,11 @@ fn parameterized2(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
     total + 2
 }"#,
         );
-        let groups = detect(&[&a, &b], &fine_config());
+        let config = Config {
+            parameterize_literals: false,
+            ..fine_config()
+        };
+        let groups = detect(&[&a, &b], &config);
         assert_eq!(groups.len(), 1);
         assert_eq!(
             occurrence_lines(&groups[0], &[&a, &b]),
@@ -2039,7 +2044,11 @@ fn parameterized2(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
     Ok(total + 2)
 }"#,
         );
-        let groups = detect(&[&a, &b], &Config::default());
+        let config = Config {
+            parameterize_literals: false,
+            ..Config::default()
+        };
+        let groups = detect(&[&a, &b], &config);
         assert_eq!(groups.len(), 1);
         assert!(groups[0].token_count >= 40);
         assert_eq!(
@@ -2066,7 +2075,11 @@ fn parameterized2(previous: u32, start: usize, index: usize, tag: u64) -> u64 {
     let marker = 2;
 }"#,
         );
-        let groups = detect(&[&a, &b], &fine_config());
+        let config = Config {
+            parameterize_literals: false,
+            ..fine_config()
+        };
+        let groups = detect(&[&a, &b], &config);
         assert_eq!(groups.len(), 2);
         let mut lines: Vec<(u32, u32)> = groups
             .iter()

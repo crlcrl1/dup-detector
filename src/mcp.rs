@@ -225,6 +225,8 @@ pub struct FindClonesInFileParams {
     pub max_groups: Option<usize>,
     /// Restrict results to these clone types: "type-1", "type-2".
     pub types: Option<Vec<CloneType>>,
+    /// Allow consistent literal renames to match as clones.
+    pub parameterize_literals: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -247,6 +249,8 @@ pub struct FindClonesForRegionParams {
     pub max_groups: Option<usize>,
     /// Restrict results to these clone types: "type-1", "type-2".
     pub types: Option<Vec<CloneType>>,
+    /// Allow consistent literal renames to match as clones.
+    pub parameterize_literals: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -389,6 +393,9 @@ fn find_clones_in_file_from_index(
         .clone()
         .with_limits(params.min_lines, params.min_occurrences, params.max_groups)
         .map_err(|e| e.to_string())?;
+    if let Some(v) = params.parameterize_literals {
+        cfg.parameterize_literals = v;
+    }
     cfg.types = params.types;
     let files: Vec<&SourceFile> = index.files().iter().collect();
     let token_count = files[file_index].tokens.len();
@@ -456,6 +463,9 @@ fn find_clones_for_region_in_index(
         .clone()
         .with_limits(Some(min_lines), None, params.max_groups)
         .map_err(|e| e.to_string())?;
+    if let Some(v) = params.parameterize_literals {
+        cfg.parameterize_literals = v;
+    }
     cfg.types = params.types;
     let groups = crate::detect::detect_in_spans(&files, &[(file_idx, span_start, span_end)], &cfg);
     Ok(ScanResponse::from_files(&files, groups))
@@ -623,6 +633,78 @@ mod tests {
         state.indexes.lock().unwrap().clear();
         SourceIndex::clear_cache(&state.workspace_root);
         assert!(!workspace.join(".dup-detector").exists());
+        fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[test]
+    fn file_and_region_queries_support_literal_parameterization() {
+        let workspace = temp_dir("literal-query-params");
+        let source = r#"fn ensure_font_resource() -> Result<()> {
+    let mut fonts = match resources.get(b"Font") {
+        Ok(Object::Dictionary(fonts)) => fonts.clone(),
+        Ok(Object::Reference(id)) => document.get_dictionary(*id)?.clone(),
+        _ => Dictionary::new(),
+    };
+    Ok(())
+}
+
+fn ensure_xobject_resource() -> Result<()> {
+    let mut xobjects = match resources.get(b"XObject") {
+        Ok(Object::Dictionary(xobjects)) => xobjects.clone(),
+        Ok(Object::Reference(id)) => document.get_dictionary(*id)?.clone(),
+        _ => Dictionary::new(),
+    };
+    Ok(())
+}
+"#;
+        fs::write(workspace.join("a.rs"), source).unwrap();
+        let config = Config {
+            min_lines: 5,
+            ..Config::default()
+        };
+        let index = SourceIndex::build_with_cache(&workspace, &config, None).unwrap();
+        let region_params = |parameterize_literals| FindClonesForRegionParams {
+            file: "a.rs".to_string(),
+            start_line: 2,
+            end_line: 6,
+            scope: None,
+            min_lines: Some(5),
+            max_groups: None,
+            types: None,
+            parameterize_literals,
+        };
+        let strict =
+            find_clones_for_region_in_index(&index, &config, region_params(Some(false))).unwrap();
+        assert!(strict.groups.is_empty());
+
+        let parameterized =
+            find_clones_for_region_in_index(&index, &config, region_params(None)).unwrap();
+        assert!(parameterized.groups.iter().any(|group| {
+            group
+                .occurrences
+                .iter()
+                .any(|occurrence| occurrence.start_line <= 2 && occurrence.end_line >= 6)
+                && group
+                    .occurrences
+                    .iter()
+                    .any(|occurrence| occurrence.start_line <= 11 && occurrence.end_line >= 15)
+        }));
+
+        let file_params = |parameterize_literals| FindClonesInFileParams {
+            file: "a.rs".to_string(),
+            scope: None,
+            min_lines: Some(5),
+            min_occurrences: None,
+            max_groups: None,
+            types: None,
+            parameterize_literals,
+        };
+        let strict =
+            find_clones_in_file_from_index(&index, &config, file_params(Some(false))).unwrap();
+        assert!(strict.groups.is_empty());
+        let file_response =
+            find_clones_in_file_from_index(&index, &config, file_params(None)).unwrap();
+        assert!(!file_response.groups.is_empty());
         fs::remove_dir_all(&workspace).ok();
     }
 }

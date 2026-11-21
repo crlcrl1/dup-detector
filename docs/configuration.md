@@ -28,7 +28,7 @@ min_occurrences = 2
 max_bucket = 32          # larger seed buckets are refined by longer spans; generic windows are dropped
 seed_window = 8          # seed window length in tokens
 max_groups = 100         # omit / comment out for no limit
-parameterize_literals = false
+parameterize_literals = true
 languages = ["rust", "python", "javascript", "typescript", "tsx", "c", "cpp"]
 no_ignore = false         # also scan files excluded by .gitignore/.ignore rules
 include_hidden = false    # also scan dot-directories like .github (off by default)
@@ -44,7 +44,7 @@ cache_location = "project" # "project" (.dup-detector/ at the root) or "user-cac
 | `max_bucket`            | `32`    | Seed buckets larger than this are refined by longer spans: generic windows are dropped, code copied more than this many times is still reported |
 | `seed_window`           | `8`     | Seed window length in tokens                                       |
 | `max_groups`            | none    | Maximum number of groups to report                                 |
-| `parameterize_literals` | `false` | Treat consistently renamed literals as equal                       |
+| `parameterize_literals` | `true`  | Treat consistently renamed literals as equal                       |
 | `languages`             | all registered | Restrict scanning to these languages; omit to scan every registered language (built-in + plugins) |
 | `no_ignore`             | `false` | Also scan files excluded by `.gitignore`/`.ignore` rules           |
 | `include_hidden`        | `false` | Also scan hidden (dot) directories, e.g. `.github`                 |
@@ -132,8 +132,8 @@ dup-detector scan <path> --lang rust --lang python --min-lines 7 --min-occurrenc
 # JSON output (for tooling)
 dup-detector scan <path> --json
 
-# allow consistent literal renames to match
-dup-detector scan <path> --parameterize-literals
+# require exact literals instead of allowing consistent literal renames
+dup-detector scan <path> --no-parameterize-literals
 
 # also scan files excluded by .gitignore
 dup-detector scan <path> --no-ignore
@@ -161,7 +161,7 @@ Scan options:
 | `--min-lines <N>`         | `7`     | Minimum line count for a clone group         |
 | `--min-occurrences <N>`   | `2`     | Minimum occurrences per group                |
 | `--max-groups <N>`        | none    | Maximum number of groups to report           |
-| `--parameterize-literals` | off     | Treat consistently renamed literals as equal |
+| `--no-parameterize-literals` | off  | Require exact literals                       |
 | `--lang <LANG>`           | all     | Restrict to a language (repeatable)          |
 | `--no-ignore`             | off     | Also scan files excluded by `.gitignore`/`.ignore` |
 | `--max-file-bytes <N>`    | `2097152` | Skip files larger than `N` bytes                 |

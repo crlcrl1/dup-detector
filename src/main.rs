@@ -69,9 +69,9 @@ enum Command {
         /// Maximum number of groups to report (default: no limit)
         #[arg(long)]
         max_groups: Option<usize>,
-        /// Allow consistent literal renames to match as clones
+        /// Require exact literals instead of allowing consistent literal renames
         #[arg(long)]
-        parameterize_literals: bool,
+        no_parameterize_literals: bool,
         /// Restrict scanning to these languages (e.g. --lang rust --lang cpp)
         #[arg(long = "lang", value_name = "LANG")]
         languages: Vec<String>,
@@ -165,7 +165,7 @@ fn main() -> anyhow::Result<()> {
             min_lines,
             min_occurrences,
             max_groups,
-            parameterize_literals,
+            no_parameterize_literals,
             languages,
             no_ignore,
             max_file_bytes,
@@ -176,7 +176,7 @@ fn main() -> anyhow::Result<()> {
             min_lines,
             min_occurrences,
             max_groups,
-            parameterize_literals,
+            no_parameterize_literals,
             &languages,
             no_ignore,
             max_file_bytes,
@@ -231,7 +231,7 @@ fn run_scan(
     min_lines: Option<usize>,
     min_occurrences: Option<usize>,
     max_groups: Option<usize>,
-    parameterize_literals: bool,
+    no_parameterize_literals: bool,
     languages: &[String],
     no_ignore: bool,
     max_file_bytes: Option<u64>,
@@ -242,8 +242,8 @@ fn run_scan(
         .with_context(|| format!("failed to load config for {}", path.display()))?
         .with_limits(min_lines, min_occurrences, max_groups)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    if parameterize_literals {
-        config.parameterize_literals = true;
+    if no_parameterize_literals {
+        config.parameterize_literals = false;
     }
     if no_ignore {
         config.no_ignore = true;
@@ -556,5 +556,30 @@ mod tests {
             dunce::canonicalize(&dir).unwrap()
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn scan_disables_literal_parameterization(args: &[&str]) -> bool {
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Command::Scan {
+            no_parameterize_literals,
+            ..
+        } = cli.command
+        else {
+            panic!("expected scan command");
+        };
+        no_parameterize_literals
+    }
+
+    #[test]
+    fn literal_parameterization_is_enabled_unless_cli_disables_it() {
+        assert!(!scan_disables_literal_parameterization(&[
+            "dup-detector",
+            "scan",
+        ]));
+        assert!(scan_disables_literal_parameterization(&[
+            "dup-detector",
+            "scan",
+            "--no-parameterize-literals",
+        ]));
     }
 }

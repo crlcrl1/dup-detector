@@ -277,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn literals_are_exact_by_default() {
+    fn literal_parameterization_controls_window_signatures() {
         let a = "let x = 100 + 200; y";
         let b = "let x = 100 + 300; y";
         assert_ne!(signature(a, 0, 8), signature(b, 0, 8));

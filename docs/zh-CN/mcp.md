@@ -35,12 +35,13 @@ dup-detector mcp
 | 工具                     | 用途                           | 参数                                                                                          |
 | ------------------------ | ------------------------------ | --------------------------------------------------------------------------------------------- |
 | `find_clones`            | 全项目范围的重复代码           | `scope?`、`min_lines?`、`min_occurrences?`、`max_groups?`、`types?`、`parameterize_literals?` |
-| `find_clones_in_file`    | 涉及指定文件的克隆             | `file`、`scope?`、`min_lines?`、`min_occurrences?`、`max_groups?`、`types?`                   |
-| `find_clones_for_region` | “我正在写的这段代码是否重复？” | `file`、`start_line`、`end_line`、`scope?`、`min_lines?`、`max_groups?`、`types?`             |
+| `find_clones_in_file`    | 涉及指定文件的克隆             | `file`、`scope?`、`min_lines?`、`min_occurrences?`、`max_groups?`、`types?`、`parameterize_literals?` |
+| `find_clones_for_region` | “我正在写的这段代码是否重复？” | `file`、`start_line`、`end_line`、`scope?`、`min_lines?`、`max_groups?`、`types?`、`parameterize_literals?` |
 | `reindex`                | 丢弃全部内存索引并清空工作目录的磁盘缓存（下次扫描时重建） | —                                                                                             |
 
 - `scope` 默认为当前工作目录；只允许传工作目录本身或其子目录。
 - `types` 接受 `"type-1"`、`"type-2"`。
+- `parameterize_literals` 默认为 `true`；传 `false` 可要求字面量精确匹配。
 - `find_clones_for_region` 的 `min_lines` 默认为 `min(config.min_lines, 查询区间的行数)`；若文件尚未被索引，则即时解析。`file` 必须解析到 `scope` 内的路径，通过 `..` 等逃逸的路径会被拒绝。
 
 ## 响应结构

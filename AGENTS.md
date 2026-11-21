@@ -98,7 +98,7 @@ Correctness invariant: for every clone whose occurrences include an open file, t
    - Use fixed-length (default 8) token windows as seeds; hash and bucket them using **local** parameterized encoding within the window to guarantee rename invariance.
    - If a bucket has too many occurrences (> `max_bucket`), it is refined by parameterized fingerprints of doubling span (16 up to 256 tokens). Sub-buckets still above `max_bucket` recurse; base-level members that stay below it are dropped as generic noise. At refined levels every member is star-paired to the bucket's first member, and that member's sub-bucket to the first member outside it, so code copied more than `max_bucket` times is still reported at linear pair cost.
    - Run a **bijection check** on candidate pairs (identifiers must map one-to-one; any conflict fails), then extend maximally left/right to obtain the maximal matching span.
-4. **Fixed tokens** (keywords/operators/punctuation) must match exactly; identifiers use bijection; literals match exactly by default (`parameterize_literals` can be enabled).
+4. **Fixed tokens** (keywords/operators/punctuation) must match exactly; identifiers and literals use bijection by default (`parameterize_literals = false` requires exact literals).
 5. **Post-processing**: merge overlapping/adjacent matches within the same file pair only when their file-offset alignment stays constant (prevents span drift); report occurrences only at single-semantic-unit granularity — a span must be exactly one statement, item, or block (per-token unit ranges are recorded during tokenization), and multi-unit matches are split into one clone group per unit; drop groups that cannot be aligned; drop group occurrences that do not match the group representative (exact parameterized keys), so only Type-1/Type-2 clones are reported; filter boilerplate (imports, pure declarations) unless `filter_boilerplate` is disabled; sort by token count; limit the number of returned groups.
 7. **Same-file overlapping regions** must be handled explicitly to avoid meaningless self-overlap results.
 
@@ -109,11 +109,11 @@ The server is long-running, maintains an in-memory index keyed by workspace root
 | Tool | Purpose | Key params |
 | --- | --- | --- |
 | `find_clones` | Project-wide duplicated code | `scope?`, `min_lines?`, `min_occurrences?`, `max_groups?`, `types?`, `parameterize_literals?` |
-| `find_clones_in_file` | Clones involving a given file | `file`, `scope?`, `min_lines?`, `min_occurrences?`, `max_groups?`, `types?` |
-| `find_clones_for_region` | **Most used by agents**: is the code I'm writing duplicated? | `file`, `start_line`, `end_line`, `scope?`, `min_lines?`, `max_groups?`, `types?` |
+| `find_clones_in_file` | Clones involving a given file | `file`, `scope?`, `min_lines?`, `min_occurrences?`, `max_groups?`, `types?`, `parameterize_literals?` |
+| `find_clones_for_region` | **Most used by agents**: is the code I'm writing duplicated? | `file`, `start_line`, `end_line`, `scope?`, `min_lines?`, `max_groups?`, `types?`, `parameterize_literals?` |
 | `reindex` | Drop all in-memory indexes and clear the startup directory's on-disk cache (rebuilt on next scan) | (none) |
 
-Defaults: `min_lines = 7`, `min_occurrences = 2`, `max_groups = unlimited`, `max_bucket = 32`, seed window 8. `types` accepts `"type-1"` / `"type-2"`. `find_clones_for_region` defaults `min_lines` to `min(config.min_lines, line span of the queried region)` and parses the file on the fly if it is not indexed yet; `file` must resolve inside `scope`.
+Defaults: `min_lines = 7`, `min_occurrences = 2`, `max_groups = unlimited`, `max_bucket = 32`, seed window 8, `parameterize_literals = true`. `types` accepts `"type-1"` / `"type-2"`. All three detection tools accept `parameterize_literals`; passing `false` requires exact literals. `find_clones_for_region` defaults `min_lines` to `min(config.min_lines, line span of the queried region)` and parses the file on the fly if it is not indexed yet; `file` must resolve inside `scope`.
 
 Responses stay **token-efficient**: `{files_scanned, groups: [{token_count, clone_type, occurrences: [{path, start_line, end_line}]}]}`, limited in number and sorted by size; no source excerpts.
 
@@ -125,7 +125,7 @@ cargo build --release             # performance-sensitive (always use release fo
 cargo run -- mcp                  # start MCP server over stdio
 cargo run -- lsp                  # start language server over stdio
 cargo run -- scan <path>          # scan from the command line and print results
-cargo run -- scan <path> --json --min-lines 7 --min-occurrences 2 --parameterize-literals --lang rust
+cargo run -- scan <path> --json --min-lines 7 --min-occurrences 2 --no-parameterize-literals --lang rust
 cargo run -- scan <path> --json --file <file> [--stdin]   # only clones involving <file> (repeatable); --stdin reads its proposed contents
 cargo run -- scan <path> --json --stdin-json              # stdin {"files":[{"path","text"}],"exclude":[path]}: check proposed files, drop excluded ones
 cargo run -- clean [path]         # remove the project's on-disk token cache (project + user-cache)

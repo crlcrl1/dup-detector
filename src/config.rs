@@ -63,7 +63,7 @@ impl Default for Config {
             max_bucket: 32,
             seed_window: 8,
             max_groups: None,
-            parameterize_literals: false,
+            parameterize_literals: true,
             languages: None,
             no_ignore: false,
             include_hidden: false,
@@ -602,6 +602,17 @@ mod tests {
         assert_eq!(config.min_lines, 12);
         assert_eq!(config.min_occurrences, Config::default().min_occurrences);
         assert_eq!(config.languages, Config::default().languages);
+    }
+
+    #[test]
+    fn literal_parameterization_defaults_on_and_can_be_disabled() {
+        assert!(Config::default().parameterize_literals);
+        let config = Config::from_toml(
+            "parameterize_literals = false\n",
+            Path::new(CONFIG_FILE_NAME),
+        )
+        .unwrap();
+        assert!(!config.parameterize_literals);
     }
 
     #[test]

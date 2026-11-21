@@ -28,8 +28,8 @@ file discovery (.gitignore aware)
    above `max_bucket` are refined by longer spans, so generic windows are
    dropped while code copied many times is still paired. Candidate pairs pass a one-to-one
    **bijection check**, then extend maximally.
-4. **Fixed tokens match exactly**; identifiers use the bijection; literals match
-   exactly unless `parameterize_literals` is enabled.
+4. **Fixed tokens match exactly**; identifiers and literals use the bijection by
+   default. Set `parameterize_literals = false` to require exact literals.
 5. **Post-processing.** Overlapping matches are merged only when file-offset
    alignment stays constant, occurrences are reported at single-semantic-unit
    granularity (multi-unit matches are split), boilerplate (imports, pure

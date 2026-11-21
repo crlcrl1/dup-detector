@@ -75,7 +75,7 @@ fn corpus_precision_and_recall() {
         ("added_line", &[]),
         ("same_file", &[("a.rs", "a.rs")]),
         ("unrelated", &[]),
-        ("constants", &[]),
+        ("constants", &[("a.rs", "b.rs")]),
     ];
     let config = base_config();
     let mut true_positives = 0usize;
@@ -104,7 +104,7 @@ fn corpus_precision_and_recall() {
     assert!(recall >= 0.9, "recall {recall}");
     assert_eq!(
         (true_positives, false_positives, false_negatives),
-        (8, 0, 0)
+        (9, 0, 0)
     );
 }
 
@@ -140,19 +140,15 @@ fn renamed_clones_are_type2() {
 }
 
 #[test]
-fn changed_constants_match_when_literals_are_parameterized() {
-    let strict = base_config();
-    let (_index, groups) = scan("constants", &strict);
-    assert!(
-        groups.is_empty(),
-        "default config must require exact literals"
-    );
-
-    let parameterized = Config {
-        parameterize_literals: true,
+fn changed_constants_follow_literal_parameterization() {
+    let strict = Config {
+        parameterize_literals: false,
         ..base_config()
     };
-    let (index, groups) = scan("constants", &parameterized);
+    let (_index, groups) = scan("constants", &strict);
+    assert!(groups.is_empty());
+
+    let (index, groups) = scan("constants", &base_config());
     let reported = reported_pairs(&index, &groups);
     assert!(reported.contains(&ordered("a.rs".to_string(), "b.rs".to_string())));
 }

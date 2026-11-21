@@ -43,12 +43,13 @@ it tracked. All logs go to stderr so the stdio protocol stays clean.
 | Tool                     | Purpose                               | Parameters                                                                                    |
 | ------------------------ | ------------------------------------- | --------------------------------------------------------------------------------------------- |
 | `find_clones`            | Project-wide duplicated code          | `scope?`, `min_lines?`, `min_occurrences?`, `max_groups?`, `types?`, `parameterize_literals?` |
-| `find_clones_in_file`    | Clones involving a given file         | `file`, `scope?`, `min_lines?`, `min_occurrences?`, `max_groups?`, `types?`                   |
-| `find_clones_for_region` | "Is the code I'm writing duplicated?" | `file`, `start_line`, `end_line`, `scope?`, `min_lines?`, `max_groups?`, `types?`             |
+| `find_clones_in_file`    | Clones involving a given file         | `file`, `scope?`, `min_lines?`, `min_occurrences?`, `max_groups?`, `types?`, `parameterize_literals?` |
+| `find_clones_for_region` | "Is the code I'm writing duplicated?" | `file`, `start_line`, `end_line`, `scope?`, `min_lines?`, `max_groups?`, `types?`, `parameterize_literals?` |
 | `reindex`                | Drop all in-memory indexes and clear the working directory's on-disk cache (rebuilt on next scan) | —                                                                                             |
 
 - `scope` defaults to the current working directory; it must be the working directory or one of its subdirectories.
 - `types` accepts `"type-1"`, `"type-2"`.
+- `parameterize_literals` defaults to `true`; pass `false` to require exact literals.
 - `find_clones_for_region` defaults `min_lines` to `min(config.min_lines, line span of the queried
   region)` and parses the file on the fly if it is not indexed yet. `file` must resolve to a path
   inside `scope`; paths escaping it (e.g. via `..`) are rejected.
